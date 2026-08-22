@@ -2,7 +2,7 @@
 
 本地 Windows 工具：用标签管理多个 Codex 对话，并按 prompt list 顺序向同一个 Codex thread 提交任务。PowerShell 内运行的是 Codex 的真实 TUI；队列通过本地 App Server 的 JSON-RPC `turn/start` 提交，不会模拟或覆盖终端中的模型、审批和手工输入。
 
-每个打开的标签使用独立 Codex App Server。关闭对话会终止该标签的 PowerShell、远程 TUI 和 App Server 完整进程树并释放 session writer，因此可以立即在外部命令行执行 `codex resume <session-id>`。重新打开时会创建新服务；若 session 正被外部 Codex 使用，页面会保持关闭并提示先退出外部客户端。
+每个打开的标签使用独立 Codex App Server。恢复或重新打开时，远程 TUI 会先加载 thread，确认状态为 `idle` 或真实 `active` 后，队列控制端才调用 `thread/resume` 订阅事件；这避免已经完成的历史对话在 TUI 中永久停留于虚假 `Working`。关闭对话会终止该标签的 PowerShell、远程 TUI 和 App Server 完整进程树并释放 session writer，因此可以立即在外部命令行执行 `codex resume <session-id>`。重新打开时会创建新服务；若 session 正被外部 Codex 使用，页面会保持关闭并提示先退出外部客户端。
 
 ## 运行
 

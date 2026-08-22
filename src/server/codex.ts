@@ -248,6 +248,35 @@ export class CodexRpcClient extends EventEmitter {
   }
 }
 
+export async function waitForThreadLoaded(
+  rpc: Pick<CodexRpcClient, "readThread">,
+  threadId: string,
+  timeoutMs = 30_000,
+  pollMs = 200,
+  startupError?: () => string | null,
+): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = "unknown";
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    const terminalError = startupError?.();
+    if (terminalError) throw new Error(terminalError);
+    try {
+      const response = await rpc.readThread(threadId);
+      const thread = response?.thread ?? response?.data?.thread ?? response?.data ?? response;
+      lastStatus = String(thread?.status?.type ?? "unknown");
+      if (lastStatus === "idle" || lastStatus === "active") return thread;
+      if (lastStatus === "systemError") throw new Error(`TUI_THREAD_SYSTEM_ERROR:${thread?.status?.message ?? threadId}`);
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("TUI_THREAD_SYSTEM_ERROR:")) throw error;
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  const detail = lastError instanceof Error ? lastError.message : lastStatus;
+  throw new Error(`TUI_ATTACH_TIMEOUT:${threadId}:${detail}`);
+}
+
 export type CodexManagerStatus = { state: "starting" | "ready" | "error" | "stopped"; url: string | null; error: string | null };
 
 export class AppServerManager extends EventEmitter {

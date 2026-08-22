@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildRemoteCodexCommand, parseCodexExitCode, sliceTerminalBuffer } from "./pty.js";
+import { buildRemoteCodexCommand, parseCodexExitCode, sliceTerminalBuffer, terminalStartupError } from "./pty.js";
 
 describe("remote Codex terminal command", () => {
   it("resumes the selected remote thread in the selected working directory", () => {
     const command = buildRemoteCodexCommand("ws://127.0.0.1:4500", "01a00000-0000-7000-8000-000000000001", "C:\\Users\\Tester Workspace", "dark");
     expect(command).toContain("Set-Location -LiteralPath 'C:\\Users\\Tester Workspace'");
-    expect(command).toContain("codex resume 01a00000-0000-7000-8000-000000000001 --remote ws://127.0.0.1:4500 -C 'C:\\Users\\Tester Workspace'");
+    expect(command).toContain("codex resume 01a00000-0000-7000-8000-000000000001 --remote ws://127.0.0.1:4500 --no-alt-screen -C 'C:\\Users\\Tester Workspace'");
     expect(command).toContain('$Host.UI.RawUI.BackgroundColor = "Black"');
     expect(command).toContain("check_for_update_on_startup=false");
     expect(command).toContain("__CODEX_PROMPTOR_EXIT__:");
@@ -21,6 +21,12 @@ describe("remote Codex terminal command", () => {
   it("reads a split-buffer exit marker only after the exit code arrives", () => {
     expect(parseCodexExitCode("output __CODEX_PROMPTOR_EXIT__:")).toBeNull();
     expect(parseCodexExitCode("output __CODEX_PROMPTOR_EXIT__:17\r\nPS>")).toBe(17);
+  });
+
+  it("surfaces an active writer failure while waiting for the TUI to attach", () => {
+    expect(terminalStartupError("Error: thread already has an active writer\r\n__CODEX_PROMPTOR_EXIT__:1\r\n"))
+      .toContain("active writer");
+    expect(terminalStartupError("__CODEX_PROMPTOR_EXIT__:0\r\n")).toContain("code 0");
   });
 
   it("sends only the missing terminal bytes for a matching cursor", () => {

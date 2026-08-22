@@ -97,6 +97,11 @@ export class PtyManager extends EventEmitter {
   }
   async stopAll(): Promise<void> { await Promise.all([...this.sessions.keys()].map((tabId) => this.stop(tabId))); }
   has(tabId: string): boolean { return this.sessions.has(tabId); }
+  startupError(tabId: string): string | null {
+    const source = this.sessions.get(tabId) ?? this.archives.get(tabId);
+    if (!source) return null;
+    return terminalStartupError(source.buffer.toString("utf8"));
+  }
   snapshot(tabId: string, cursor: TerminalCursor = {}): TerminalSnapshot | null {
     const source = this.sessions.get(tabId) ?? this.archives.get(tabId);
     if (!source) return null;
@@ -131,7 +136,7 @@ export function buildRemoteCodexCommand(remoteUrl: string, threadId: string, cwd
   const foreground = theme === "light" ? "Black" : "Gray";
   const background = theme === "light" ? "White" : "Black";
   const ansi = theme === "light" ? "30;47" : "37;40";
-  return `$env:NO_COLOR = \"1\"; Set-Location -LiteralPath ${quoteArg(cwd)}; $Host.UI.RawUI.ForegroundColor = \"${foreground}\"; $Host.UI.RawUI.BackgroundColor = \"${background}\"; $promptorEsc = [char]27; Write-Host -NoNewline \"$promptorEsc[${ansi}m\"; Clear-Host; & codex resume ${quoteArg(threadId)} --remote ${quoteArg(remoteUrl)} -C ${quoteArg(cwd)} -c check_for_update_on_startup=false; $promptorCodexOk = $?; $promptorCodexExit = $LASTEXITCODE; if ($null -eq $promptorCodexExit) { if ($promptorCodexOk) { $promptorCodexExit = 0 } else { $promptorCodexExit = 1 } }; Write-Output \"${CODEX_EXIT_MARKER}$promptorCodexExit\"`;
+  return `$env:NO_COLOR = \"1\"; Set-Location -LiteralPath ${quoteArg(cwd)}; $Host.UI.RawUI.ForegroundColor = \"${foreground}\"; $Host.UI.RawUI.BackgroundColor = \"${background}\"; $promptorEsc = [char]27; Write-Host -NoNewline \"$promptorEsc[${ansi}m\"; Clear-Host; & codex resume ${quoteArg(threadId)} --remote ${quoteArg(remoteUrl)} --no-alt-screen -C ${quoteArg(cwd)} -c check_for_update_on_startup=false; $promptorCodexOk = $?; $promptorCodexExit = $LASTEXITCODE; if ($null -eq $promptorCodexExit) { if ($promptorCodexOk) { $promptorCodexExit = 0 } else { $promptorCodexExit = 1 } }; Write-Output \"${CODEX_EXIT_MARKER}$promptorCodexExit\"`;
 }
 
 export function parseCodexExitCode(value: string): number | null {
@@ -139,6 +144,19 @@ export function parseCodexExitCode(value: string): number | null {
   if (!match) return null;
   const parsed = Number(match[1]);
   return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+export function terminalStartupError(value: string): string | null {
+  const exitCode = parseCodexExitCode(value);
+  if (exitCode === null) return null;
+  const plain = value
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, " ");
+  if (/active writer|already has an active writer|thread\/resume failed.*writer/i.test(plain)) {
+    return "thread/resume failed: thread already has an active writer";
+  }
+  return `Codex TUI exited before the thread was attached (code ${exitCode}).`;
 }
 
 function quoteArg(value: string): string {

@@ -297,8 +297,12 @@ sequenceDiagram
     API->>API: 校验路径与标签状态
     API->>AS: thread/start {cwd, serviceName}
     AS-->>API: thread {id, sessionId, cwd}
+    API->>AS: 停止创建用 App Server，释放 writer
+    API->>AS: 启动该标签的新 App Server
+    API->>PTY: 在 cwd 启动 PowerShell 和 codex --remote resume id --no-alt-screen
+    API->>AS: thread/read 轮询至 idle/active
+    API->>AS: controller thread/resume 订阅事件
     API->>API: 原子写入 tab.json
-    API->>PTY: 在 cwd 启动 PowerShell 和 codex --remote resume id
     API-->>UI: session ready + IDs
 ```
 
@@ -318,20 +322,21 @@ sequenceDiagram
     API->>AS: thread/read {threadId, includeTurns:true}
     AS-->>API: thread + turns + items
     API->>Disk: 幂等导入 completed turns
-    API->>AS: thread/resume {threadId,cwd}
-    AS-->>API: resumed thread
+    API->>PTY: 启动 PowerShell 和 codex --remote resume id --no-alt-screen
+    API->>AS: thread/read 轮询至 idle/active
+    API->>AS: controller thread/resume {threadId,cwd}
+    AS-->>API: controller 已订阅
     API->>Disk: 写入绑定信息和导入报告
-    API->>PTY: 启动 PowerShell 和远程 Codex TUI
     API-->>UI: ready + imported history
 ```
 
-如果 `thread/read` 或 `thread/resume` 失败，不写入 session 绑定，也不启动终端；页面保留用户输入并显示可重试错误。
+远程 TUI 必须是新 App Server 上第一个执行 `thread/resume` 的客户端。若 controller 先恢复、TUI 再恢复，Codex CLI 0.147.0 可能在 thread 实际为 `idle` 时永久显示虚假 `Working` 并持续重绘。服务因此先等待 TUI 将 `thread/read.status.type` 从 `notLoaded` 变为 `idle` 或真实 `active`，随后 controller 才调用 `thread/resume` 订阅事件。若读取、TUI 附着或 controller 订阅失败，立即清理 PTY 与 App Server，不写入 ready 绑定，并显示可重试错误。
 
 ### 6.4 关闭与重新打开对话
 
 关闭顺序固定为：暂停队列并中断活动 turn、终止该标签的 PowerShell/Codex TUI 完整进程树、关闭 controller、终止该标签的 App Server 完整进程树、确认端口释放，最后写入 `session.state=closed`。关闭成功后，外部 `codex resume <thread-id>` 必须可以立即取得 writer。
 
-关闭状态不使用遮罩或 `inert`：历史和终端画面仍可查看，所有对话页写操作原位禁用并变灰，只有“重新打开终端”可用。重新打开时创建新的独立 App Server；若外部 Codex 正持有 writer，返回 `SESSION_ACTIVE_WRITER` 并保持关闭，不遗留新进程。
+关闭状态不使用遮罩或 `inert`：历史和终端画面仍可查看，所有对话页写操作原位禁用并变灰，只有“重新打开终端”可用。重新打开时创建新的独立 App Server，并同样执行“TUI 先恢复、controller 后订阅”的顺序；若外部 Codex 正持有 writer，返回 `SESSION_ACTIVE_WRITER` 并保持关闭，不遗留新进程。
 
 ### 6.5 队列调度流程
 

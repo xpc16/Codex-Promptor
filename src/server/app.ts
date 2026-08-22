@@ -7,7 +7,7 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
 import { type Group, IndexFileSchema, isoNow, newPrompt, PromptFileSchema, RuntimeFileSchema, type TabBundle } from "../shared/schemas.js";
-import { AppServerPool, type AppServerManager } from "./codex.js";
+import { AppServerPool, type AppServerManager, waitForThreadLoaded } from "./codex.js";
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
 import { PtyManager } from "./pty.js";
@@ -258,21 +258,34 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await pty.stop(tabId, false);
       await codex.stop(tabId);
       await storage.updateTab(tabId, (tab) => ({ ...tab, session: { ...tab.session, state: "connecting", lastError: null }, updatedAt: isoNow() }));
-      const manager = codex.get(tabId);
-      const rpc = await manager.ensureReady();
+      let manager = codex.get(tabId);
+      let rpc = await manager.ensureReady();
       let thread: any;
       let report: unknown = null;
       if (mode === "resume") {
-        const read = historyThreadFromResponse(await rpc.readThread(resumeId));
-        report = await syncHistory(storage, tabId, read);
-        thread = historyThreadFromResponse(await rpc.resumeThread(resumeId, cwd));
+        thread = historyThreadFromResponse(await rpc.readThread(resumeId));
+        report = await syncHistory(storage, tabId, thread);
       } else {
         thread = historyThreadFromResponse(await rpc.startThread(cwd));
       }
       const threadId = String(thread?.id ?? thread?.threadId ?? body.resumeId ?? "");
       if (!threadId) throw new Error("THREAD_ID_MISSING");
+      // A remote TUI that resumes an already-loaded thread can remain forever
+      // in a false Working state even though thread/read reports idle. For a
+      // new thread, release the creator App Server first; for every thread,
+      // let the TUI perform the first resume on the fresh App Server.
+      if (mode === "new") {
+        await codex.stop(tabId);
+        manager = codex.get(tabId);
+        rpc = await manager.ensureReady();
+      }
       const now = isoNow();
-      const tab = await storage.updateTab(tabId, (current) => ({
+      await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null });
+      if (!manager.remoteUrl) throw new Error("APP_SERVER_REMOTE_URL_MISSING");
+      await pty.start(tabId, cwd, manager.remoteUrl, threadId, (await storage.readIndex()).ui.theme);
+      await waitForThreadLoaded(rpc, threadId, 30_000, 200, () => pty.startupError(tabId));
+      thread = historyThreadFromResponse(await rpc.resumeThread(threadId, cwd));
+      await storage.updateTab(tabId, (current) => ({
         ...current,
         session: {
           state: "ready",
@@ -280,17 +293,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           threadId,
           sessionId: String(thread?.sessionId ?? threadId),
           createdAt: current.session.createdAt ?? now,
-          connectedAt: now,
+          connectedAt: isoNow(),
           lastError: null,
         },
-        updatedAt: now,
+        updatedAt: isoNow(),
       }));
-      await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null });
-      if (manager.remoteUrl) await pty.start(tabId, cwd, manager.remoteUrl, threadId, (await storage.readIndex()).ui.theme);
       const bundle = await storage.readTab(tabId);
       return reply.send({ data: { bundle, report } });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      await pty.stop(tabId, false).catch(() => undefined);
       await codex.stop(tabId).catch(() => undefined);
       const activeWriter = isActiveWriterError(message);
       const code = activeWriter ? "SESSION_ACTIVE_WRITER" : "SESSION_CONNECT_FAILED";
@@ -322,20 +334,27 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await codex.stop(tabId);
       const manager = codex.get(tabId);
       const rpc = await manager.ensureReady();
-      await rpc.resumeThread(tab.session.threadId, tab.session.workingDirectory);
       if (!manager.remoteUrl) throw new Error("APP_SERVER_REMOTE_URL_MISSING");
       const now = isoNow();
       await storage.updateTab(tabId, (current) => ({
         ...current,
-        session: { ...current.session, state: "ready", connectedAt: now, lastError: null },
+        session: { ...current.session, state: "connecting", lastError: null },
         updatedAt: now,
       }));
       const theme = (await storage.readIndex()).ui.theme;
       await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null });
       await pty.start(tabId, tab.session.workingDirectory, manager.remoteUrl, tab.session.threadId, theme);
+      await waitForThreadLoaded(rpc, tab.session.threadId, 30_000, 200, () => pty.startupError(tabId));
+      await rpc.resumeThread(tab.session.threadId, tab.session.workingDirectory);
+      await storage.updateTab(tabId, (current) => ({
+        ...current,
+        session: { ...current.session, state: "ready", connectedAt: isoNow(), lastError: null },
+        updatedAt: isoNow(),
+      }));
       return reply.send({ data: await storage.readTab(tabId) });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      await pty.stop(tabId, false).catch(() => undefined);
       await codex.stop(tabId).catch(() => undefined);
       const activeWriter = isActiveWriterError(message);
       const code = activeWriter ? "SESSION_ACTIVE_WRITER" : "TERMINAL_REOPEN_FAILED";
