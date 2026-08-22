@@ -1049,16 +1049,16 @@ Queue turn 成功时：
 - HTTP 和 App Server 都只绑定 `127.0.0.1`。
 - 禁止配置 `0.0.0.0`。
 - App Server 端口不暴露给浏览器 JavaScript。
-- Fastify 拒绝非预期 Host 和 Origin。
-- WebSocket upgrade 同样校验认证 cookie 和 Origin。
+- Fastify 只信任 `127.0.0.1` / `localhost` Host，并拒绝非同源 Origin 或 Referer。
+- WebSocket upgrade 同样校验 loopback Host 和同源 Origin。
 
 ### 15.2 浏览器认证
 
-1. 启动时生成 256-bit 随机一次性 token。
-2. 浏览器打开 `/?bootstrapToken=<token>`。
-3. 服务验证后设置 HttpOnly、SameSite=Strict、短生命周期 session cookie。
-4. 立即 302 到不含 token 的 `/`。
-5. 所有写请求使用独立 CSRF token。
+1. 启动时仍生成 256-bit 随机 token，供显式 header/query 调用使用，但不打印到常规启动 URL。
+2. 浏览器固定打开 `http://127.0.0.1:4317/`。
+3. 页面发出的 REST 请求必须具有 loopback Host，且 Origin 或 Referer 与 Host 同源；无浏览器来源的调用仍须提供 token。
+4. WebSocket 必须具有 loopback Host 和同源 Origin，或显式提供 token。
+5. 服务只监听 `127.0.0.1`，因此固定 URL 不扩大到局域网访问。
 
 ### 15.3 命令和路径安全
 
@@ -1120,8 +1120,9 @@ Queue turn 成功时：
 2. 检查生产构建是否存在。
 3. 如果已有实例，读取受保护的本地实例信息并打开其 URL。
 4. 否则启动 Node 服务。
-5. 等待服务 ready 后打开默认浏览器。
-6. 用户 Ctrl+C 或服务退出时，按顺序关闭 PTY、controller、App Server 和 HTTP 服务。
+5. 等待服务 ready 后打开默认浏览器，地址固定为 `http://127.0.0.1:4317/`。
+6. 页面建立独立生命周期 WebSocket；最后一个页面断开 5 秒且未重连时自动退出，普通刷新会在宽限期内取消退出。
+7. 用户 Ctrl+C、最后页面关闭或服务退出时，按顺序关闭 PTY、controller、App Server 和 HTTP 服务。
 
 后台进程使用 Windows Job Object 或等价的父子进程管理，避免关闭服务后遗留 Codex/PowerShell 子进程。
 

@@ -13,7 +13,7 @@
 .\start.ps1
 ```
 
-`start.ps1` 会启动只监听 `127.0.0.1` 的服务并打开本地网页。每个标签的数据在 `data/tabs/<tab-id>/`：
+`start.ps1` 会启动只监听 `127.0.0.1` 的服务并打开 `http://127.0.0.1:4317/`；该固定地址也可以直接手动打开。最后一个 Promptor 页面关闭后，后端会等待 5 秒（允许普通刷新重连），随后自动停止所有子进程并退出。设置环境变量 `CODEX_PROMPTOR_AUTO_EXIT=0` 可关闭自动退出。每个标签的数据在 `data/tabs/<tab-id>/`：
 
 - `prompt-list.json`：prompt、顺序、开始/完成时间、attempt 和状态；
 - `final-answers.json`：独立保存 prompt 对应的 final answer；

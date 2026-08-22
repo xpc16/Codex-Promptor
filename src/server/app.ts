@@ -13,6 +13,7 @@ import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js
 import { PtyManager } from "./pty.js";
 import { RunnerManager } from "./queue.js";
 import { StorageService } from "./storage.js";
+import { UiLifecycle } from "./ui-lifecycle.js";
 
 const execFileAsync = promisify(execFile);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -25,6 +26,7 @@ export type PromptorApp = FastifyInstance & {
     codex: AppServerPool;
     pty: PtyManager;
     runners: RunnerManager;
+    ui: UiLifecycle;
     token: string;
     close: () => Promise<void>;
   };
@@ -35,6 +37,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const storage = new StorageService(rootDir);
   const codex = new AppServerPool();
   const pty = new PtyManager();
+  const ui = new UiLifecycle(Number(process.env.CODEX_PROMPTOR_UI_GRACE_MS ?? 5_000));
   const token = process.env.CODEX_PROMPTOR_TOKEN ?? randomBytes(32).toString("hex");
   const clients = new Set<Client>();
   const sequences = new Map<string, number>();
@@ -86,7 +89,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     emit(tabId, { type: "service.changed", codex: aggregate });
   });
 
-  app.promptor = { storage, codex, pty, runners, token, close: async () => {
+  app.promptor = { storage, codex, pty, runners, ui, token, close: async () => {
+    ui.stop();
     await runners.stopAll();
     await pty.stopAll();
     await codex.stopAll();
@@ -96,7 +100,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     if (noAuth) return;
     const header = request.headers["x-codex-promptor-token"];
     const query = (request.query as any)?.token;
-    if (header !== token && query !== token) return reply.code(401).send({ error: { code: "UNAUTHORIZED", message: "Open the local URL printed by start.ps1." } });
+    if (header !== token && query !== token && !isTrustedBrowserRequest(request.headers)) {
+      return reply.code(401).send({ error: { code: "UNAUTHORIZED", message: "Open http://127.0.0.1:4317/ in the local browser." } });
+    }
   };
 
   await app.register(fastifyStatic, {
@@ -469,10 +475,14 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
 
   app.get("/ws", { websocket: true }, (socket, request) => {
     const queryToken = (request.query as any)?.token;
-    if (!noAuth && queryToken !== token) { socket.close(1008, "Unauthorized"); return; }
+    if (!noAuth && queryToken !== token && !isTrustedBrowserRequest(request.headers)) { socket.close(1008, "Unauthorized"); return; }
     const client: Client = { socket, subscriptions: new Set() };
     clients.add(client);
-    socket.on("close", () => clients.delete(client));
+    ui.connect();
+    socket.on("close", () => {
+      if (!clients.delete(client)) return;
+      ui.disconnect();
+    });
     socket.on("message", async (raw: Buffer) => {
       try {
         const message = JSON.parse(raw.toString()) as any;
@@ -586,4 +596,18 @@ function assertConversationOpen(bundle: TabBundle): void {
 
 function isActiveWriterError(message: string): boolean {
   return /active writer|already has an active writer|thread\/resume failed.*writer/i.test(message);
+}
+
+export function isTrustedBrowserOrigin(origin: string | undefined, host: string | undefined): boolean {
+  if (!origin || !host || !/^(?:127\.0\.0\.1|localhost)(?::\d+)?$/i.test(host)) return false;
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === "http:" && parsed.host.toLowerCase() === host.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+export function isTrustedBrowserRequest(headers: { origin?: string; referer?: string; host?: string }): boolean {
+  return isTrustedBrowserOrigin(headers.origin, headers.host) || isTrustedBrowserOrigin(headers.referer, headers.host);
 }

@@ -68,6 +68,26 @@ export function App() {
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { if (index) document.documentElement.dataset.theme = index.ui.theme; }, [index?.ui.theme]);
   useEffect(() => {
+    let disposed = false;
+    let socket: WebSocket | null = null;
+    let retryTimer: number | null = null;
+    const protocol = location.protocol === "https:" ? "wss" : "ws";
+    const connect = () => {
+      if (disposed) return;
+      socket = new WebSocket(`${protocol}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ""}`);
+      socket.onclose = () => {
+        socket = null;
+        if (!disposed) retryTimer = window.setTimeout(connect, 1_000);
+      };
+    };
+    connect();
+    return () => {
+      disposed = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      socket?.close();
+    };
+  }, []);
+  useEffect(() => {
     const timer = window.setInterval(() => setClock(new Date()), 30_000);
     return () => window.clearInterval(timer);
   }, []);
@@ -526,7 +546,7 @@ function TerminalPanel({ tabId, runtime, theme, closed, onChanged, onError }: { 
     };
     const connect = () => {
       if (disposed || closedRef.current || socket.current?.readyState === WebSocket.OPEN || socket.current?.readyState === WebSocket.CONNECTING) return;
-      const ws = new WebSocket(`${protocol}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+      const ws = new WebSocket(`${protocol}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ""}`);
       socket.current = ws;
       ws.onopen = () => {
         if (disposed || closedRef.current) { ws.close(); return; }

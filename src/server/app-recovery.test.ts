@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { isoNow } from "../shared/schemas.js";
-import { recoverTerminalRuntime } from "./app.js";
+import { isTrustedBrowserOrigin, isTrustedBrowserRequest, recoverTerminalRuntime } from "./app.js";
 import { StorageService } from "./storage.js";
 
 describe("runtime recovery", () => {
@@ -52,5 +52,17 @@ describe("runtime recovery", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("local browser origin", () => {
+  it("accepts the fixed loopback URL and rejects cross-site or rebound hosts", () => {
+    expect(isTrustedBrowserOrigin("http://127.0.0.1:4317", "127.0.0.1:4317")).toBe(true);
+    expect(isTrustedBrowserOrigin("http://localhost:4317", "localhost:4317")).toBe(true);
+    expect(isTrustedBrowserOrigin("https://example.com", "127.0.0.1:4317")).toBe(false);
+    expect(isTrustedBrowserOrigin("http://example.com:4317", "example.com:4317")).toBe(false);
+    expect(isTrustedBrowserOrigin(undefined, "127.0.0.1:4317")).toBe(false);
+    expect(isTrustedBrowserRequest({ referer: "http://127.0.0.1:4317/", host: "127.0.0.1:4317" })).toBe(true);
+    expect(isTrustedBrowserRequest({ referer: "http://example.com/", host: "127.0.0.1:4317" })).toBe(false);
   });
 });
