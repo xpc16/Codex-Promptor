@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+data/index.json
+data/tabs/*
+data/backups/*
+data/trash/*
+!data/tabs/.gitkeep
+!data/backups/.gitkeep
+!data/trash/.gitkeep

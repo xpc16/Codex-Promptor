@@ -1,0 +1,20 @@
+{
+  "session_id": "019xxxxxxxxxxxxxxxxxxxxxxxx",
+  "prompts": [
+    {
+      "id": "001",
+      "enabled": true,
+      "prompt": "检查当前项目结构，分析音频识别模块存在的问题。"
+    },
+    {
+      "id": "002",
+      "enabled": true,
+      "prompt": "根据前面的分析，重构音高识别模块。"
+    },
+    {
+      "id": "003",
+      "enabled": true,
+      "prompt": "运行现有测试，并修复发现的问题。"
+    }
+  ]
+}
