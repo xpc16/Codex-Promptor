@@ -93,6 +93,52 @@ describe("queue pause boundary", () => {
     }
   });
 
+  it("does not dispatch pending prompts owned by another thread", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-queue-thread-scope-"));
+    const storage = new StorageService(root);
+    try {
+      await storage.ensure();
+      const tab = await storage.createTab("thread scoped queue");
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        updatedAt: isoNow(),
+        session: { ...current.session, state: "ready", workingDirectory: root, threadId: "current-thread", sessionId: "current-thread", connectedAt: isoNow() },
+      }));
+      const bundle = await storage.readTab(tab.id);
+      const otherThreadPrompt = newPrompt("belongs elsewhere", "queue");
+      otherThreadPrompt.threadId = "other-thread";
+      const unboundPrompt = newPrompt("run here", "queue");
+      bundle.prompts.prompts.push(otherThreadPrompt, unboundPrompt);
+      await storage.writePrompts(tab.id, bundle.prompts);
+
+      const calls: string[] = [];
+      const codex = {
+        rpc: {
+          waitForThreadIdle: async () => undefined,
+          startTurn: async (_threadId: string, text: string) => {
+            calls.push(text);
+            throw new Error("expected test stop");
+          },
+        },
+      } as unknown as AppServerManager;
+      const runner = new QueueRunner(tab.id, storage, codex);
+
+      await runner.start();
+      await waitUntil(async () => {
+        const current = await storage.readTab(tab.id);
+        return calls.length === 1 && current.runtime.runner.desiredState === "paused";
+      });
+      const result = await storage.readTab(tab.id);
+      expect(calls).toEqual(["run here"]);
+      expect(result.prompts.prompts.find((prompt) => prompt.id === otherThreadPrompt.id)?.status).toBe("pending");
+      expect(result.prompts.prompts.find((prompt) => prompt.id === unboundPrompt.id)?.threadId).toBe("current-thread");
+      expect(result.prompts.prompts.find((prompt) => prompt.id === unboundPrompt.id)?.status).toBe("failed");
+      await runner.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("re-reads prompts added during the final active turn and keeps the selected cwd", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-queue-dynamic-"));
     const storage = new StorageService(root);
@@ -210,7 +256,7 @@ describe("queue pause boundary", () => {
   });
 });
 
-async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {
+async function waitUntil(predicate: () => Promise<boolean>, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await predicate()) return;

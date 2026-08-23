@@ -8,6 +8,9 @@ export type TerminalEvent =
   | { tabId: string; type: "state"; state: "stopped" | "starting" | "running" | "exited" | "error"; exitCode?: number | null; message?: string };
 
 export type TerminalTheme = "light" | "dark";
+export type TerminalLaunch =
+  | { mode: "new" }
+  | { mode: "resume"; threadId: string };
 
 type TerminalBuffer = { generation: string; buffer: Buffer; bufferStart: number; nextOffset: number };
 type Session = TerminalBuffer & { process: pty.IPty; codexExited: boolean };
@@ -28,7 +31,7 @@ export class PtyManager extends EventEmitter {
   private readonly sessions = new Map<string, Session>();
   private readonly archives = new Map<string, TerminalBuffer>();
 
-  async start(tabId: string, cwd: string, remoteUrl: string, threadId: string, theme: TerminalTheme = "light"): Promise<void> {
+  async start(tabId: string, cwd: string, remoteUrl: string, launch: TerminalLaunch, theme: TerminalTheme = "light"): Promise<void> {
     await this.stop(tabId, false);
     this.archives.delete(tabId);
     this.emitEvent({ tabId, type: "state", state: "starting" });
@@ -72,7 +75,7 @@ export class PtyManager extends EventEmitter {
       setTimeout(() => {
         if (this.sessions.get(tabId)?.process !== child) return;
         this.emitEvent({ tabId, type: "state", state: "running" });
-        child.write(`${buildRemoteCodexCommand(remoteUrl, threadId, cwd, theme)}\r`);
+        child.write(`${buildRemoteCodexCommand(remoteUrl, launch, cwd, theme)}\r`);
       }, 180);
     } catch (error) {
       this.emitEvent({ tabId, type: "state", state: "error", message: error instanceof Error ? error.message : String(error) });
@@ -132,11 +135,14 @@ function copyBuffer(source: TerminalBuffer): TerminalBuffer {
   return { generation: source.generation, buffer: Buffer.from(source.buffer), bufferStart: source.bufferStart, nextOffset: source.nextOffset };
 }
 
-export function buildRemoteCodexCommand(remoteUrl: string, threadId: string, cwd: string, theme: TerminalTheme = "light"): string {
+export function buildRemoteCodexCommand(remoteUrl: string, launch: TerminalLaunch, cwd: string, theme: TerminalTheme = "light"): string {
   const foreground = theme === "light" ? "Black" : "Gray";
   const background = theme === "light" ? "White" : "Black";
   const ansi = theme === "light" ? "30;47" : "37;40";
-  return `$env:NO_COLOR = \"1\"; Set-Location -LiteralPath ${quoteArg(cwd)}; $Host.UI.RawUI.ForegroundColor = \"${foreground}\"; $Host.UI.RawUI.BackgroundColor = \"${background}\"; $promptorEsc = [char]27; Write-Host -NoNewline \"$promptorEsc[${ansi}m\"; Clear-Host; & codex resume ${quoteArg(threadId)} --remote ${quoteArg(remoteUrl)} --no-alt-screen -C ${quoteArg(cwd)} -c check_for_update_on_startup=false; $promptorCodexOk = $?; $promptorCodexExit = $LASTEXITCODE; if ($null -eq $promptorCodexExit) { if ($promptorCodexOk) { $promptorCodexExit = 0 } else { $promptorCodexExit = 1 } }; Write-Output \"${CODEX_EXIT_MARKER}$promptorCodexExit\"`;
+  const invocation = launch.mode === "resume"
+    ? `& codex resume ${quoteArg(launch.threadId)} --remote ${quoteArg(remoteUrl)} --no-alt-screen -C ${quoteArg(cwd)} -c check_for_update_on_startup=false`
+    : `& codex --remote ${quoteArg(remoteUrl)} --no-alt-screen -C ${quoteArg(cwd)} -c check_for_update_on_startup=false`;
+  return `$env:NO_COLOR = \"1\"; Set-Location -LiteralPath ${quoteArg(cwd)}; $Host.UI.RawUI.ForegroundColor = \"${foreground}\"; $Host.UI.RawUI.BackgroundColor = \"${background}\"; $promptorEsc = [char]27; Write-Host -NoNewline \"$promptorEsc[${ansi}m\"; Clear-Host; ${invocation}; $promptorCodexOk = $?; $promptorCodexExit = $LASTEXITCODE; if ($null -eq $promptorCodexExit) { if ($promptorCodexOk) { $promptorCodexExit = 0 } else { $promptorCodexExit = 1 } }; Write-Output \"${CODEX_EXIT_MARKER}$promptorCodexExit\"`;
 }
 
 export function parseCodexExitCode(value: string): number | null {

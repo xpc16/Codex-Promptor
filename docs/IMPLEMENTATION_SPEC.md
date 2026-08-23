@@ -63,7 +63,7 @@
 codex app-server --listen ws://127.0.0.1:<random-port>
 ```
 
-该标签的 controller、队列和 Codex TUI 只连接自己的进程。进程边界保证关闭标签时可以立即释放 rollout writer，也防止一个标签的异常影响其他对话。端口和 PID 只保存在内存中，不写入标签 JSON。
+该标签的 controller 和队列直接连接自己的 App Server；Codex TUI 则经每标签独占、只监听 `127.0.0.1` 随机端口的透明 WebSocket 转发层连接同一 App Server。进程边界保证关闭标签时可以立即释放 rollout writer，也防止一个标签的异常影响其他对话。端口和 PID 只保存在内存中，不写入标签 JSON。
 
 ### 3.2 自动队列不向 PowerShell 注入按键
 
@@ -75,6 +75,8 @@ codex app-server --listen ws://127.0.0.1:<random-port>
 - 多行 prompt、Unicode 和长文本不依赖 bracketed paste。
 - 可通过 `turn.id`、`clientUserMessageId` 和结构化事件可靠关联结果。
 - 用户仍可在 TUI 中选择模型、调整模式、审批、发起人工 turn 或 steering。
+
+转发层不改写任何终端输入。App Server JSON-RPC 通常逐字节双向转发，唯一的兼容性规范化是把 TUI 发出的 `thread/start.params.historyMode: paginated` 改为 `legacy`：本工具的全量对账依赖 `thread/read(includeTurns=true)`，而官方协议对 paginated rollout 的完整历史读取仍会返回不支持。除此之外，转发层只关联 `thread/start`、`thread/resume`、`thread/fork` 请求与成功响应，用于识别 `/new`、`/resume`、`/fork` 后真正被 TUI 选中的 thread。不能仅凭 `thread/started` 自动换绑，因为 detached review 等辅助流程也可能发出该事件。
 
 队列发起 `turn/start` 时只发送 `threadId`、`clientUserMessageId` 和 `input`，不发送 `model`、`effort`、`sandboxPolicy`、`approvalPolicy` 等覆盖项，从而沿用用户在该 thread 中设置的当前选项。
 
@@ -146,6 +148,8 @@ flowchart LR
 | `QueueRunner` | 每标签队列状态机、动态选取下一项、失败策略和恢复。 |
 | `TurnRecorder` | 汇集 user/agent items，识别 final answer，记录人工与队列 turns。 |
 | `PtyManager` | 每标签 PowerShell/Codex TUI 的启动、输出缓冲、resize 和停止。 |
+| `TuiProxyPool` / `TuiThreadRequestTracker` | 为 TUI 提供 CLI 可接受的 `ws://host:port` 透明转发，关联成功的 thread 切换请求。 |
+| `TerminalThreadSynchronizer` | 切换时暂停调度边界、更新绑定、订阅新 thread、导入历史并恢复原队列意图。 |
 | `StorageService` | Zod 校验、revision、每标签锁、原子写入和 schema migration。 |
 | `WorkspaceIndexService` | 分组、标签、布局和 trash 管理。 |
 | `LocalAuthService` | 一次性启动令牌、cookie、Origin/Host/CSRF 校验。 |
@@ -184,15 +188,22 @@ flowchart LR
 - 标签可在组内排序，也可拖到其他分组。
 - 标签支持新建、重命名和删除。
 - 删除标签必须二次确认；后端将标签目录移动到 `data/trash/`，不直接永久删除。
+- 分组和标签行只保留一个“⋮”操作按钮；点击后显示“修改”和“删除”菜单。点击菜单外、滚动、调整窗口或按 `Escape` 关闭菜单，菜单项支持方向键切换焦点。
 - 标签切换只改变当前视图，不停止后台终端或队列。
 - 同一 Codex Thread ID 不允许绑定两个活动标签。
+- 标签状态只使用一组右侧指示符：灰色方块为已关闭，较大的静态绿色圆点为已打开且当前没有队列 prompt 在执行，呼吸变化的绿色圆点为队列 prompt 正在执行。
+- 每条队列 prompt 成功完成后，在标签状态旁显示一个钟形提醒，持续 30 秒；连续完成会从最近一次完成时刻重新计时。
+- 同一完成事件触发一次简短双音提示。音效由浏览器 Web Audio 生成，不依赖外部音频文件；首次用户点击或按键用于解锁浏览器音频策略。
+- 提示音和钟形提醒只响应实时的 `origin: queue` 完成事件；人工 turn、导入历史、同步历史和刷新时的状态恢复不触发声音。页面在完成后的 30 秒内刷新时可以从 `completedAt` 恢复钟形提醒。
+- 控制台栏最底部为单行工具区：左侧使用月亮/太阳纯图标切换主题，中间显示服务状态点和当前时间，右侧使用 `中 / En` 切换界面语言。
+- 主题与语言都是全局持久化偏好。语言取值为 `zh-CN | en`，旧数据默认 `zh-CN`；切换覆盖应用自有按钮、说明、状态、对话框、提示和无障碍文本，不翻译 prompt、final answer、终端输出、路径和用户命名。
 
 ### 5.3 新标签的会话设置
 
 未配置标签显示以下控件：
 
 1. 本地路径文本框。
-2. “浏览”按钮，调用后端打开 Windows 文件夹选择器。
+2. “选择文件夹”按钮，调用后端打开置于浏览器前方的 Windows Explorer 风格文件夹选择器；对话框显示地址栏、当前目录内容，并优先从文本框中的有效路径打开。选择过程中按钮禁用，后端拒绝重复窗口；取消、超时或服务退出后必须释放选择器状态及辅助进程。
 3. 单选项：
    - 创建新对话；
    - 继续已有对话。
@@ -207,7 +218,7 @@ flowchart LR
 - 不自动创建不存在的工作目录。
 - 不要求目录必须是 Git 仓库；若 Codex 自身要求信任或确认，由真实 TUI 处理。
 
-标签一旦成功绑定 thread，就不能直接切换到另一个 thread。要使用另一会话，应新建标签；这样可以避免历史文件混用。
+标签绑定后仍允许用户在真实 TUI 中使用 `/resume`、`/fork` 或 `/new`。透明转发层只在请求成功后更新标签绑定并全量同步所选 thread；当前 JSON 的旧 thread 完成历史会被替换，未绑定的 pending 队列会保留，因此不会混用回答，也不会丢失关闭前尚未执行的指令。
 
 ### 5.4 状态与回答历史区
 
@@ -230,14 +241,19 @@ Codex: 已连接 | Terminal: 运行中 | Queue: 已暂停
 ### 5.5 真实 PowerShell/Codex 终端
 
 - 后端通过 `node-pty` 启动 `powershell.exe -NoLogo -NoExit`，并把 PTY 的 `cwd` 直接设置为标签工作路径。
-- PowerShell 启动后，后端发送一条仅由受控值组成的命令：
+- PowerShell 启动后，后端根据模式发送一条仅由受控值组成的命令：
 
 ```powershell
-codex --remote ws://127.0.0.1:<app-server-port> --no-alt-screen resume <thread-id>
+# 新建：由 TUI 自己执行 thread/start
+codex --remote ws://127.0.0.1:<tui-proxy-port> --no-alt-screen -C <cwd>
+
+# 恢复：让 TUI 首先恢复已保存的 thread
+codex resume <thread-id> --remote ws://127.0.0.1:<tui-proxy-port> --no-alt-screen -C <cwd>
 ```
 
 - `thread-id` 必须先通过 UUID 校验；工作路径不拼进命令字符串。
 - xterm.js 的键盘输入原样写入 PTY，工具不拦截普通按键、不替换 slash command、不改变模型选择。
+- Codex CLI 0.147.0 的 `--remote` 只接受 `ws://host:port`，不能使用带路径或 query 的网页 WebSocket URL；因此每个标签使用独立随机转发端口。
 - 浏览器只要仍连接后端，用户即可正常使用 Codex TUI，包括模型选择、模式切换、审批、人工提问和 steering。
 - 浏览器首次附着时接收一次有限 snapshot；WebSocket 重连携带 `generation + nextOffset`，只补发缺失字节。缓存代次变化或游标过旧时才明确 reset。
 - `ResizeObserver` 只在 xterm 行列数实际变化时调整 PTY；连接建立不强制抢占焦点。TUI 的 DECSET 12 光标闪烁请求由前端消费，以保持稳定光标。
@@ -248,8 +264,9 @@ codex --remote ws://127.0.0.1:<app-server-port> --no-alt-screen resume <thread-i
 
 队列右栏包含：
 
-- 开始按钮。
-- 暂停按钮。
+- 单行顶部信息栏：本地化标题（`执行队列` / `Prompt list`）、`completed/total`、本地化 runner 状态、开始按钮和暂停按钮。
+- 顶部信息栏不换行；窄栏时状态文本可省略并通过 `title` 查看，标题、完成数及两个按钮始终保留。
+- runner 错误详情仅在发生错误时显示于信息栏下方。
 - 失败策略选择：
   - 失败并暂停（默认）；
   - 记录失败后继续。
@@ -279,10 +296,11 @@ codex --remote ws://127.0.0.1:<app-server-port> --no-alt-screen resume <thread-i
 1. `start.ps1` 检查是否已有实例。
 2. 服务获得数据目录的独占进程锁。
 3. 读取并校验 `data/index.json` 与各标签文件。
-4. 将进程重启前遗留的 `ready/connecting` 标签恢复为 `closed`，终端设为 stopped，队列设为 paused。
-5. 启动 Fastify，只监听 `127.0.0.1` 随机端口。
-6. 生成一次性浏览器令牌，打开默认浏览器。
-7. 用户创建或重新打开对话时，才为该标签选择空闲端口、启动 App Server、连接 controller 并启动远程 TUI。
+4. 在清理进程残留前读取 `session.reopenOnLaunch`；兼容旧数据时，带有效路径与 thread ID 的 `ready` 标签也视为待恢复。
+5. 将进程重启前遗留的 `ready/connecting` 标签临时恢复为 `closed`，终端设为 stopped，队列设为 paused，并清理过期的 App Server 归属信息。
+6. 启动 Fastify，只监听 `127.0.0.1` 随机端口。
+7. 对所有待恢复标签并行执行与“重新打开终端”相同的恢复流程；单个标签失败只写入该标签错误，不阻塞其他标签和 HTTP 服务。
+8. 生成一次性浏览器令牌，打开默认浏览器；自动恢复中的标签显示 `connecting`，恢复完成后通过 snapshot 更新为 `ready`。
 
 ### 6.2 创建新对话
 
@@ -295,18 +313,16 @@ sequenceDiagram
 
     UI->>API: POST /tabs/:id/session {mode:new,cwd}
     API->>API: 校验路径与标签状态
-    API->>AS: thread/start {cwd, serviceName}
-    AS-->>API: thread {id, sessionId, cwd}
-    API->>AS: 停止创建用 App Server，释放 writer
-    API->>AS: 启动该标签的新 App Server
-    API->>PTY: 在 cwd 启动 PowerShell 和 codex --remote resume id --no-alt-screen
-    API->>AS: thread/read 轮询至 idle/active
-    API->>AS: controller thread/resume 订阅事件
+    API->>PTY: 在 cwd 启动 PowerShell 和 codex --remote --no-alt-screen
+    PTY->>AS: TUI 发起 thread/start
+    AS-->>PTY: thread {id, sessionId, cwd}
+    API->>API: 代理规范化 legacy history 并捕获 thread id
     API->>API: 原子写入 tab.json
     API-->>UI: session ready + IDs
+    Note over AS: 首个 turn 后创建可读取的 rollout
 ```
 
-`thread/start` 不附带初始 prompt。这样用户可先在真实 TUI 中选择模型或模式，再点击队列“开始”。
+新建模式不由 controller 预先创建空 thread，也不调用 `thread/read`、`thread/resume` 或 `codex resume` 验证尚未落盘的空 thread。真实 TUI 在同一个 App Server 上发起首个 `thread/start`，代理把 history mode 规范为 `legacy` 并以成功响应中的 thread id 立即绑定标签；首个队列或手工 turn 随后创建 rollout。这样既避免 `no rollout found`，也允许用户先在真实 TUI 中选择模型或模式，再点击队列“开始”。
 
 ### 6.3 恢复已有对话并导入历史
 
@@ -319,24 +335,39 @@ sequenceDiagram
     participant PTY as PowerShell/Codex TUI
 
     UI->>API: POST /tabs/:id/session {mode:resume,cwd,resumeId}
-    API->>AS: thread/read {threadId, includeTurns:true}
-    AS-->>API: thread + turns + items
-    API->>Disk: 幂等导入 completed turns
+    API->>AS: thread/read 预检 thread 是否存在
     API->>PTY: 启动 PowerShell 和 codex --remote resume id --no-alt-screen
     API->>AS: thread/read 轮询至 idle/active
     API->>AS: controller thread/resume {threadId,cwd}
     AS-->>API: controller 已订阅
-    API->>Disk: 写入绑定信息和导入报告
+    API->>AS: thread/read {threadId, includeTurns:true}
+    AS-->>API: thread + turns + items
+    API->>Disk: 全量校正完成历史并追加 pending 队列
+    API->>Disk: 写入绑定信息和同步报告
     API-->>UI: ready + imported history
 ```
 
 远程 TUI 必须是新 App Server 上第一个执行 `thread/resume` 的客户端。若 controller 先恢复、TUI 再恢复，Codex CLI 0.147.0 可能在 thread 实际为 `idle` 时永久显示虚假 `Working` 并持续重绘。服务因此先等待 TUI 将 `thread/read.status.type` 从 `notLoaded` 变为 `idle` 或真实 `active`，随后 controller 才调用 `thread/resume` 订阅事件。若读取、TUI 附着或 controller 订阅失败，立即清理 PTY 与 App Server，不写入 ready 绑定，并显示可重试错误。
 
+#### 6.3.1 TUI 内切换 thread 后自动跟随
+
+用户可在真实 TUI 中执行 `/resume`、`/fork` 或 `/new`。透明转发层等待对应 JSON-RPC 成功响应，以返回的 `thread.id` 为权威目标；失败响应和 detached review 不触发换绑。目标与当前标签不同后，后端按以下顺序执行：
+
+1. 记录队列原 `desiredState`，冻结旧 thread 的调度边界。
+2. 原子更新 `tab.json` 的 `threadId`、`sessionId`、实时 `cwd` 和 `lastThreadSwitch`。
+3. controller 对新 thread 调用 `thread/resume`，保证后续人工 turn 事件可被记录。
+4. 调用 `thread/read(includeTurns=true)`，把 completed prompts/final answers 幂等合并到该标签原有两个 JSON。
+5. 推送新 snapshot；若队列切换前处于 running，则继续处理当时尚未执行的条目。
+
+`cwd` 优先采用 TUI 请求中的实时 override，其次才使用 stored thread metadata，避免页面工作路径与终端状态栏不一致。重复成功响应按 tab 串行处理，目标已经绑定时直接跳过。
+
 ### 6.4 关闭与重新打开对话
 
-关闭顺序固定为：暂停队列并中断活动 turn、终止该标签的 PowerShell/Codex TUI 完整进程树、关闭 controller、终止该标签的 App Server 完整进程树、确认端口释放，最后写入 `session.state=closed`。关闭成功后，外部 `codex resume <thread-id>` 必须可以立即取得 writer。
+关闭顺序固定为：暂停队列并中断活动 turn、终止该标签的 PowerShell/Codex TUI 完整进程树、关闭该标签的 TUI 转发端口、关闭 controller、终止该标签的 App Server 完整进程树、确认端口释放，最后写入 `session.state=closed`。关闭成功后，外部 `codex resume <thread-id>` 必须可以立即取得 writer。
 
 关闭状态不使用遮罩或 `inert`：历史和终端画面仍可查看，所有对话页写操作原位禁用并变灰，只有“重新打开终端”可用。重新打开时创建新的独立 App Server，并同样执行“TUI 先恢复、controller 后订阅”的顺序；若外部 Codex 正持有 writer，返回 `SESSION_ACTIVE_WRITER` 并保持关闭，不遗留新进程。
+
+正常退出时，在停止 PTY 与 App Server 之前把每个标签是否仍为 `ready` 写入 `session.reopenOnLaunch`。新建、恢复或重新打开成功时立即把该标记设为 `true`；用户明确关闭对话时设为 `false`。下次启动只自动恢复标记为开启且仍有有效工作路径与 thread ID 的标签。自动恢复只重建终端连接并同步历史，不恢复队列的 running 意图，避免重启后重复提交 prompt。
 
 ### 6.5 队列调度流程
 
@@ -606,7 +637,13 @@ codex_promptor/
     "codexSessionId": "0198dabc-1234-7abc-8def-0123456789ab",
     "codexCliVersion": "0.147.0",
     "boundAt": "2026-08-21T09:01:00.000Z",
-    "lastHistorySyncAt": "2026-08-21T09:01:02.000Z"
+    "lastHistorySyncAt": "2026-08-21T09:01:02.000Z",
+    "lastThreadSwitch": {
+      "fromThreadId": "0198dabb-0000-7000-8000-000000000000",
+      "toThreadId": "0198dabc-1234-7abc-8def-0123456789ab",
+      "method": "thread/resume",
+      "switchedAt": "2026-08-21T09:01:00.000Z"
+    }
   },
   "queueConfig": {
     "onFailure": "pause"
@@ -620,7 +657,7 @@ codex_promptor/
 }
 ```
 
-`session.state`：`unconfigured | connecting | ready | error`。`queueConfig.onFailure`：`pause | continue`。
+`session.state`：`unconfigured | connecting | ready | closed | error`。`session.reopenOnLaunch` 记录正常退出时是否应在下次启动自动重建该对话的终端连接。`queueConfig.onFailure`：`pause | continue`。
 
 ### 9.3 每标签 `prompt-list.json`
 
@@ -632,6 +669,7 @@ codex_promptor/
     {
       "id": "b2bbce58-bbfc-4b34-a67f-532026b52edf",
       "origin": "imported",
+      "threadId": "0198dabc-1234-7abc-8def-0123456789ab",
       "text": "检查当前项目结构。",
       "inputSnapshot": [
         {
@@ -651,6 +689,7 @@ codex_promptor/
     {
       "id": "93767419-c19e-4e18-8da0-b19e55efc351",
       "origin": "queue",
+      "threadId": null,
       "text": "运行测试并总结失败原因。",
       "inputSnapshot": [
         {
@@ -677,6 +716,7 @@ Prompt 字段：
 | --- | --- |
 | `id` | 工具生成的 UUID。 |
 | `origin` | `queue | manual | imported`。 |
+| `threadId` | 已开始执行或从历史导入后所属的 Codex thread；尚未执行的本地队列项为 `null`。 |
 | `text` | UI 展示的主文本。 |
 | `inputSnapshot` | 结构化输入快照；可包含 text、image、localImage、skill、mention 等描述。 |
 | `status` | `pending | dispatching | running | completed | failed | interrupted | skipped`。 |
@@ -823,7 +863,15 @@ waiting_for_prompt | pausing | error
 5. answer 存在、prompt 缺失：使用 answer 中的 `promptId` 补建 prompt。
 6. 两者都缺失：生成新 UUID，先写 answer 数据草稿，再在同一个标签写锁中完成两个文件。
 
-恢复会话时执行全量同步；App Server 或应用异常重连后也执行一次同步。数据规模过大时可在未来改用 turn 分页，但第一版以 `thread/read(includeTurns=true)` 为准。
+完成逐 turn 修复后，以当前 thread 进行一次作用域校正：
+
+1. `final-answers.json` 只保留当前 thread 且仍存在于 `thread/read` 完成历史中的 answer；
+2. `prompt-list.json` 先按 Codex turn 顺序放置当前 thread 的完成记录；
+3. 再保留当前 thread 的本地失败/中断等状态；
+4. 最后按原顺序追加 `threadId == null` 或属于当前 thread 的 pending 记录；
+5. 旧 schema 中缺少 `prompt.threadId` 时，先通过 answer 的 `promptId` 交叉引用回填，再清除其他 thread 的记录。
+
+恢复会话、重新打开终端以及点击控制台栏“同步历史”时都执行全量同步；App Server 或应用异常重连后也执行一次同步。数据规模过大时可在未来改用 turn 分页，但第一版以 `thread/read(includeTurns=true)` 为准。
 
 ### 10.4 时间字段
 
@@ -900,7 +948,7 @@ stateDiagram-v2
 | `GET` | `/api/health` | 本地服务健康检查。 |
 | `POST` | `/api/dialog/select-directory` | 打开 Windows 文件夹选择器并返回绝对路径。 |
 
-文件夹选择器由后端启动固定 PowerShell `-STA -NoProfile` 脚本，使用 `System.Windows.Forms.FolderBrowserDialog`。该接口不接受 shell 文本参数。
+文件夹选择器由后端启动固定 PowerShell `-STA -NoProfile` 脚本，使用配置为目录选择模式的 `System.Windows.Forms.OpenFileDialog`，从而提供标准 Explorer 地址栏和目录内容视图。请求只接受可选的 `initialPath`；路径通过专用环境变量传入固定脚本，不作为 shell 代码拼接。
 
 ### 12.2 分组与标签
 
@@ -919,8 +967,8 @@ stateDiagram-v2
 | Method | Path | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/tabs/:tabId/session` | 创建或恢复 thread。 |
-| `POST` | `/api/tabs/:tabId/history/sync` | 手工触发历史对账。 |
-| `POST` | `/api/tabs/:tabId/terminal/reopen` | 在既有 thread 上重新打开 Codex TUI。 |
+| `POST` | `/api/tabs/:tabId/history/sync` | 手工全量重读当前 thread，校正两个 JSON 并刷新页面数据。 |
+| `POST` | `/api/tabs/:tabId/terminal/reopen` | 在既有 thread 上重新打开 Codex TUI，并在附着后全量同步历史。 |
 
 创建/恢复 body：
 
@@ -957,7 +1005,7 @@ stateDiagram-v2
 ```ts
 type TerminalCursor = { generation: string | null; nextOffset: number | null };
 type ClientMessage =
-  | { type: "subscribe"; tabIds: string[]; terminals?: Record<string, TerminalCursor> }
+  | { type: "subscribe"; tabIds: string[]; snapshots?: boolean; terminals?: Record<string, TerminalCursor> }
   | { type: "terminal.sync"; tabId: string; cursor: TerminalCursor }
   | { type: "terminal.input"; tabId: string; dataBase64: string }
   | { type: "terminal.resize"; tabId: string; cols: number; rows: number }
@@ -984,6 +1032,8 @@ type ServerMessage =
 终端字节以 Base64 包在 JSON 消息中，确保控制序列和 Unicode 不被错误转换。客户端丢弃已经消费的重叠区间；发现 gap 时发送 `terminal.sync`，服务端按游标补发或返回一次 reset snapshot。
 
 每标签维护递增 `sequence`。浏览器发现序号跳跃时请求 snapshot，而不是猜测遗漏状态。
+
+控制台栏另建一个订阅全部 tabId 的轻量 WebSocket，并发送 `snapshots: false`，只接收后续 `runner.changed`、`answer.added` 和服务状态事件；因此不会为侧栏状态重复读取每个标签的完整 prompt/answer 历史。`GET /api/bootstrap` 返回每标签的轻量 activity 摘要（runner state、active prompt 和最近一次队列完成时间），用于首次渲染及 30 秒提醒恢复。
 
 ## 14. 持久化、并发与崩溃恢复
 

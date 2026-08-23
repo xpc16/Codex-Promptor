@@ -6,6 +6,7 @@ dist/
 !.env.example
 .DS_Store
 Thumbs.db
+codex_sessions_exports.md
 data/index.json
 data/tabs/*
 data/backups/*

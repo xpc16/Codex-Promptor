@@ -3,6 +3,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import net from "node:net";
 import WebSocket from "ws";
+import type { AppServerOwnership } from "../shared/schemas.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -138,10 +139,7 @@ export class CodexRpcClient extends EventEmitter {
       accumulator.turn = turn;
       if (Array.isArray(turn.items)) accumulator.items = turn.items;
       const event: TurnCompletedEvent = { threadId: accumulator.threadId, turnId, turn, items: accumulator.items };
-      this.turns.delete(turnId);
-      this.completed.set(turnId, event);
-      if (threadId) this.activeThreads.delete(threadId);
-      this.emit("turnCompleted", event);
+      this.rememberCompletedTurn(event);
     }
   }
 
@@ -174,12 +172,31 @@ export class CodexRpcClient extends EventEmitter {
     return this.request("thread/start", { cwd, serviceName: "codex-promptor" });
   }
 
-  async readThread(threadId: string): Promise<any> {
-    return this.request("thread/read", { threadId, includeTurns: true });
+  async readThread(threadId: string, timeoutMs = 30_000): Promise<any> {
+    return this.request("thread/read", { threadId, includeTurns: true }, timeoutMs);
+  }
+
+  async readThreadSummary(threadId: string, timeoutMs = 30_000): Promise<any> {
+    return this.request("thread/read", { threadId, includeTurns: false }, timeoutMs);
   }
 
   async resumeThread(threadId: string, cwd: string): Promise<any> {
     return this.request("thread/resume", { threadId, cwd });
+  }
+
+  async loadedThreadIds(timeoutMs = 2_000): Promise<string[]> {
+    const result = await this.request("thread/loaded/list", { limit: 1_000 }, timeoutMs);
+    return Array.isArray(result?.data) ? result.data.map(String).filter(Boolean) : [];
+  }
+
+  async unsubscribeThread(threadId: string, timeoutMs = 2_000): Promise<any> {
+    return this.request("thread/unsubscribe", { threadId }, timeoutMs);
+  }
+
+  async releaseLoadedThreads(timeoutMs = 2_000): Promise<void> {
+    if (!this.connected) return;
+    const threadIds = await this.loadedThreadIds(timeoutMs);
+    await Promise.all(threadIds.map((threadId) => this.unsubscribeThread(threadId, timeoutMs).catch(() => undefined)));
   }
 
   async interruptTurn(threadId: string, turnId: string): Promise<any> {
@@ -201,38 +218,112 @@ export class CodexRpcClient extends EventEmitter {
     return { turnId, raw };
   }
 
-  async waitForTurn(turnId: string, timeoutMs = 24 * 60 * 60 * 1000): Promise<TurnCompletedEvent> {
+  async waitForTurn(turnId: string, timeoutMs = 24 * 60 * 60 * 1000, pollMs = 750): Promise<TurnCompletedEvent> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const already = this.completed.get(turnId);
+      if (already) return already;
+
+      // Codex may route completion notifications to the interactive TUI client
+      // instead of this controller connection. Wait briefly for the normal
+      // notification, then verify the authoritative thread snapshot so a queue
+      // cannot remain stuck on a turn that has already finished in PowerShell.
+      const signaled = await this.waitForTurnNotification(turnId, Math.min(Math.max(0, pollMs), Math.max(0, deadline - Date.now())));
+      if (signaled) return signaled;
+
+      const accumulator = this.turns.get(turnId);
+      if (!accumulator?.threadId) continue;
+      try {
+        const remaining = Math.max(1, deadline - Date.now());
+        const response = await this.readThread(accumulator.threadId, Math.min(30_000, remaining));
+        const thread = response?.thread ?? response?.data?.thread ?? response?.data ?? response;
+        const turn = Array.isArray(thread?.turns)
+          ? thread.turns.find((item: any) => String(item?.id ?? item?.turnId ?? "") === turnId)
+          : null;
+        if (!turn || !turnFinished(turn)) continue;
+        return this.rememberCompletedTurn({
+          threadId: accumulator.threadId,
+          turnId,
+          turn,
+          items: Array.isArray(turn.items) ? turn.items : accumulator.items,
+        });
+      } catch (error) {
+        if (Date.now() >= deadline) throw error;
+        // A transient read failure must not discard a turn whose completion
+        // notification can still arrive on the next iteration.
+      }
+    }
+    throw new Error("TURN_TIMEOUT");
+  }
+
+  private waitForTurnNotification(turnId: string, timeoutMs: number): Promise<TurnCompletedEvent | null> {
     const already = this.completed.get(turnId);
-    if (already) return already;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.removeListener("turnCompleted", onCompleted);
-        reject(new Error("TURN_TIMEOUT"));
-      }, timeoutMs);
-      const onCompleted = (event: TurnCompletedEvent) => {
-        if (event.turnId !== turnId) return;
+    if (already) return Promise.resolve(already);
+    if (timeoutMs <= 0) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const cleanup = () => {
         clearTimeout(timer);
         this.removeListener("turnCompleted", onCompleted);
+      };
+      const onCompleted = (event: TurnCompletedEvent) => {
+        if (event.turnId !== turnId) return;
+        cleanup();
         resolve(event);
       };
+      const timer = setTimeout(() => { cleanup(); resolve(null); }, timeoutMs);
       this.on("turnCompleted", onCompleted);
+      const completedAfterSubscribe = this.completed.get(turnId);
+      if (completedAfterSubscribe) { cleanup(); resolve(completedAfterSubscribe); }
     });
   }
 
-  async waitForThreadIdle(threadId: string, timeoutMs = 24 * 60 * 60 * 1000): Promise<void> {
+  private rememberCompletedTurn(event: TurnCompletedEvent): TurnCompletedEvent {
+    const existing = this.completed.get(event.turnId);
+    if (existing) return existing;
+    this.turns.delete(event.turnId);
+    this.completed.set(event.turnId, event);
+    if (event.threadId) this.activeThreads.delete(event.threadId);
+    this.emit("turnCompleted", event);
+    return event;
+  }
+
+  async waitForThreadIdle(threadId: string, timeoutMs = 24 * 60 * 60 * 1000, pollMs = 750): Promise<void> {
     if (!this.activeThreads.has(threadId)) return;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.removeListener("turnCompleted", onCompleted);
-        reject(new Error("THREAD_IDLE_TIMEOUT"));
-      }, timeoutMs);
-      const onCompleted = (event: TurnCompletedEvent) => {
-        if (event.threadId !== threadId || this.activeThreads.has(threadId)) return;
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!this.activeThreads.has(threadId)) return;
+      const signaled = await this.waitForThreadIdleNotification(threadId, Math.min(Math.max(0, pollMs), Math.max(0, deadline - Date.now())));
+      if (signaled || !this.activeThreads.has(threadId)) return;
+      try {
+        const remaining = Math.max(1, deadline - Date.now());
+        const response = await this.readThread(threadId, Math.min(30_000, remaining));
+        const thread = response?.thread ?? response?.data?.thread ?? response?.data ?? response;
+        if (!threadIdle(thread)) continue;
+        this.activeThreads.delete(threadId);
+        return;
+      } catch (error) {
+        if (Date.now() >= deadline) throw error;
+      }
+    }
+    throw new Error("THREAD_IDLE_TIMEOUT");
+  }
+
+  private waitForThreadIdleNotification(threadId: string, timeoutMs: number): Promise<boolean> {
+    if (!this.activeThreads.has(threadId)) return Promise.resolve(true);
+    if (timeoutMs <= 0) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const cleanup = () => {
         clearTimeout(timer);
         this.removeListener("turnCompleted", onCompleted);
-        resolve();
       };
+      const onCompleted = (event: TurnCompletedEvent) => {
+        if (event.threadId !== threadId || this.activeThreads.has(threadId)) return;
+        cleanup();
+        resolve(true);
+      };
+      const timer = setTimeout(() => { cleanup(); resolve(false); }, timeoutMs);
       this.on("turnCompleted", onCompleted);
+      if (!this.activeThreads.has(threadId)) { cleanup(); resolve(true); }
     });
   }
 
@@ -248,8 +339,19 @@ export class CodexRpcClient extends EventEmitter {
   }
 }
 
+function turnFinished(turn: any): boolean {
+  const status = String(turn?.status?.type ?? turn?.status ?? turn?.state ?? "").toLowerCase();
+  return ["completed", "failed", "interrupted", "canceled", "cancelled"].includes(status);
+}
+
+function threadIdle(thread: any): boolean {
+  const status = String(thread?.status?.type ?? thread?.status ?? thread?.state ?? "").toLowerCase();
+  if (status === "idle") return true;
+  return Array.isArray(thread?.turns) && thread.turns.length > 0 && thread.turns.every(turnFinished);
+}
+
 export async function waitForThreadLoaded(
-  rpc: Pick<CodexRpcClient, "readThread">,
+  rpc: Pick<CodexRpcClient, "readThreadSummary">,
   threadId: string,
   timeoutMs = 30_000,
   pollMs = 200,
@@ -262,7 +364,7 @@ export async function waitForThreadLoaded(
     const terminalError = startupError?.();
     if (terminalError) throw new Error(terminalError);
     try {
-      const response = await rpc.readThread(threadId);
+      const response = await rpc.readThreadSummary(threadId);
       const thread = response?.thread ?? response?.data?.thread ?? response?.data ?? response;
       lastStatus = String(thread?.status?.type ?? "unknown");
       if (lastStatus === "idle" || lastStatus === "active") return thread;
@@ -287,10 +389,12 @@ export class AppServerManager extends EventEmitter {
   private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   private intentionalStop = false;
+  private ownershipInfo: AppServerOwnership | null = null;
   private _status: CodexManagerStatus = { state: "stopped", url: null, error: null };
 
   get status(): CodexManagerStatus { return { ...this._status }; }
   get remoteUrl(): string | null { return this.url; }
+  get ownership(): AppServerOwnership | null { return this.ownershipInfo ? { ...this.ownershipInfo } : null; }
 
   async start(): Promise<void> {
     if (this._status.state === "ready") return;
@@ -302,10 +406,12 @@ export class AppServerManager extends EventEmitter {
 
   private async startInternal(): Promise<void> {
     this.intentionalStop = false;
+    this.ownershipInfo = null;
     this.setStatus({ state: "starting", url: null, error: null });
     try {
       const port = await freePort();
       const command = process.platform === "win32" ? "codex.cmd" : "codex";
+      const startedAt = new Date().toISOString();
       this.port = port;
       this.url = `ws://127.0.0.1:${port}`;
       this.process = spawn(command, ["app-server", "--listen", this.url], {
@@ -322,12 +428,14 @@ export class AppServerManager extends EventEmitter {
       });
       await waitForHttpReady(`http://127.0.0.1:${port}/readyz`, 15_000);
       await connectWithRetry(this.rpc, this.url, 15_000);
+      this.ownershipInfo = await captureAppServerOwnership(port, this.process?.pid ?? null, startedAt);
       this.setStatus({ state: "ready", url: this.url, error: null });
     } catch (error) {
       this.rpc.close();
       const child = this.process;
       this.process = null;
       if (child?.pid) await terminateProcessTree(child.pid).catch(() => undefined);
+      this.ownershipInfo = null;
       this.setStatus({ state: "error", url: this.url, error: error instanceof Error ? error.message : String(error) });
     }
   }
@@ -352,12 +460,22 @@ export class AppServerManager extends EventEmitter {
 
   private async stopInternal(): Promise<void> {
     this.intentionalStop = true;
+    await this.rpc.releaseLoadedThreads(1_500).catch(() => undefined);
     this.rpc.close();
     const child = this.process;
     const port = this.port;
+    const ownership = this.ownershipInfo;
     this.process = null;
-    if (child?.pid) await terminateProcessTree(child.pid);
-    if (port !== null) await waitForPortClosed(port, 5_000);
+    this.ownershipInfo = null;
+    if (child?.pid) await terminateProcessTree(child.pid).catch(() => undefined);
+    if (port !== null) {
+      try {
+        await waitForPortClosed(port, 750);
+      } catch {
+        if (ownership) await terminateStaleAppServer(ownership);
+        await waitForPortClosed(port, 5_000);
+      }
+    }
     this.port = null;
     this.url = null;
     this.setStatus({ state: "stopped", url: null, error: null });
@@ -403,9 +521,12 @@ export class AppServerPool extends EventEmitter {
   async stop(tabId: string): Promise<void> {
     const manager = this.managers.get(tabId);
     if (!manager) return;
-    await manager.stop();
-    this.managers.delete(tabId);
-    this.emit("removed", { tabId, aggregate: this.status });
+    try {
+      await manager.stop();
+    } finally {
+      this.managers.delete(tabId);
+      this.emit("removed", { tabId, aggregate: this.status });
+    }
   }
 
   async stopAll(): Promise<void> {
@@ -413,6 +534,67 @@ export class AppServerPool extends EventEmitter {
       await manager.stop();
       this.managers.delete(tabId);
     }));
+  }
+}
+
+type ListeningProcess = {
+  pid: number;
+  commandLine: string;
+  startedAt: string;
+};
+
+/**
+ * Terminates only a listener whose PID, endpoint and creation time match an
+ * App Server previously launched by this tool. This is used after an
+ * ungraceful backend exit, when the original launcher process may be gone.
+ */
+export async function terminateStaleAppServer(ownership: AppServerOwnership): Promise<boolean> {
+  if (process.platform !== "win32") return false;
+  const listener = await inspectWindowsAppServerListener(ownership.port);
+  if (!listener || !matchesOwnership(listener, ownership)) return false;
+  await terminateProcessTree(listener.pid);
+  await waitForPortClosed(ownership.port, 5_000);
+  return true;
+}
+
+async function captureAppServerOwnership(port: number, launcherPid: number | null, fallbackStartedAt: string): Promise<AppServerOwnership> {
+  const listener = process.platform === "win32" ? await inspectWindowsAppServerListener(port) : null;
+  return {
+    launcherPid,
+    listenerPid: listener?.pid ?? null,
+    port,
+    startedAt: listener?.startedAt ?? fallbackStartedAt,
+  };
+}
+
+function matchesOwnership(listener: ListeningProcess, ownership: AppServerOwnership): boolean {
+  if (ownership.listenerPid === null || listener.pid !== ownership.listenerPid) return false;
+  const expectedEndpoint = `ws://127.0.0.1:${ownership.port}`.toLowerCase();
+  const commandLine = listener.commandLine.toLowerCase();
+  if (!commandLine.includes("app-server") || !commandLine.includes(expectedEndpoint)) return false;
+  const expectedStart = Date.parse(ownership.startedAt);
+  const actualStart = Date.parse(listener.startedAt);
+  return Number.isFinite(expectedStart) && Number.isFinite(actualStart) && Math.abs(expectedStart - actualStart) <= 2_000;
+}
+
+async function inspectWindowsAppServerListener(port: number): Promise<ListeningProcess | null> {
+  if (process.platform !== "win32") return null;
+  const script = [
+    `$connection = Get-NetTCPConnection -State Listen -LocalAddress '127.0.0.1' -LocalPort ${port} -ErrorAction SilentlyContinue | Select-Object -First 1`,
+    "if ($null -eq $connection) { exit 4 }",
+    "$processInfo = Get-CimInstance Win32_Process -Filter \"ProcessId = $($connection.OwningProcess)\" -ErrorAction SilentlyContinue",
+    "if ($null -eq $processInfo) { exit 5 }",
+    "$startedAt = $processInfo.CreationDate.ToUniversalTime().ToString('o')",
+    "[pscustomobject]@{ pid = [int]$processInfo.ProcessId; commandLine = [string]$processInfo.CommandLine; startedAt = $startedAt } | ConvertTo-Json -Compress",
+  ].join("; ");
+  try {
+    const result = await execFileAsync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true });
+    const value = JSON.parse(String(result.stdout).trim());
+    const pid = Number(value?.pid);
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    return { pid, commandLine: String(value?.commandLine ?? ""), startedAt: String(value?.startedAt ?? "") };
+  } catch {
+    return null;
   }
 }
 

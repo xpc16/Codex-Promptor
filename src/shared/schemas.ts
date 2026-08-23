@@ -36,6 +36,7 @@ export const PromptSchema = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   origin: OriginSchema,
+  threadId: z.string().nullable().default(null),
   startedAt: z.string().nullable(),
   completedAt: z.string().nullable(),
   codexTurnId: z.string().nullable(),
@@ -81,12 +82,19 @@ export type AnswerFile = z.infer<typeof AnswerFileSchema>;
 
 export const SessionSchema = z.object({
   state: z.enum(["unconfigured", "connecting", "ready", "closed", "error"]),
+  reopenOnLaunch: z.boolean().default(false),
   workingDirectory: z.string().nullable(),
   threadId: z.string().nullable(),
   sessionId: z.string().nullable(),
   createdAt: z.string().nullable(),
   connectedAt: z.string().nullable(),
   lastError: z.object({ code: z.string(), message: z.string() }).nullable(),
+  lastThreadSwitch: z.object({
+    fromThreadId: z.string(),
+    toThreadId: z.string(),
+    method: z.enum(["thread/start", "thread/resume", "thread/fork"]),
+    switchedAt: z.string(),
+  }).nullable().default(null),
 });
 export type Session = z.infer<typeof SessionSchema>;
 
@@ -114,6 +122,14 @@ export const RunnerStateSchema = z.enum([
 ]);
 export type RunnerState = z.infer<typeof RunnerStateSchema>;
 
+export const AppServerOwnershipSchema = z.object({
+  launcherPid: z.number().int().positive().nullable(),
+  listenerPid: z.number().int().positive().nullable(),
+  port: z.number().int().min(1).max(65_535),
+  startedAt: z.string(),
+});
+export type AppServerOwnership = z.infer<typeof AppServerOwnershipSchema>;
+
 export const RuntimeFileSchema = z.object({
   schemaVersion: z.number().default(1),
   revision: z.number().default(0),
@@ -137,7 +153,8 @@ export const RuntimeFileSchema = z.object({
     lastExitCode: z.number().nullable().default(null),
     lastStartedAt: z.string().nullable().default(null),
     lastError: z.object({ code: z.string(), message: z.string() }).nullable().default(null),
-  }).default({ state: "stopped", lastExitCode: null, lastStartedAt: null, lastError: null }),
+    appServer: AppServerOwnershipSchema.nullable().default(null),
+  }).default({ state: "stopped", lastExitCode: null, lastStartedAt: null, lastError: null, appServer: null }),
   reconciliation: z.object({
     required: z.boolean().default(false),
     lastCompletedAt: z.string().nullable().default(null),
@@ -165,8 +182,9 @@ export const IndexFileSchema = z.object({
   ui: z.object({
     consoleWidth: z.number().min(220).max(520).default(300),
     theme: z.enum(["light", "dark"]).default("light"),
+    locale: z.enum(["zh-CN", "en"]).default("zh-CN"),
     ungroupedCollapsed: z.boolean().default(false),
-  }).default({ consoleWidth: 300, theme: "light", ungroupedCollapsed: false }),
+  }).default({ consoleWidth: 300, theme: "light", locale: "zh-CN", ungroupedCollapsed: false }),
 });
 export type IndexFile = z.infer<typeof IndexFileSchema>;
 
@@ -179,12 +197,14 @@ export type TabBundle = {
 
 export const defaultSession = (): Session => ({
   state: "unconfigured",
+  reopenOnLaunch: false,
   workingDirectory: null,
   threadId: null,
   sessionId: null,
   createdAt: null,
   connectedAt: null,
   lastError: null,
+  lastThreadSwitch: null,
 });
 
 export const defaultRuntime = (): RuntimeFile => RuntimeFileSchema.parse({
@@ -198,7 +218,7 @@ export const defaultRuntime = (): RuntimeFile => RuntimeFileSchema.parse({
     lastError: null,
     lastTransitionAt: isoNow(),
   },
-  terminal: { state: "stopped", lastExitCode: null, lastStartedAt: null, lastError: null },
+  terminal: { state: "stopped", lastExitCode: null, lastStartedAt: null, lastError: null, appServer: null },
   reconciliation: { required: false, lastCompletedAt: null },
 });
 
@@ -223,6 +243,7 @@ export const newPrompt = (text: string, origin: Origin = "queue"): PromptRecord 
   createdAt: isoNow(),
   updatedAt: isoNow(),
   origin,
+  threadId: null,
   startedAt: null,
   completedAt: null,
   codexTurnId: null,

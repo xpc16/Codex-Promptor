@@ -20,11 +20,16 @@ if (process.env.CODEX_PROMPTOR_AUTO_EXIT !== "0") {
 }
 
 await app.listen({ host: "127.0.0.1", port });
+const restorePromise = app.promptor.restoreOpenSessions();
 const address = app.server.address();
 const actualPort = typeof address === "object" && address ? address.port : port;
 const url = `http://127.0.0.1:${actualPort}/`;
 console.log(`Codex Promptor ready: ${url}`);
 console.log(`Data directory: ${app.promptor.storage.dataDir}`);
+void restorePromise.then(({ restored, failed }) => {
+  if (restored.length) console.log(`Restored ${restored.length} previously open Codex conversation(s).`);
+  for (const item of failed) console.error(`Failed to restore tab ${item.tabId} [${item.code}]: ${item.message}`);
+});
 if (process.platform === "win32" && process.env.CODEX_PROMPTOR_OPEN !== "0") {
   spawn("cmd.exe", ["/d", "/c", "start", "", url], { windowsHide: true, stdio: "ignore" });
 }

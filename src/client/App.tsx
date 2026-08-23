@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -11,10 +12,23 @@ import {
 } from "react";
 import type { AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta } from "../shared/schemas.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
+import { completionNoticeExpiresAt, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
 import ReactMarkdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
+import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import {
+  createI18n,
+  I18nContext,
+  PromptorApiError,
+  promptStatusLabel,
+  runnerLabel,
+  serviceStateLabel,
+  terminalStateLabel,
+  useI18n,
+  type Locale,
+} from "./i18n.js";
 
 const token = new URLSearchParams(location.search).get("token") ?? "";
 
@@ -24,11 +38,54 @@ async function api<T = any>(url: string, init: RequestInit = {}): Promise<T> {
   if (init.body && !headers.has("content-type")) headers.set("content-type", "application/json");
   const response = await fetch(url, { ...init, headers });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload?.error?.message ?? `HTTP ${response.status}`);
+  if (!response.ok) throw new PromptorApiError(
+    String(payload?.error?.code ?? "HTTP_ERROR"),
+    String(payload?.error?.message ?? `HTTP ${response.status}`),
+    response.status,
+    Boolean(payload?.error?.retryable),
+  );
   return payload.data as T;
 }
 
 function jsonBody(value: unknown): RequestInit { return { method: "POST", body: JSON.stringify(value) }; }
+
+let promptCompletionAudioContext: AudioContext | null = null;
+
+function getPromptCompletionAudioContext(): AudioContext | null {
+  if (promptCompletionAudioContext) return promptCompletionAudioContext;
+  const AudioContextConstructor = window.AudioContext ?? (window as any).webkitAudioContext;
+  if (!AudioContextConstructor) return null;
+  try { promptCompletionAudioContext = new AudioContextConstructor(); }
+  catch { return null; }
+  return promptCompletionAudioContext;
+}
+
+async function primePromptCompletionSound(): Promise<void> {
+  const context = getPromptCompletionAudioContext();
+  if (context?.state === "suspended") await context.resume().catch(() => undefined);
+}
+
+async function playPromptCompletionSound(): Promise<void> {
+  const context = getPromptCompletionAudioContext();
+  if (!context) return;
+  if (context.state === "suspended") await context.resume().catch(() => undefined);
+  if (context.state !== "running") return;
+  const start = context.currentTime + .01;
+  const tone = (frequency: number, offset: number, duration: number, volume: number) => {
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(frequency, start + offset);
+    gain.gain.setValueAtTime(.0001, start + offset);
+    gain.gain.exponentialRampToValueAtTime(volume, start + offset + .012);
+    gain.gain.exponentialRampToValueAtTime(.0001, start + offset + duration);
+    oscillator.connect(gain).connect(context.destination);
+    oscillator.start(start + offset);
+    oscillator.stop(start + offset + duration + .02);
+  };
+  tone(784, 0, .09, .045);
+  tone(1_046.5, .072, .15, .04);
+}
 
 type AppDialog =
   | { kind: "group" }
@@ -41,20 +98,54 @@ export function App() {
   const [index, setIndex] = useState<IndexFile | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [service, setService] = useState<any>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown | null>(null);
   const [viewNonce, setViewNonce] = useState(0);
   const [consoleWidth, setConsoleWidth] = useState(300);
   const [dialog, setDialog] = useState<AppDialog | null>(null);
   const [clock, setClock] = useState(() => new Date());
+  const [activities, setActivities] = useState<Record<string, TabActivitySummary>>({});
+  const [recentCompletionExpiries, setRecentCompletionExpiries] = useState<Record<string, number>>({});
   const consoleDragging = useRef(false);
   const consoleWidthRef = useRef(300);
   const navigationBusy = useRef(false);
   const dragItem = useRef<{ type: "group" | "tab"; id: string } | null>(null);
+  const completionTimers = useRef(new Map<string, number>());
+  const completionExpiries = useRef(new Map<string, number>());
+  const locale: Locale = index?.ui.locale ?? "zh-CN";
+  const i18n = useMemo(() => createI18n(locale), [locale]);
+  const { t } = i18n;
+
+  const markRecentCompletion = useCallback((tabId: string, completedAt: string | null, audible: boolean) => {
+    const expiresAt = completionNoticeExpiresAt(completedAt);
+    if (audible) void playPromptCompletionSound();
+    if (!expiresAt || expiresAt <= Date.now()) return;
+    const effectiveExpiry = Math.max(expiresAt, completionExpiries.current.get(tabId) ?? 0);
+    completionExpiries.current.set(tabId, effectiveExpiry);
+    const oldTimer = completionTimers.current.get(tabId);
+    if (oldTimer !== undefined) window.clearTimeout(oldTimer);
+    setRecentCompletionExpiries((current) => ({ ...current, [tabId]: effectiveExpiry }));
+    const timer = window.setTimeout(() => {
+      if (completionExpiries.current.get(tabId) !== effectiveExpiry) return;
+      completionExpiries.current.delete(tabId);
+      completionTimers.current.delete(tabId);
+      setRecentCompletionExpiries((current) => {
+        if (current[tabId] !== effectiveExpiry) return current;
+        const next = { ...current };
+        delete next[tabId];
+        return next;
+      });
+    }, Math.max(0, effectiveExpiry - Date.now()));
+    completionTimers.current.set(tabId, timer);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
-      const data = await api<{ index: IndexFile; app: any }>("/api/bootstrap");
+      const data = await api<{ index: IndexFile; activities: Record<string, TabActivitySummary>; app: any }>("/api/bootstrap");
       setIndex(data.index);
+      setActivities(data.activities);
+      for (const [tabId, activity] of Object.entries(data.activities)) {
+        markRecentCompletion(tabId, activity.lastQueueCompletedAt, false);
+      }
       setService(data.app);
       if (!consoleDragging.current) {
         consoleWidthRef.current = data.index.ui.consoleWidth;
@@ -62,11 +153,28 @@ export function App() {
       }
       setSelectedId((current) => current && data.index.tabs.some((tab) => tab.id === current) ? current : data.index.tabs[0]?.id ?? null);
       setError(null);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-  }, []);
+    } catch (reason) { setError(reason); }
+  }, [markRecentCompletion]);
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => { if (index) document.documentElement.dataset.theme = index.ui.theme; }, [index?.ui.theme]);
+  useEffect(() => { document.documentElement.lang = locale; }, [locale]);
+  useEffect(() => {
+    const prime = () => { void primePromptCompletionSound(); };
+    document.addEventListener("pointerdown", prime, { once: true });
+    document.addEventListener("keydown", prime, { once: true });
+    return () => {
+      document.removeEventListener("pointerdown", prime);
+      document.removeEventListener("keydown", prime);
+    };
+  }, []);
+  useEffect(() => () => {
+    for (const timer of completionTimers.current.values()) window.clearTimeout(timer);
+    completionTimers.current.clear();
+    completionExpiries.current.clear();
+  }, []);
+
+  const tabIdsKey = useMemo(() => (index?.tabs ?? []).map((tab) => tab.id).sort().join(","), [index]);
   useEffect(() => {
     let disposed = false;
     let socket: WebSocket | null = null;
@@ -75,6 +183,43 @@ export function App() {
     const connect = () => {
       if (disposed) return;
       socket = new WebSocket(`${protocol}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ""}`);
+      socket.onopen = () => socket?.send(JSON.stringify({
+        type: "subscribe",
+        tabIds: tabIdsKey ? tabIdsKey.split(",") : [],
+        snapshots: false,
+      }));
+      socket.onmessage = (event) => {
+        let message: any;
+        try { message = JSON.parse(String(event.data)); } catch { return; }
+        const tabId = typeof message.tabId === "string" ? message.tabId : "";
+        if (message.type === "runner.changed" && tabId && message.runner?.runner) {
+          const runtime = message.runner as RuntimeFile;
+          setActivities((current) => ({
+            ...current,
+            [tabId]: {
+              runnerState: runtime.runner.state,
+              desiredState: runtime.runner.desiredState,
+              activePromptId: runtime.runner.activePromptId,
+              lastQueueCompletedAt: current[tabId]?.lastQueueCompletedAt ?? null,
+            },
+          }));
+        } else if (message.type === "answer.added" && tabId && message.answer?.origin === "queue") {
+          const answer = message.answer as AnswerRecord;
+          const completedAt = answer.completedAt ?? answer.recordedAt;
+          setActivities((current) => ({
+            ...current,
+            [tabId]: {
+              runnerState: current[tabId]?.runnerState ?? "paused",
+              desiredState: current[tabId]?.desiredState ?? "paused",
+              activePromptId: current[tabId]?.activePromptId ?? null,
+              lastQueueCompletedAt: completedAt,
+            },
+          }));
+          markRecentCompletion(tabId, completedAt, true);
+        } else if (message.type === "service.changed") {
+          setService((current: any) => ({ ...(current ?? {}), codex: message.codex }));
+        }
+      };
       socket.onclose = () => {
         socket = null;
         if (!disposed) retryTimer = window.setTimeout(connect, 1_000);
@@ -86,7 +231,7 @@ export function App() {
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       socket?.close();
     };
-  }, []);
+  }, [markRecentCompletion, tabIdsKey]);
   useEffect(() => {
     const timer = window.setInterval(() => setClock(new Date()), 30_000);
     return () => window.clearInterval(timer);
@@ -95,7 +240,7 @@ export function App() {
   const updatePreferences = useCallback(async (patch: Partial<IndexFile["ui"]>) => {
     setIndex((current) => current ? { ...current, ui: { ...current.ui, ...patch } } : current);
     try { setIndex(await api<IndexFile>("/api/preferences", { method: "PATCH", body: JSON.stringify(patch) })); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); await refresh(); }
+    catch (reason) { setError(reason); await refresh(); }
   }, [refresh]);
 
   useEffect(() => {
@@ -120,8 +265,8 @@ export function App() {
   const ungrouped = index?.tabs.filter((tab) => !tab.groupId).sort((a, b) => a.order - b.order) ?? [];
 
   const createTab = async () => {
-    try { const tab = await api<TabMeta>("/api/tabs", jsonBody({ name: "新对话" })); await refresh(); setSelectedId(tab.id); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    try { const tab = await api<TabMeta>("/api/tabs", jsonBody({ name: t("dialog.defaultConversationName") })); await refresh(); setSelectedId(tab.id); }
+    catch (reason) { setError(reason); }
   };
 
   const submitDialog = async (value: string) => {
@@ -134,7 +279,7 @@ export function App() {
       setDialog(null);
       await refresh();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(reason);
       throw reason;
     }
   };
@@ -147,7 +292,7 @@ export function App() {
       setDialog(null);
       await refresh();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(reason);
       throw reason;
     }
   };
@@ -162,7 +307,7 @@ export function App() {
       { groupId: null, tabIds: orderedTabIds(nextTabs, null) },
     ];
     try { setIndex(await api<IndexFile>("/api/navigation/order", { method: "PUT", body: JSON.stringify({ groupIds, sections }) })); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); await refresh(); }
+    catch (reason) { setError(reason); await refresh(); }
     finally { navigationBusy.current = false; }
   };
 
@@ -194,71 +339,81 @@ export function App() {
 
   const toggleGroup = async (group: Group) => {
     try { await api(`/api/groups/${group.id}`, { method: "PATCH", body: JSON.stringify({ collapsed: !group.collapsed }) }); await refresh(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { setError(reason); }
   };
 
   const reloadSelected = async () => { await refresh(); setViewNonce((value) => value + 1); };
   const syncSelected = async () => {
     if (!selected?.session.threadId) return;
     try { await api(`/api/tabs/${selected.id}/history/sync`, { method: "POST" }); await reloadSelected(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { setError(reason); }
   };
 
-  if (!index) return <div className="loading-screen"><div className="orb" /><p>{error ?? "正在打开 Promptor…"}</p><button onClick={() => void refresh()}>重试</button></div>;
+  if (!index) return <I18nContext.Provider value={i18n}><div className="loading-screen"><div className="orb" /><p>{error ? i18n.errorText(error) : t("app.loading")}</p><button onClick={() => void refresh()}>{t("action.retry")}</button></div></I18nContext.Provider>;
 
-  return <div className="app-shell" style={{ gridTemplateColumns: `${consoleWidth}px 7px minmax(0, 1fr)` }}>
-    <aside className="sidebar" aria-label="控制台栏">
-      <div className="brand"><div className="brand-mark">✦</div><div><strong>Promptor</strong><span>Codex 控制台</span></div></div>
-      <div className="sidebar-actions"><button className="primary small" onClick={() => void createTab()}>＋ 新建对话</button><button className="icon-button" title="新建分组" onClick={() => setDialog({ kind: "group" })}>＋组</button></div>
+  return <I18nContext.Provider value={i18n}><div className="app-shell" style={{ gridTemplateColumns: `${consoleWidth}px 7px minmax(0, 1fr)` }}>
+    <aside className="sidebar" aria-label={t("aria.console")}>
+      <div className="brand"><div className="brand-mark">✦</div><div><strong>Promptor</strong><span>{t("brand.subtitle")}</span></div></div>
+      <div className="sidebar-actions"><button className="primary small" onClick={() => void createTab()}>{t("nav.newConversation")}</button><button className="icon-button" title={t("nav.newGroupTitle")} onClick={() => setDialog({ kind: "group" })}>{t("nav.newGroup")}</button></div>
       <div className="tab-tree">
         {groups.map((group) => {
           const groupTabs = index.tabs.filter((tab) => tab.groupId === group.id).sort((a, b) => a.order - b.order);
           return <div className="group" key={group.id}>
             <div className="group-heading" draggable onDragStart={() => { dragItem.current = { type: "group", id: group.id }; }} onDragEnd={() => { dragItem.current = null; }} onDragEnter={(event) => { event.preventDefault(); if (dragItem.current?.type === "group") moveGroup(dragItem.current.id, group.id); else if (dragItem.current?.type === "tab" && groupTabs.length === 0) moveTab(dragItem.current.id, null, group.id); }}>
-              <button className="collapse-button" aria-label={group.collapsed ? `展开 ${group.name}` : `折叠 ${group.name}`} onClick={() => void toggleGroup(group)}>{group.collapsed ? "▸" : "▾"}</button><span className="group-drag" title="拖动分组排序">⠿</span><span className="group-name">{group.name}</span><em>{groupTabs.length}</em><button className="rename-button" aria-label={`重命名分组 ${group.name}`} onClick={() => setDialog({ kind: "rename-group", groupId: group.id, initialValue: group.name })}>✎</button><button className="row-delete-button" aria-label={`删除分组 ${group.name}`} title="删除分组，对话移到未分组" onMouseDown={(event) => event.stopPropagation()} onClick={() => setDialog({ kind: "delete-group", groupId: group.id, name: group.name, tabCount: groupTabs.length })}>×</button>
+              <button className="collapse-button" aria-label={t(group.collapsed ? "nav.expand" : "nav.collapse", { name: group.name })} onClick={() => void toggleGroup(group)}>{group.collapsed ? "▸" : "▾"}</button><span className="group-name">{group.name}</span><em>{groupTabs.length}</em><RowActionsMenu subject={t("nav.groupSubject", { name: group.name })} deleteTitle={t("nav.deleteGroupHint")} onEdit={() => setDialog({ kind: "rename-group", groupId: group.id, initialValue: group.name })} onDelete={() => setDialog({ kind: "delete-group", groupId: group.id, name: group.name, tabCount: groupTabs.length })} />
             </div>
-            {!group.collapsed && groupTabs.map((tab) => <ConsoleTabRow key={tab.id} tab={tab} selected={tab.id === selectedId} onClick={() => setSelectedId(tab.id)} onRename={() => setDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => setDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={() => { dragItem.current = { type: "tab", id: tab.id }; }} onDragEnd={() => { dragItem.current = null; }} onDragEnter={() => { if (dragItem.current?.type === "tab") moveTab(dragItem.current.id, tab.id, group.id); }} />)}
+            {!group.collapsed && groupTabs.map((tab) => <ConsoleTabRow key={tab.id} tab={tab} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletionExpiries[tab.id])} selected={tab.id === selectedId} onClick={() => setSelectedId(tab.id)} onRename={() => setDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => setDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={() => { dragItem.current = { type: "tab", id: tab.id }; }} onDragEnd={() => { dragItem.current = null; }} onDragEnter={() => { if (dragItem.current?.type === "tab") moveTab(dragItem.current.id, tab.id, group.id); }} />)}
           </div>;
         })}
         <div className="group ungrouped-group">
           <div className="group-heading" onDragEnter={(event) => { event.preventDefault(); if (dragItem.current?.type === "tab" && ungrouped.length === 0) moveTab(dragItem.current.id, null, null); }}>
-            <button className="collapse-button" aria-label={index.ui.ungroupedCollapsed ? "展开未分组" : "折叠未分组"} onClick={() => void updatePreferences({ ungroupedCollapsed: !index.ui.ungroupedCollapsed })}>{index.ui.ungroupedCollapsed ? "▸" : "▾"}</button><span className="group-name">未分组</span><em>{ungrouped.length}</em>
+            <button className="collapse-button" aria-label={t(index.ui.ungroupedCollapsed ? "nav.expand" : "nav.collapse", { name: t("nav.ungrouped") })} onClick={() => void updatePreferences({ ungroupedCollapsed: !index.ui.ungroupedCollapsed })}>{index.ui.ungroupedCollapsed ? "▸" : "▾"}</button><span className="group-name">{t("nav.ungrouped")}</span><em>{ungrouped.length}</em>
           </div>
-          {!index.ui.ungroupedCollapsed && ungrouped.map((tab) => <ConsoleTabRow key={tab.id} tab={tab} selected={tab.id === selectedId} onClick={() => setSelectedId(tab.id)} onRename={() => setDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => setDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={() => { dragItem.current = { type: "tab", id: tab.id }; }} onDragEnd={() => { dragItem.current = null; }} onDragEnter={() => { if (dragItem.current?.type === "tab") moveTab(dragItem.current.id, tab.id, null); }} />)}
+          {!index.ui.ungroupedCollapsed && ungrouped.map((tab) => <ConsoleTabRow key={tab.id} tab={tab} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletionExpiries[tab.id])} selected={tab.id === selectedId} onClick={() => setSelectedId(tab.id)} onRename={() => setDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => setDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={() => { dragItem.current = { type: "tab", id: tab.id }; }} onDragEnd={() => { dragItem.current = null; }} onDragEnter={() => { if (dragItem.current?.type === "tab") moveTab(dragItem.current.id, tab.id, null); }} />)}
         </div>
-        {!groups.length && !ungrouped.length && <div className="empty-sidebar">还没有对话<br /><span>从上方新建一个对话标签</span></div>}
+        {!groups.length && !ungrouped.length && <div className="empty-sidebar">{t("nav.empty")}<br /><span>{t("nav.emptyHint")}</span></div>}
       </div>
       <div className="sidebar-footer">
-        {selected && <label className="footer-select"><span>当前对话分组</span><select value={selected.groupId ?? ""} onChange={(event) => moveTab(selected.id, null, event.target.value || null)}><option value="">未分组</option>{groups.map((group) => <option value={group.id} key={group.id}>{group.name}</option>)}</select></label>}
-        <div className="footer-actions"><button className="ghost" onClick={() => void reloadSelected()}>↻ 刷新</button><button className="ghost" disabled={!selected?.session.threadId || selected.session.state === "closed"} onClick={() => void syncSelected()}>同步历史</button></div>
-        <button className="theme-toggle" onClick={() => void updatePreferences({ theme: index.ui.theme === "light" ? "dark" : "light" })}><span>{index.ui.theme === "light" ? "☾" : "☀"}</span>{index.ui.theme === "light" ? "切换深色模式" : "切换浅色模式"}</button>
-        <div className="service-status" title={`Codex App Server: ${service?.codex?.state ?? "starting"}`}><span className={`status-dot ${service?.codex?.state === "ready" ? "ready" : service?.codex?.state === "error" ? "error" : ""}`} />Codex App Server <time className="muted">{formatClock(clock)}</time></div>
+        {selected && <label className="footer-select"><span>{t("footer.currentGroup")}</span><select value={selected.groupId ?? ""} onChange={(event) => moveTab(selected.id, null, event.target.value || null)}><option value="">{t("nav.ungrouped")}</option>{groups.map((group) => <option value={group.id} key={group.id}>{group.name}</option>)}</select></label>}
+        <div className="footer-actions"><button className="ghost" onClick={() => void reloadSelected()}>{t("footer.refresh")}</button><button className="ghost" disabled={!selected?.session.threadId || selected.session.state === "closed"} onClick={() => void syncSelected()}>{t("footer.syncHistory")}</button></div>
+        <div className="footer-bottom-row">
+          <button className="footer-compact-button theme-icon-toggle" title={t(index.ui.theme === "light" ? "theme.toDark" : "theme.toLight")} aria-label={t(index.ui.theme === "light" ? "theme.toDark" : "theme.toLight")} onClick={() => void updatePreferences({ theme: index.ui.theme === "light" ? "dark" : "light" })}><ThemeIcon theme={index.ui.theme} /></button>
+          <div className="service-status" title={t("service.title", { state: serviceStateLabel(i18n, service?.codex?.state) })}><span className={`status-dot ${service?.codex?.state === "ready" ? "ready" : service?.codex?.state === "error" ? "error" : ""}`} /><time>{i18n.formatClock(clock)}</time></div>
+          <button className="footer-compact-button locale-toggle" title={t(locale === "zh-CN" ? "language.toEnglish" : "language.toChinese")} aria-label={t(locale === "zh-CN" ? "language.toEnglish" : "language.toChinese")} onClick={() => void updatePreferences({ locale: locale === "zh-CN" ? "en" : "zh-CN" })}><span className={locale === "zh-CN" ? "active" : ""}>中</span><span aria-hidden="true">/</span><span className={locale === "en" ? "active" : ""}>En</span></button>
+        </div>
       </div>
     </aside>
-    <div className="console-splitter" role="separator" aria-label="调整控制台栏宽度" onMouseDown={() => { consoleDragging.current = true; }} />
-    <main className="workspace" aria-label="对话页">
-      {error && <div className="toast error-toast">{error}<button onClick={() => setError(null)}>×</button></div>}
+    <div className="console-splitter" role="separator" aria-label={t("aria.resizeConsole")} onMouseDown={() => { consoleDragging.current = true; }} />
+    <main className="workspace" aria-label={t("aria.conversationPage")}>
+      {Boolean(error) && <div className="toast error-toast">{i18n.errorText(error)}<button onClick={() => setError(null)}>×</button></div>}
       {selected ? <TabView key={`${selected.id}-${viewNonce}`} tab={selected} theme={index.ui.theme} onChanged={refresh} onError={setError} /> : <Welcome onCreate={() => void createTab()} />}
     </main>
     {dialog && (dialog.kind === "delete-tab" || dialog.kind === "delete-group" ? <ConfirmDialog
-      title={dialog.kind === "delete-tab" ? "删除对话" : "删除分组"}
-      message={dialog.kind === "delete-tab" ? `确定删除“${dialog.name}”吗？数据将移入 data/trash，可手工恢复。` : `确定删除分组“${dialog.name}”吗？其中 ${dialog.tabCount} 个对话会移到“未分组”，不会删除对话数据。`}
-      confirmLabel="删除"
+      title={t(dialog.kind === "delete-tab" ? "dialog.deleteConversation" : "dialog.deleteGroup")}
+      message={dialog.kind === "delete-tab" ? t("dialog.deleteConversationMessage", { name: dialog.name }) : t("dialog.deleteGroupMessage", { name: dialog.name, count: dialog.tabCount })}
+      confirmLabel={t("action.delete")}
       onCancel={() => setDialog(null)}
       onConfirm={confirmDelete}
     /> : <TextDialog
       key={dialog.kind === "group" ? "group" : dialog.kind === "rename-tab" ? `rename-tab-${dialog.tabId}` : `rename-group-${dialog.groupId}`}
-      title={dialog.kind === "group" ? "新建分组" : dialog.kind === "rename-tab" ? "重命名对话" : "重命名分组"}
-      label={dialog.kind === "rename-tab" ? "对话名称" : "分组名称"}
-      initialValue={dialog.kind === "group" ? "新分组" : dialog.initialValue}
-      confirmLabel={dialog.kind === "group" ? "创建" : "保存"}
+      title={t(dialog.kind === "group" ? "dialog.newGroup" : dialog.kind === "rename-tab" ? "dialog.renameConversation" : "dialog.renameGroup")}
+      label={t(dialog.kind === "rename-tab" ? "dialog.conversationName" : "dialog.groupName")}
+      initialValue={dialog.kind === "group" ? t("dialog.defaultGroupName") : dialog.initialValue}
+      confirmLabel={t(dialog.kind === "group" ? "action.create" : "action.save")}
       onCancel={() => setDialog(null)}
       onConfirm={submitDialog}
     />)}
-  </div>;
+  </div></I18nContext.Provider>;
+}
+
+function ThemeIcon({ theme }: { theme: "light" | "dark" }) {
+  return theme === "light"
+    ? <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 15.3A8.5 8.5 0 0 1 8.7 3.8 8.5 8.5 0 1 0 20.2 15.3Z" /></svg>
+    : <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>;
 }
 
 function ConfirmDialog({ title, message, confirmLabel, onCancel, onConfirm }: { title: string; message: string; confirmLabel: string; onCancel: () => void; onConfirm: () => Promise<void> }) {
+  const { t } = useI18n();
   const [busy, setBusy] = useState(false);
   const confirm = async () => {
     if (busy) return;
@@ -269,12 +424,13 @@ function ConfirmDialog({ title, message, confirmLabel, onCancel, onConfirm }: { 
   return <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onCancel(); }}>
     <div className="text-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-dialog-title" onKeyDown={(event) => { if (event.key === "Escape" && !busy) onCancel(); }}>
       <h3 id="confirm-dialog-title">{title}</h3><p className="confirm-copy">{message}</p>
-      <div className="dialog-actions"><button type="button" className="ghost" disabled={busy} onClick={onCancel}>取消</button><button type="button" className="danger-action" disabled={busy} onClick={() => void confirm()}>{busy ? "处理中…" : confirmLabel}</button></div>
+      <div className="dialog-actions"><button type="button" className="ghost" disabled={busy} onClick={onCancel}>{t("action.cancel")}</button><button type="button" className="danger-action" disabled={busy} onClick={() => void confirm()}>{busy ? t("action.processing") : confirmLabel}</button></div>
     </div>
   </div>;
 }
 
 function TextDialog({ title, label, initialValue, confirmLabel, multiline = false, onCancel, onConfirm }: { title: string; label: string; initialValue: string; confirmLabel: string; multiline?: boolean; onCancel: () => void; onConfirm: (value: string) => Promise<void> }) {
+  const { t } = useI18n();
   const [value, setValue] = useState(initialValue);
   const [busy, setBusy] = useState(false);
   const submit = async (event: FormEvent) => {
@@ -289,30 +445,101 @@ function TextDialog({ title, label, initialValue, confirmLabel, multiline = fals
     <form className="text-dialog" role="dialog" aria-modal="true" aria-labelledby="text-dialog-title" onSubmit={(event) => void submit(event)} onKeyDown={(event) => { if (event.key === "Escape" && !busy) onCancel(); }}>
       <h3 id="text-dialog-title">{title}</h3><label htmlFor="text-dialog-value">{label}</label>
       {multiline ? <textarea id="text-dialog-value" autoFocus rows={7} value={value} onChange={(event) => setValue(event.target.value)} /> : <input id="text-dialog-value" autoFocus value={value} onFocus={(event) => event.currentTarget.select()} onChange={(event) => setValue(event.target.value)} />}
-      <div className="dialog-actions"><button type="button" className="ghost" disabled={busy} onClick={onCancel}>取消</button><button type="submit" className="primary" disabled={busy || !value.trim()}>{busy ? "处理中…" : confirmLabel}</button></div>
+      <div className="dialog-actions"><button type="button" className="ghost" disabled={busy} onClick={onCancel}>{t("action.cancel")}</button><button type="submit" className="primary" disabled={busy || !value.trim()}>{busy ? t("action.processing") : confirmLabel}</button></div>
     </form>
   </div>;
 }
 
-function ConsoleTabRow({ tab, selected, onClick, onRename, onDelete, onDragStart, onDragEnd, onDragEnter }: { tab: TabMeta; selected: boolean; onClick: () => void; onRename: () => void; onDelete: () => void; onDragStart: () => void; onDragEnd: () => void; onDragEnter: () => void }) {
-  const state = tab.session.state;
+function RowActionsMenu({ subject, deleteTitle, onEdit, onDelete }: { subject: string; deleteTitle?: string; onEdit: () => void; onDelete: () => void }) {
+  const { t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState({ top: 0, left: 0 });
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const positionMenu = () => {
+    const rect = buttonRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const width = 116;
+    const height = 82;
+    const gap = 4;
+    const top = rect.bottom + gap + height <= window.innerHeight - 8 ? rect.bottom + gap : Math.max(8, rect.top - height - gap);
+    const left = Math.max(8, Math.min(window.innerWidth - width - 8, rect.right - width));
+    setPosition({ top, left });
+  };
+  useEffect(() => {
+    if (!open) return;
+    const focusFrame = requestAnimationFrame(() => menuRef.current?.querySelector<HTMLButtonElement>("button")?.focus());
+    const dismiss = () => setOpen(false);
+    const outsidePointer = (event: globalThis.PointerEvent) => {
+      const target = event.target as Node;
+      if (!buttonRef.current?.contains(target) && !menuRef.current?.contains(target)) dismiss();
+    };
+    const keyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      dismiss();
+      buttonRef.current?.focus();
+    };
+    document.addEventListener("pointerdown", outsidePointer);
+    document.addEventListener("keydown", keyDown);
+    window.addEventListener("resize", dismiss);
+    window.addEventListener("scroll", dismiss, true);
+    return () => {
+      cancelAnimationFrame(focusFrame);
+      document.removeEventListener("pointerdown", outsidePointer);
+      document.removeEventListener("keydown", keyDown);
+      window.removeEventListener("resize", dismiss);
+      window.removeEventListener("scroll", dismiss, true);
+    };
+  }, [open]);
+  const run = (action: () => void) => {
+    setOpen(false);
+    action();
+  };
+  return <span className="row-actions-anchor" onMouseDown={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}>
+    <button ref={buttonRef} type="button" className="row-actions-button" aria-label={t("menu.moreFor", { subject })} aria-haspopup="menu" aria-expanded={open} title={t("menu.more")} draggable={false} onClick={(event) => { event.stopPropagation(); if (!open) positionMenu(); setOpen((value) => !value); }}>⋮</button>
+    {open && createPortal(<div ref={menuRef} className="row-actions-menu" role="menu" aria-label={t("menu.actionsFor", { subject })} style={position} onPointerDown={(event) => event.stopPropagation()} onKeyDown={(event) => {
+      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+      event.preventDefault();
+      const items = [...event.currentTarget.querySelectorAll<HTMLButtonElement>("button")];
+      const current = items.indexOf(document.activeElement as HTMLButtonElement);
+      const direction = event.key === "ArrowDown" ? 1 : -1;
+      items[(current + direction + items.length) % items.length]?.focus();
+    }}><button type="button" role="menuitem" onClick={() => run(onEdit)}>{t("menu.edit")}</button><button type="button" role="menuitem" className="danger" title={deleteTitle} onClick={() => run(onDelete)}>{t("menu.delete")}</button></div>, document.body)}
+  </span>;
+}
+
+function ConsoleTabRow({ tab, activity, recentlyCompleted, selected, onClick, onRename, onDelete, onDragStart, onDragEnd, onDragEnter }: { tab: TabMeta; activity?: TabActivitySummary; recentlyCompleted: boolean; selected: boolean; onClick: () => void; onRename: () => void; onDelete: () => void; onDragStart: () => void; onDragEnd: () => void; onDragEnter: () => void }) {
+  const { t } = useI18n();
+  const visualState = tabVisualState(tab.session.state, activity);
+  const tabStatus = visualState === "closed"
+    ? t("tab.closed")
+    : visualState === "running"
+      ? t("tab.running")
+      : visualState === "idle"
+        ? t("tab.idle")
+        : visualState === "error"
+          ? t("tab.error")
+          : t("tab.unconfigured");
   return <div className={`tab-row ${selected ? "selected" : ""}`} draggable onDragStart={onDragStart} onDragEnd={onDragEnd} onDragEnter={(event) => { event.preventDefault(); onDragEnter(); }}>
-    <span className="console-drag" title="拖动对话排序或移动分组">⠿</span><button className="tab-button" onClick={onClick} onDoubleClick={onRename}><span className={`tab-dot ${state}`} /><span className="tab-label">{tab.name}</span><span className="tab-state">{state === "ready" ? "●" : state === "closed" ? "■" : state === "error" ? "!" : ""}</span></button><button className="rename-button" aria-label={`重命名对话 ${tab.name}`} onClick={onRename}>✎</button><button className="row-delete-button" aria-label={`删除对话 ${tab.name}`} onMouseDown={(event) => event.stopPropagation()} onClick={onDelete}>×</button>
+    <span className="console-drag" title={t("nav.dragConversation")}>⠿</span><button className="tab-button" onClick={onClick}><span className="tab-label">{tab.name}</span><span className="tab-status-cluster">{recentlyCompleted && <span className="tab-completion-bell" role="img" aria-label={t("tab.justCompleted")} title={t("tab.justCompletedRecent")}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg></span>}<span className={`tab-status-indicator ${visualState}`} role="img" aria-label={tabStatus} title={tabStatus} /></span></button><RowActionsMenu subject={t("nav.conversationSubject", { name: tab.name })} onEdit={onRename} onDelete={onDelete} />
   </div>;
 }
 
 function Welcome({ onCreate }: { onCreate: () => void }) {
-  return <div className="welcome"><div className="welcome-icon">✦</div><h1>把一组 prompt 交给 Codex</h1><p>每个对话标签绑定独立的工作路径与 Codex thread。执行队列和 PowerShell 终端分别保留自动化与手工控制能力。</p><button className="primary" onClick={onCreate}>开始一个新对话</button></div>;
+  const { t } = useI18n();
+  return <div className="welcome"><div className="welcome-icon">✦</div><h1>{t("welcome.title")}</h1><p>{t("welcome.body")}</p><button className="primary" onClick={onCreate}>{t("welcome.start")}</button></div>;
 }
 
-function TabView({ tab, theme, onChanged, onError }: { tab: TabMeta; theme: "light" | "dark"; onChanged: () => void; onError: (message: string) => void }) {
+function TabView({ tab, theme, onChanged, onError }: { tab: TabMeta; theme: "light" | "dark"; onChanged: () => void; onError: (error: unknown) => void }) {
+  const { t } = useI18n();
   const [bundle, setBundle] = useState<TabBundle | null>(null);
   const [leftWidth, setLeftWidth] = useState(tab.layout.leftWidthPercent);
   const dragging = useRef(false);
   const [reopening, setReopening] = useState(false);
   const load = useCallback(async () => {
     try { setBundle(await api<TabBundle>(`/api/tabs/${tab.id}`)); }
-    catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { onError(reason); }
   }, [tab.id, onError]);
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
@@ -321,19 +548,22 @@ function TabView({ tab, theme, onChanged, onError }: { tab: TabMeta; theme: "lig
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
     return () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
   }, [leftWidth, tab.id]);
-  if (!bundle) return <div className="loading-pane"><div className="spinner" />读取对话数据…</div>;
+  if (!bundle) return <div className="loading-pane"><div className="spinner" />{t("conversation.loading")}</div>;
   const closed = bundle.tab.session.state === "closed";
+  const runnable = bundle.tab.session.state === "ready" && Boolean(bundle.tab.session.threadId);
   const reopen = async () => {
     if (reopening) return;
     setReopening(true);
     try { await api(`/api/tabs/${tab.id}/terminal/reopen`, { method: "POST" }); await load(); onChanged(); }
-    catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { onError(reason); }
     finally { setReopening(false); }
   };
+  const threadId = bundle.tab.session.threadId;
+  const answers = threadId ? bundle.answers.answers.filter((answer) => answer.threadId === threadId) : [];
   return <div className={`tab-view ${closed ? "conversation-closed" : ""}`}><div className="tab-workspace" style={{ gridTemplateColumns: `${leftWidth}fr 7px ${100 - leftWidth}fr` }}>
-    <section className="conversation-pane"><SessionPanel bundle={bundle} reopening={reopening} onReopen={reopen} onChanged={() => { void load(); onChanged(); }} onError={onError} /><AnswerHistory answers={bundle.answers.answers} /></section>
-    <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) dragging.current = true; }} title={closed ? "对话关闭时不能调整布局" : "拖动调整对话页左右栏宽度"} />
-    <section className="queue-pane"><PromptQueue bundle={bundle} disabled={closed} onChanged={() => void load()} onError={onError} /><TerminalPanel tabId={tab.id} runtime={bundle.runtime} theme={theme} closed={closed} onChanged={load} onError={onError} /></section>
+    <section className="conversation-pane"><SessionPanel bundle={bundle} reopening={reopening} onReopen={reopen} onChanged={() => { void load(); onChanged(); }} onError={onError} /><AnswerHistory answers={answers} /></section>
+    <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) dragging.current = true; }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
+    <section className="queue-pane"><PromptQueue bundle={bundle} disabled={closed} runnable={runnable} onChanged={() => void load()} onError={onError} /><TerminalPanel tabId={tab.id} runtime={bundle.runtime} theme={theme} closed={closed} onChanged={load} onError={onError} /></section>
   </div></div>;
 }
 
@@ -341,51 +571,94 @@ function orderedTabIds(tabs: TabMeta[], groupId: string | null): string[] {
   return tabs.filter((tab) => tab.groupId === groupId).sort((a, b) => a.order - b.order).map((tab) => tab.id);
 }
 
-function SessionPanel({ bundle, reopening, onReopen, onChanged, onError }: { bundle: TabBundle; reopening: boolean; onReopen: () => Promise<void>; onChanged: () => void; onError: (message: string) => void }) {
+function SessionPanel({ bundle, reopening, onReopen, onChanged, onError }: { bundle: TabBundle; reopening: boolean; onReopen: () => Promise<void>; onChanged: () => void; onError: (error: unknown) => void }) {
+  const i18n = useI18n();
+  const { t } = i18n;
   const [cwd, setCwd] = useState(bundle.tab.session.workingDirectory ?? "");
   const [mode, setMode] = useState<"new" | "resume">("new");
   const [resumeId, setResumeId] = useState("");
   const [busy, setBusy] = useState(false);
+  const [browsing, setBrowsing] = useState(false);
   const session = bundle.tab.session;
-  const connected = session.state === "ready" || session.state === "closed";
+  const restoring = session.state === "connecting" && Boolean(session.threadId && session.workingDirectory);
+  const connected = session.state === "ready" || session.state === "closed" || restoring;
   const connect = async () => {
     setBusy(true);
     try { await api(`/api/tabs/${bundle.tab.id}/session`, jsonBody({ mode, workingDirectory: cwd, resumeId })); onChanged(); }
-    catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { onError(reason); }
     finally { setBusy(false); }
   };
-  const browse = async () => { try { const result = await api<{ path: string | null }>("/api/dialog/select-directory", jsonBody({})); if (result.path) setCwd(result.path); } catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); } };
-  const closeConversation = async () => { try { setBusy(true); await api(`/api/tabs/${bundle.tab.id}/session/close`, { method: "POST" }); onChanged(); } catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); } finally { setBusy(false); } };
+  const browse = async () => {
+    if (browsing) return;
+    setBrowsing(true);
+    try {
+      const result = await api<{ path: string | null }>("/api/dialog/select-directory", jsonBody({ initialPath: cwd }));
+      if (result.path) setCwd(result.path);
+    } catch (reason) { onError(reason); }
+    finally { setBrowsing(false); }
+  };
+  const closeConversation = async () => { try { setBusy(true); await api(`/api/tabs/${bundle.tab.id}/session/close`, { method: "POST" }); onChanged(); } catch (reason) { onError(reason); } finally { setBusy(false); } };
   return <div className="session-card">
-    <div className="section-title"><span className="section-icon">◌</span><div><strong>{session.state === "ready" ? "Codex 对话已连接" : session.state === "closed" ? "Codex 对话已关闭" : "连接一个 Codex 对话"}</strong><small>{connected ? "队列使用此 thread；PowerShell TUI 连接同一个 App Server" : "选择工作目录，然后新建或恢复 session"}</small></div></div>
-    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">对话已关闭。内容仍可查看，队列和终端操作已停用。</div>}<div className="session-path"><span>工作路径</span><code>{session.workingDirectory}</code></div><div className="session-ids"><div><span>thread id</span><code>{session.threadId}</code></div><div><span>session id</span><code>{session.sessionId}</code></div></div><div className="session-actions"><button className="ghost" disabled={busy || reopening} onClick={() => void onReopen()}>{reopening ? "正在恢复…" : "重新打开终端"}</button>{session.state === "ready" && <button className="danger-action" disabled={busy} onClick={() => void closeConversation()}>{busy ? "正在关闭…" : "关闭对话"}</button>}</div></div> : <>
-      <label className="field-label">本地工作路径</label><div className="path-row"><input value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="例如 D:\\work\\project" /><button className="ghost" onClick={() => void browse()}>选择文件夹</button></div>
-      <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => setMode("new")}>创建新对话</button><button className={mode === "resume" ? "active" : ""} onClick={() => setMode("resume")}>继续旧对话</button></div>
-      {mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} placeholder="粘贴 session / thread id" />}
-      <button className="primary connect" disabled={busy || !cwd.trim()} onClick={() => void connect()}>{busy ? "正在连接…" : "确定并打开 Codex"}</button>
+    <div className="section-title"><span className="section-icon">◌</span><div><strong>{t(session.state === "ready" ? "session.ready" : session.state === "closed" ? "session.closed" : restoring ? "session.restoring" : "session.setup")}</strong><small>{t(restoring ? "session.restoringHelp" : connected ? "session.connectedHelp" : "session.setupHelp")}</small></div></div>
+    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t("session.workingDirectory")}</span><code>{session.workingDirectory}</code></div><div className="session-ids"><div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div><div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>{session.lastThreadSwitch && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <button className="danger-action" disabled={busy} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>}</div></div> : <>
+      <label className="field-label">{t("session.localPath")}</label><div className="path-row"><input value={cwd} title={cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t("session.pathExample")} /><button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button></div>{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}
+      <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => setMode("new")}>{t("session.createNew")}</button><button className={mode === "resume" ? "active" : ""} onClick={() => setMode("resume")}>{t("session.resumeOld")}</button></div>
+      {mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} placeholder={t("session.resumePlaceholder")} />}
+      <button className="primary connect" disabled={busy || !cwd.trim()} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button>
     </>}
-    {session.lastError && <div className="inline-error">{session.lastError.message}</div>}
+    {session.lastError && <div className="inline-error">{i18n.errorText(session.lastError)}</div>}
   </div>;
 }
 
 function AnswerHistory({ answers }: { answers: AnswerRecord[] }) {
-  return <div className="answers"><div className="answers-heading"><span>Final answers</span><em>{answers.length}</em></div><div className="answer-scroll">{answers.length === 0 ? <div className="empty-answers">完成的 final answer 会持续记录在这里。</div> : <div className="answer-list">{answers.map((answer) => <article className="answer-card" key={answer.id}><div className="answer-meta"><span>{answer.origin === "imported" ? "历史导入" : answer.origin === "manual" ? "手工对话" : "队列"}</span><time>{formatTime(answer.completedAt)}</time></div><div className="answer-prompt">{answer.prompt}</div><div className="markdown"><ReactMarkdown rehypePlugins={[rehypeSanitize]}>{answer.finalAnswer}</ReactMarkdown></div></article>)}</div>}</div></div>;
+  const i18n = useI18n();
+  const { t } = i18n;
+  const scroll = useRef<HTMLDivElement>(null);
+  const contentKey = answers.map((answer) => answer.id).join("|");
+  useLayoutEffect(() => { if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight; }, [contentKey]);
+  return <div className="answers"><div className="answers-heading"><span>{t("answers.title")}</span><em>{answers.length}</em></div><div className="answer-scroll" ref={scroll}>{answers.length === 0 ? <div className="empty-answers">{t("answers.empty")}</div> : <div className="answer-list">{answers.map((answer) => <article className="answer-card" key={answer.id}><div className="answer-meta"><span>{t(answer.origin === "imported" ? "answers.imported" : answer.origin === "manual" ? "answers.manual" : "answers.queue")}</span><time>{i18n.formatTime(answer.completedAt)}</time></div><div className="answer-prompt">{answer.prompt}</div><div className="markdown"><ReactMarkdown rehypePlugins={[rehypeSanitize]}>{answer.finalAnswer}</ReactMarkdown></div></article>)}</div>}</div></div>;
 }
 
-function PromptQueue({ bundle, disabled, onChanged, onError }: { bundle: TabBundle; disabled: boolean; onChanged: () => void; onError: (message: string) => void }) {
+function PromptQueue({ bundle, disabled, runnable, onChanged, onError }: { bundle: TabBundle; disabled: boolean; runnable: boolean; onChanged: () => void; onError: (error: unknown) => void }) {
+  const i18n = useI18n();
+  const { t } = i18n;
   const [newText, setNewText] = useState("");
   const [adding, setAdding] = useState(false);
+  const [runnerAction, setRunnerAction] = useState<"start" | "pause" | null>(null);
   const [insertBeforeId, setInsertBeforeId] = useState<string | null>(null);
   const nativeDragSource = useRef<string | null>(null);
   const reorderInFlight = useRef(false);
-  const prompts = bundle.prompts.prompts;
+  const promptList = useRef<HTMLDivElement>(null);
+  const threadId = bundle.tab.session.threadId;
+  const currentAnswerPromptIds = new Set(bundle.answers.answers
+    .filter((answer) => answer.threadId === threadId)
+    .map((answer) => answer.promptId));
+  const prompts = bundle.prompts.prompts.filter((prompt) => prompt.threadId === threadId
+    || (!prompt.threadId && currentAnswerPromptIds.has(prompt.id))
+    || (prompt.status === "pending" && !prompt.threadId));
+  const promptContentKey = prompts.map((prompt) => prompt.id).join("|");
+  useLayoutEffect(() => { if (promptList.current) promptList.current.scrollTop = promptList.current.scrollHeight; }, [promptContentKey]);
   const runtime = bundle.runtime;
+  const runnerRunning = runtime.runner.desiredState === "running";
+  const hasPendingPrompt = prompts.some((prompt) => prompt.status === "pending");
+  const changeRunner = async (action: "start" | "pause") => {
+    if (disabled || runnerAction || (action === "start" ? !runnable || runnerRunning || !hasPendingPrompt : !runnerRunning)) return;
+    setRunnerAction(action);
+    try {
+      await api(`/api/tabs/${bundle.tab.id}/runner/${action}`, jsonBody({}));
+      onChanged();
+    } catch (reason) {
+      onError(reason);
+    } finally {
+      setRunnerAction(null);
+    }
+  };
   const add = async () => {
     const text = newText.trim();
     if (!text || adding || disabled) return;
     setAdding(true);
     try { await api(`/api/tabs/${bundle.tab.id}/prompts`, jsonBody({ text })); setNewText(""); onChanged(); }
-    catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { onError(reason); }
     finally { setAdding(false); }
   };
   const reorder = async (sourceId: string, targetId: string) => {
@@ -394,24 +667,28 @@ function PromptQueue({ bundle, disabled, onChanged, onError }: { bundle: TabBund
     if (!ids) return;
     reorderInFlight.current = true;
     try { await api(`/api/tabs/${bundle.tab.id}/prompts/order`, { method: "PUT", body: JSON.stringify({ promptIds: ids }) }); onChanged(); }
-    catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { onError(reason); }
     finally { reorderInFlight.current = false; nativeDragSource.current = null; }
   };
   const insertBefore = async (value: string) => {
     if (!insertBeforeId || disabled) return;
     try { await api(`/api/tabs/${bundle.tab.id}/prompts`, jsonBody({ text: value, beforeId: insertBeforeId })); setInsertBeforeId(null); onChanged(); }
-    catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); throw reason; }
+    catch (reason) { onError(reason); throw reason; }
   };
   const pendingIds = prompts.filter((item) => item.status === "pending").map((item) => item.id);
-  return <div className="queue-card"><div className="queue-heading"><div><div className="eyebrow">Prompt list</div><h3>执行队列 <span>{prompts.filter((item) => item.status === "completed").length}/{prompts.length}</span></h3></div></div>
-    <div className="runner-status"><span className={`status-dot ${runtime.runner.state === "running" ? "running" : runtime.runner.state === "error" ? "error" : ""}`} />{runnerLabel(runtime)}{runtime.runner.lastError && <span className="runner-error">· {runtime.runner.lastError.message}</span>}</div>
-    <div className="prompt-list">{prompts.length === 0 && <div className="empty-prompts">添加第一条 prompt，开始你的批处理。</div>}{prompts.map((prompt, index) => { const pendingIndex = pendingIds.indexOf(prompt.id); return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} onInsert={() => { if (!disabled) setInsertBeforeId(prompt.id); }} canMoveUp={pendingIndex > 0} canMoveDown={pendingIndex >= 0 && pendingIndex < pendingIds.length - 1} onMove={(direction) => { const target = pendingIds[pendingIndex + direction]; if (target) void reorder(prompt.id, target); }} onChanged={onChanged} onError={onError} />; })}</div>
-    <div className="add-prompt"><textarea disabled={disabled} value={newText} onChange={(event) => setNewText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={disabled ? "对话已关闭，重新打开后可添加 prompt" : "输入 prompt…（Enter 添加，Shift + Enter 换行）"} /><button className="primary" disabled={disabled || adding || !newText.trim()} onClick={() => void add()}>{adding ? "添加中…" : "添加"}</button></div>
-    {insertBeforeId && <TextDialog title="插入 prompt" label="Prompt 内容" initialValue="" confirmLabel="插入" multiline onCancel={() => setInsertBeforeId(null)} onConfirm={insertBefore} />}
+  const runnerState = runnerLabel(i18n, runtime);
+  const completedCount = prompts.filter((item) => item.status === "completed").length;
+  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{prompts.length}</span><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "running" ? "running" : runtime.runner.state === "error" ? "error" : ""}`} /><span>{runnerState}</span></span></div><div className="runner-actions"><button className="primary runner-start-button" disabled={disabled || !runnable || Boolean(runnerAction) || runnerRunning || !hasPendingPrompt} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={disabled || Boolean(runnerAction) || !runnerRunning} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button></div></div>
+    {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
+    <div className="prompt-list" ref={promptList}>{prompts.length === 0 && <div className="empty-prompts">{t("queue.empty")}</div>}{prompts.map((prompt, index) => { const pendingIndex = pendingIds.indexOf(prompt.id); return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} onInsert={() => { if (!disabled) setInsertBeforeId(prompt.id); }} canMoveUp={pendingIndex > 0} canMoveDown={pendingIndex >= 0 && pendingIndex < pendingIds.length - 1} onMove={(direction) => { const target = pendingIds[pendingIndex + direction]; if (target) void reorder(prompt.id, target); }} onChanged={onChanged} onError={onError} />; })}</div>
+    <div className="add-prompt"><textarea disabled={disabled} value={newText} onChange={(event) => setNewText(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><button className="primary" disabled={disabled || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
+    {insertBeforeId && <TextDialog title={t("queue.insertPrompt")} label={t("queue.promptContent")} initialValue="" confirmLabel={t("queue.insert")} multiline onCancel={() => setInsertBeforeId(null)} onConfirm={insertBefore} />}
   </div>;
 }
 
-function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, onNativeDragEnter, onInsert, canMoveUp, canMoveDown, onMove, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragEnter: (targetId: string) => void; onInsert: () => void; canMoveUp: boolean; canMoveDown: boolean; onMove: (direction: -1 | 1) => void; onChanged: () => void; onError: (message: string) => void }) {
+function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, onNativeDragEnter, onInsert, canMoveUp, canMoveDown, onMove, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragEnter: (targetId: string) => void; onInsert: () => void; canMoveUp: boolean; canMoveDown: boolean; onMove: (direction: -1 | 1) => void; onChanged: () => void; onError: (error: unknown) => void }) {
+  const i18n = useI18n();
+  const { t } = i18n;
   const editable = !locked && !["completed", "running", "dispatching"].includes(prompt.status);
   const [text, setText] = useState(prompt.text);
   const [editing, setEditing] = useState(false);
@@ -420,14 +697,14 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
   const beginEdit = () => { if (!editable) return; setEditing(true); requestAnimationFrame(() => { editor.current?.focus(); editor.current?.select(); }); };
   const save = async () => {
     if (!editable) return;
-    if (!text.trim()) { onError("Prompt 不能为空"); return; }
+    if (!text.trim()) { onError(new PromptorApiError("PROMPT_EMPTY", t("queue.promptEmpty"), 400, false)); return; }
     if (text.trim() === prompt.text) { setEditing(false); return; }
     try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "PATCH", body: JSON.stringify({ text }) }); setEditing(false); onChanged(); }
-    catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { onError(reason); }
   };
-  const remove = async () => { try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "DELETE" }); onChanged(); } catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); } };
-  const retry = async () => { try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}/retry`, jsonBody({})); onChanged(); } catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); } };
-  const skip = async () => { try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}/skip`, jsonBody({})); onChanged(); } catch (reason) { onError(reason instanceof Error ? reason.message : String(reason)); } };
+  const remove = async () => { try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "DELETE" }); onChanged(); } catch (reason) { onError(reason); } };
+  const retry = async () => { try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}/retry`, jsonBody({})); onChanged(); } catch (reason) { onError(reason); } };
+  const skip = async () => { try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}/skip`, jsonBody({})); onChanged(); } catch (reason) { onError(reason); } };
   const pendingStatus = prompt.status === "pending";
   const pending = pendingStatus && !locked;
   const pointerDown = (event: PointerEvent<HTMLDivElement>) => { if (!pending || event.pointerType === "mouse" || event.button !== 0) return; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); };
@@ -441,10 +718,12 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", release, { once: true });
   };
   const nativeDragStart = (event: DragEvent<HTMLDivElement>) => { if ((event.target as HTMLElement).closest("textarea, button")) { event.preventDefault(); return; } event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", prompt.id); onNativeDragStart(prompt.id); };
-  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? "拖动排序" : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={Math.min(5, Math.max(1, text.split("\n").length))} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{formatTime(prompt.completedAt)}</time>}<span>{statusLabel(prompt.status)}</span></span>{pendingStatus && <button className="link-button" disabled={locked} onClick={() => editing ? void save() : beginEdit()}>{editing ? "保存" : "编辑"}</button>}{pendingStatus && <span className="move-buttons"><button aria-label="上移" title="上移" disabled={locked || !canMoveUp} onClick={() => onMove(-1)}>↑</button><button aria-label="下移" title="下移" disabled={locked || !canMoveDown} onClick={() => onMove(1)}>↓</button></span>}<button className="link-button" disabled={locked} onClick={onInsert}>插入</button>{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked} onClick={() => void retry()}>重试</button><button className="link-button" disabled={locked} onClick={() => void skip()}>跳过</button></> : editable && <button className="delete-button" aria-label="删除 prompt" onClick={() => void remove()}>×</button>}</div></div>;
+  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={Math.min(5, Math.max(1, text.split("\n").length))} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <button className="link-button" disabled={locked} onClick={() => editing ? void save() : beginEdit()}>{t(editing ? "action.save" : "queue.edit")}</button>}{pendingStatus && <span className="move-buttons"><button aria-label={t("queue.moveUp")} title={t("queue.moveUp")} disabled={locked || !canMoveUp} onClick={() => onMove(-1)}>↑</button><button aria-label={t("queue.moveDown")} title={t("queue.moveDown")} disabled={locked || !canMoveDown} onClick={() => onMove(1)}>↓</button></span>}<button className="link-button" disabled={locked} onClick={onInsert}>{t("queue.insert")}</button>{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
-function TerminalPanel({ tabId, runtime, theme, closed, onChanged, onError }: { tabId: string; runtime: RuntimeFile; theme: "light" | "dark"; closed: boolean; onChanged: () => void; onError: (message: string) => void }) {
+function TerminalPanel({ tabId, runtime, theme, closed, onChanged, onError }: { tabId: string; runtime: RuntimeFile; theme: "light" | "dark"; closed: boolean; onChanged: () => void; onError: (error: unknown) => void }) {
+  const i18n = useI18n();
+  const { t } = i18n;
   const host = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal | null>(null);
   const socket = useRef<WebSocket | null>(null);
@@ -454,6 +733,8 @@ function TerminalPanel({ tabId, runtime, theme, closed, onChanged, onError }: { 
   const callbacks = useRef({ onChanged, onError });
   const [connected, setConnected] = useState(false);
   const [hasOutput, setHasOutput] = useState(false);
+  const runnerBusy = runtime.runner.desiredState === "running"
+    || ["starting", "waiting_for_thread", "dispatching", "running", "waiting_for_prompt", "pausing"].includes(runtime.runner.state);
   closedRef.current = closed;
   themeRef.current = theme;
   callbacks.current = { onChanged, onError };
@@ -462,11 +743,26 @@ function TerminalPanel({ tabId, runtime, theme, closed, onChanged, onError }: { 
     let disposed = false;
     let reconnectTimer: number | null = null;
     let resizeFrame: number | null = null;
+    let cursorRevealFrame: number | null = null;
+    let terminalWriteSequence = 0;
     const decoder = new TextDecoder();
     const cursor: { generation: string | null; nextOffset: number | null } = { generation: null, nextOffset: null };
     let lastSentSize: { cols: number; rows: number } | null = null;
-    const term = new Terminal({ cursorBlink: false, cursorStyle: "block", cursorInactiveStyle: "outline", fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 14, lineHeight: 1.18, theme: getTerminalTheme(themeRef.current), scrollback: 5000, allowProposedApi: false });
-    const fit = new FitAddon(); term.loadAddon(fit); term.open(host.current); terminal.current = term;
+    const term = new Terminal({ cursorBlink: false, cursorStyle: "block", cursorInactiveStyle: "none", fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 14, lineHeight: 1.18, theme: getTerminalTheme(themeRef.current), scrollback: 5000, allowProposedApi: false });
+    const fit = new FitAddon(); term.loadAddon(fit); term.open(host.current); term.blur(); terminal.current = term;
+    const beginTerminalUpdate = () => {
+      if (cursorRevealFrame !== null) { cancelAnimationFrame(cursorRevealFrame); cursorRevealFrame = null; }
+      const sequence = ++terminalWriteSequence;
+      host.current?.classList.add("terminal-updating");
+      return sequence;
+    };
+    const finishTerminalUpdate = (sequence: number) => {
+      if (sequence !== terminalWriteSequence) return;
+      cursorRevealFrame = requestAnimationFrame(() => {
+        cursorRevealFrame = null;
+        if (sequence === terminalWriteSequence) host.current?.classList.remove("terminal-updating");
+      });
+    };
     const protocol = location.protocol === "https:" ? "wss" : "ws";
     const sendInput = (data: string) => {
       const ws = socket.current;
@@ -525,24 +821,31 @@ function TerminalPanel({ tabId, runtime, theme, closed, onChanged, onError }: { 
       const startOffset = Number(message.startOffset);
       const endOffset = Number(message.endOffset);
       if (!generation || !Number.isSafeInteger(startOffset) || !Number.isSafeInteger(endOffset) || endOffset < startOffset) return;
+      let updateSequence: number | null = null;
       if (message.reset || cursor.generation !== generation || cursor.nextOffset === null) {
+        updateSequence = beginTerminalUpdate();
         term.reset();
         term.options.cursorBlink = false;
         cursor.generation = generation;
         cursor.nextOffset = startOffset;
         setHasOutput(false);
       }
-      if (cursor.generation !== generation) { requestSync(); return; }
-      if (startOffset > cursor.nextOffset!) { requestSync(); return; }
-      if (endOffset <= cursor.nextOffset!) return;
+      if (cursor.generation !== generation) { if (updateSequence !== null) finishTerminalUpdate(updateSequence); requestSync(); return; }
+      if (startOffset > cursor.nextOffset!) { if (updateSequence !== null) finishTerminalUpdate(updateSequence); requestSync(); return; }
+      if (endOffset <= cursor.nextOffset!) { if (updateSequence !== null) finishTerminalUpdate(updateSequence); return; }
       const bytes = Uint8Array.from(atob(String(message.dataBase64 ?? "")), (char) => char.charCodeAt(0));
       const overlap = Math.max(0, cursor.nextOffset! - startOffset);
       const fresh = bytes.subarray(Math.min(overlap, bytes.length));
       cursor.nextOffset = endOffset;
       if (fresh.length) {
+        updateSequence ??= beginTerminalUpdate();
         setHasOutput(true);
-        term.write(decoder.decode(fresh, { stream: true }), () => { term.options.cursorBlink = false; });
-      } else if (endOffset > 0) setHasOutput(true);
+        const sequence = updateSequence;
+        term.write(decoder.decode(fresh, { stream: true }), () => { term.options.cursorBlink = false; finishTerminalUpdate(sequence); });
+      } else {
+        if (endOffset > 0) setHasOutput(true);
+        if (updateSequence !== null) finishTerminalUpdate(updateSequence);
+      }
     };
     const connect = () => {
       if (disposed || closedRef.current || socket.current?.readyState === WebSocket.OPEN || socket.current?.readyState === WebSocket.CONNECTING) return;
@@ -562,10 +865,10 @@ function TerminalPanel({ tabId, runtime, theme, closed, onChanged, onError }: { 
           else if (["runner.changed", "answer.added", "snapshot", "terminal.state", "service.changed"].includes(message.type)) {
             callbacks.current.onChanged();
             if (message.type === "terminal.state") scheduleSize();
-          }
+          } else if (message.type === "error" && message.error) callbacks.current.onError(message.error);
         } catch { /* ignore malformed terminal frames */ }
       };
-      ws.onerror = () => { if (!closedRef.current) callbacks.current.onError("终端 WebSocket 连接失败"); };
+      ws.onerror = () => { if (!closedRef.current) callbacks.current.onError({ code: "TERMINAL_WEBSOCKET_FAILED", message: "Terminal WebSocket connection failed" }); };
       ws.onclose = () => {
         if (socket.current === ws) socket.current = null;
         if (disposed) return;
@@ -580,11 +883,15 @@ function TerminalPanel({ tabId, runtime, theme, closed, onChanged, onError }: { 
       reconnect.current = null;
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+      if (cursorRevealFrame !== null) cancelAnimationFrame(cursorRevealFrame);
+      terminalWriteSequence += 1;
+      host.current?.classList.remove("terminal-updating");
       observer.disconnect();
       inputDisposable.dispose(); foregroundQuery.dispose(); backgroundQuery.dispose(); colorSchemeQuery.dispose(); cursorBlinkOn.dispose(); cursorBlinkOff.dispose();
       socket.current?.close(); term.dispose(); terminal.current = null; socket.current = null;
     };
   }, [tabId]);
+  useEffect(() => { if (runnerBusy) terminal.current?.blur(); }, [runnerBusy]);
   useEffect(() => {
     themeRef.current = theme;
     if (terminal.current) terminal.current.options.theme = getTerminalTheme(theme);
@@ -596,8 +903,8 @@ function TerminalPanel({ tabId, runtime, theme, closed, onChanged, onError }: { 
       setConnected(false);
     } else reconnect.current?.();
   }, [closed]);
-  const placeholder = runtime.terminal.state === "stopped" ? "终端尚未启动" : runtime.terminal.state === "starting" ? "正在启动 PowerShell / Codex…" : runtime.terminal.state === "running" ? "等待终端输出…点击此区域后可直接输入" : runtime.terminal.state === "error" ? "终端启动失败，请重新打开" : "终端已退出，可点击“重新打开终端”";
-  return <div className={`terminal-card ${closed ? "locked" : ""}`}><div className="terminal-heading"><span><i className={`status-dot ${runtime.terminal.state === "running" ? "running" : runtime.terminal.state === "error" ? "error" : ""}`} />PowerShell / Codex</span><span className="terminal-meta"><i className={`connection-dot ${connected ? "connected" : ""}`} />{closed ? "输入已停用" : connected ? "输入通道已连接" : "正在连接输入通道"}<b>{closed ? "已关闭" : terminalStateLabel(runtime.terminal.state)}</b></span></div>{runtime.terminal.lastError && <div className="terminal-error">{runtime.terminal.lastError.message}</div>}<div className={`terminal-body ${theme} ${closed ? "locked" : ""}`} onMouseDown={() => { if (!closed) terminal.current?.focus(); }}><div className="terminal-host" ref={host} />{!hasOutput && <div className="terminal-placeholder">{closed ? "对话已关闭，终端输入不可用" : placeholder}</div>}</div></div>;
+  const placeholder = t(runtime.terminal.state === "stopped" ? "terminal.notStarted" : runtime.terminal.state === "starting" ? "terminal.startingHelp" : runtime.terminal.state === "running" ? "terminal.runningHelp" : runtime.terminal.state === "error" ? "terminal.failedHelp" : "terminal.exitedHelp");
+  return <div className={`terminal-card ${closed ? "locked" : ""} ${runnerBusy ? "runner-busy" : ""}`}><div className="terminal-heading"><span><i className={`status-dot ${runtime.terminal.state === "running" ? "running" : runtime.terminal.state === "error" ? "error" : ""}`} />PowerShell / Codex</span><span className="terminal-meta"><i className={`connection-dot ${connected ? "connected" : ""}`} />{t(closed ? "terminal.inputDisabled" : connected ? "terminal.inputConnected" : "terminal.inputConnecting")}<b>{closed ? t("terminal.closed") : terminalStateLabel(i18n, runtime.terminal.state)}</b></span></div>{runtime.terminal.lastError && <div className="terminal-error">{i18n.errorText(runtime.terminal.lastError)}</div>}<div className={`terminal-body ${theme} ${closed ? "locked" : ""}`} onMouseDown={() => { if (!closed) terminal.current?.focus(); }}><div className="terminal-host" ref={host} />{!hasOutput && <div className="terminal-placeholder">{closed ? t("terminal.closedPlaceholder") : placeholder}</div>}</div></div>;
 }
 
 function getTerminalTheme(theme: "light" | "dark") {
@@ -616,9 +923,3 @@ function encodeBase64(value: string): string {
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
 }
-
-function runnerLabel(runtime: RuntimeFile) { return ({ paused: "已暂停", starting: "正在启动", waiting_for_thread: "等待当前对话结束", dispatching: "发送下一条 prompt", running: "Codex 正在回答", waiting_for_prompt: "等待新的 prompt", pausing: "当前轮结束后暂停", error: "队列出错" } as Record<string, string>)[runtime.runner.state] ?? runtime.runner.state; }
-function statusLabel(status: PromptRecord["status"]) { return ({ pending: "待执行", dispatching: "发送中", running: "执行中", completed: "已完成", failed: "失败", interrupted: "已中断", skipped: "已跳过" } as Record<string, string>)[status]; }
-function terminalStateLabel(state: RuntimeFile["terminal"]["state"]) { return ({ stopped: "未启动", starting: "正在启动", running: "运行中", exited: "已退出", error: "启动失败" } as Record<string, string>)[state]; }
-function formatTime(value: string | null) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "时间未知"; }
-function formatClock(value: Date) { return value.toLocaleString("zh-CN", { hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }); }

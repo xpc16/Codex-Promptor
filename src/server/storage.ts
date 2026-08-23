@@ -21,6 +21,7 @@ import {
   TabMetaSchema,
   defaultSession,
 } from "../shared/schemas.js";
+import { latestQueueCompletion, type TabActivitySummary } from "../shared/tab-activity.js";
 
 export class KeyedMutex {
   private readonly locks = new Map<string, Promise<void>>();
@@ -41,6 +42,34 @@ export class KeyedMutex {
 }
 
 const json = (value: unknown) => `${JSON.stringify(value, null, 2)}\n`;
+
+type AtomicWriter = (
+  filePath: string,
+  data: string,
+  options: { encoding: "utf8" },
+) => Promise<void>;
+
+const retryDelay = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+
+export async function writeFileAtomicWithRetry(
+  filePath: string,
+  data: string,
+  writer: AtomicWriter = writeFileAtomic as AtomicWriter,
+  delay: (milliseconds: number) => Promise<void> = retryDelay,
+): Promise<void> {
+  const attempts = 8;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      await writer(filePath, data, { encoding: "utf8" });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      const retryable = code === "EPERM" || code === "EBUSY" || code === "EACCES";
+      if (!retryable || attempt === attempts - 1) throw error;
+      await delay(Math.min(500, 40 * (2 ** attempt)));
+    }
+  }
+}
 
 export class StorageService {
   readonly rootDir: string;
@@ -73,7 +102,7 @@ export class StorageService {
         updatedAt: isoNow(),
         groups: [],
         tabs: [],
-        ui: { consoleWidth: 300, theme: "light", ungroupedCollapsed: false },
+        ui: { consoleWidth: 300, theme: "light", locale: "zh-CN", ungroupedCollapsed: false },
       });
     }
   }
@@ -92,7 +121,7 @@ export class StorageService {
 
   private async writeFile(filePath: string, value: unknown): Promise<void> {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await writeFileAtomic(filePath, json(value), { encoding: "utf8" });
+    await writeFileAtomicWithRetry(filePath, json(value));
   }
 
   async readIndex(): Promise<IndexFile> {
@@ -156,6 +185,19 @@ export class StorageService {
       this.readFile(this.runtimePath(tabId), (value) => RuntimeFileSchema.parse(value)),
     ]);
     return { tab, prompts, answers, runtime };
+  }
+
+  async readTabActivity(tabId: string): Promise<TabActivitySummary> {
+    const [prompts, runtime] = await Promise.all([
+      this.readFile(this.promptPath(tabId), (value) => PromptFileSchema.parse(value)),
+      this.readFile(this.runtimePath(tabId), (value) => RuntimeFileSchema.parse(value)),
+    ]);
+    return {
+      runnerState: runtime.runner.state,
+      desiredState: runtime.runner.desiredState,
+      activePromptId: runtime.runner.activePromptId,
+      lastQueueCompletedAt: latestQueueCompletion(prompts.prompts),
+    };
   }
 
   async tabExists(tabId: string): Promise<boolean> {

@@ -138,7 +138,7 @@ export class QueueRunner extends EventEmitter {
         }
         const fresh = await this.storage.readTab(this.tabId);
         if (fresh.runtime.runner.desiredState !== "running") { await this.setRunnerState("paused"); return; }
-        const prompt = fresh.prompts.prompts.find((item) => item.status === "pending");
+        const prompt = fresh.prompts.prompts.find((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId));
         if (!prompt) {
           if (await this.pauseIfEmpty()) return;
           continue;
@@ -157,7 +157,11 @@ export class QueueRunner extends EventEmitter {
     return this.storage.withTabLock(this.tabId, async () => {
       const bundle = await this.storage.readTab(this.tabId);
       if (bundle.runtime.runner.desiredState !== "running") return null;
-      const prompt = bundle.prompts.prompts.find((item) => item.id === promptId && item.status === "pending");
+      const threadId = bundle.tab.session.threadId;
+      if (!threadId) return null;
+      const prompt = bundle.prompts.prompts.find((item) => item.id === promptId
+        && item.status === "pending"
+        && (!item.threadId || item.threadId === threadId));
       if (!prompt) return null;
       const clientUserMessageId = `codex-promptor-${randomUUID()}`;
       const attempt = newAttempt("queue");
@@ -165,6 +169,7 @@ export class QueueRunner extends EventEmitter {
       attempt.startedAt = isoNow();
       attempt.clientUserMessageId = clientUserMessageId;
       prompt.attempts.push(attempt);
+      prompt.threadId = threadId;
       prompt.status = "dispatching";
       prompt.startedAt = attempt.startedAt;
       prompt.clientUserMessageId = clientUserMessageId;
@@ -218,7 +223,8 @@ export class QueueRunner extends EventEmitter {
     return this.storage.withTabLock(this.tabId, async () => {
       const bundle = await this.storage.readTab(this.tabId);
       if (bundle.runtime.runner.desiredState !== "running") return true;
-      if (bundle.prompts.prompts.some((item) => item.status === "pending")) return false;
+      const threadId = bundle.tab.session.threadId;
+      if (threadId && bundle.prompts.prompts.some((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId))) return false;
       const runtime: RuntimeFile = {
         ...bundle.runtime,
         revision: bundle.runtime.revision + 1,

@@ -99,7 +99,7 @@ export async function recordTurn(storage: StorageService, tabId: string, options
   if (!input && !options.promptText) return { prompt: null, answer: null };
   return storage.withTabLock(tabId, async () => {
     const bundle = await storage.readTab(tabId);
-    let prompt = bundle.prompts.prompts.find((item) => item.codexTurnId === turnId)
+    let prompt = bundle.prompts.prompts.find((item) => item.codexTurnId === turnId && (!item.threadId || item.threadId === options.threadId))
       ?? (options.promptId ? bundle.prompts.prompts.find((item) => item.id === options.promptId) : undefined)
       ?? (options.clientUserMessageId ? bundle.prompts.prompts.find((item) => item.clientUserMessageId === options.clientUserMessageId) : undefined);
     if (!prompt) {
@@ -110,6 +110,7 @@ export async function recordTurn(storage: StorageService, tabId: string, options
       prompt.text = options.promptText ?? input?.text ?? prompt.text;
     }
     prompt.origin = options.origin;
+    prompt.threadId = options.threadId;
     prompt.codexTurnId = turnId;
     prompt.clientUserMessageId = options.clientUserMessageId ?? prompt.clientUserMessageId;
     prompt.startedAt = protocolTime(options.turn?.startedAt) ?? prompt.startedAt;
@@ -163,6 +164,8 @@ export async function recordTurn(storage: StorageService, tabId: string, options
 export type HistoryReport = { imported: number; skipped: number; ignored: number; repaired: number };
 
 export async function syncHistory(storage: StorageService, tabId: string, thread: any): Promise<HistoryReport> {
+  const threadId = String(thread?.id ?? thread?.threadId ?? "");
+  if (!threadId) throw new Error("THREAD_ID_MISSING");
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
   const report: HistoryReport = { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
   await storage.withTabLock(tabId, async () => {
@@ -176,7 +179,27 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
     let promptChanges = bundle.prompts.prompts.length - deduplicatedPrompts.length;
     let answerChanges = 0;
     const historyPrompts: PromptRecord[] = [];
+    const completedTurnIds = new Set<string>();
     bundle.prompts.prompts = deduplicatedPrompts;
+
+    // Prompt files created before thread ownership was recorded can be repaired
+    // from their answer linkage. This lets a later sync remove records belonging
+    // to a different Codex conversation without deleting unbound queue entries.
+    const answerThreadsByPrompt = new Map<string, Set<string>>();
+    for (const answer of bundle.answers.answers) {
+      const owners = answerThreadsByPrompt.get(answer.promptId) ?? new Set<string>();
+      owners.add(answer.threadId);
+      answerThreadsByPrompt.set(answer.promptId, owners);
+    }
+    for (const prompt of bundle.prompts.prompts) {
+      const owners = answerThreadsByPrompt.get(prompt.id);
+      if (!prompt.threadId && owners?.size === 1) {
+        prompt.threadId = [...owners][0];
+        prompt.updatedAt = isoNow();
+        promptChanges += 1;
+      }
+    }
+
     for (const turn of turns) {
       if (!turnCompleted(turn)) { report.ignored += 1; continue; }
       const items = Array.isArray(turn?.items) ? turn.items : [];
@@ -185,15 +208,15 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       if (!input || !final) { report.ignored += 1; continue; }
       const turnId = String(turn.id ?? turn.turnId ?? "");
       if (!turnId) { report.ignored += 1; continue; }
-      const threadId = String(thread.id ?? thread.threadId);
+      completedTurnIds.add(turnId);
       const existingAnswer = bundle.answers.answers.find((answer) => answer.threadId === threadId && answer.codexTurnId === turnId);
-      const existingPrompt = bundle.prompts.prompts.find((prompt) => prompt.codexTurnId === turnId);
+      const existingPrompt = bundle.prompts.prompts.find((prompt) => prompt.codexTurnId === turnId && (!prompt.threadId || prompt.threadId === threadId));
       const clientId = findClientUserMessageId(items);
       // Historic turns commonly have no client id. Never compare a missing id:
       // doing so reused the first null-id prompt for every turn and then pushed
       // that same object into the list repeatedly.
       const promptByClientId = clientId
-        ? bundle.prompts.prompts.find((item) => item.clientUserMessageId === clientId)
+        ? bundle.prompts.prompts.find((item) => item.clientUserMessageId === clientId && (!item.threadId || item.threadId === threadId))
         : undefined;
       const prompt = existingPrompt ?? promptByClientId ?? newPrompt(input.text, "imported");
       const createdPrompt = !existingPrompt && !promptByClientId;
@@ -205,13 +228,28 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       };
       if (createdPrompt || prompt.origin === "imported") setPrompt("origin", "imported");
       if (createdPrompt || prompt.origin === "imported") setPrompt("text", input.text);
+      setPrompt("threadId", threadId);
       setPrompt("inputSnapshot", input.snapshot);
       setPrompt("codexTurnId", turnId);
       if (clientId) setPrompt("clientUserMessageId", clientId);
       setPrompt("startedAt", protocolTime(turn.startedAt));
-      setPrompt("completedAt", protocolTime(turn.completedAt));
+      const turnCompletedAt = protocolTime(turn.completedAt);
+      setPrompt("completedAt", turnCompletedAt);
       setPrompt("status", "completed");
       setPrompt("error", null);
+      for (const attempt of prompt.attempts) {
+        const matchesTurn = attempt.codexTurnId === turnId;
+        const matchesClient = Boolean(clientId) && attempt.clientUserMessageId === clientId;
+        if (!matchesTurn && !matchesClient) continue;
+        const completedAt = turnCompletedAt ?? attempt.completedAt ?? isoNow();
+        if (attempt.status !== "completed" || attempt.completedAt !== completedAt || attempt.codexTurnId !== turnId || attempt.error !== null) {
+          attempt.status = "completed";
+          attempt.completedAt = completedAt;
+          attempt.codexTurnId = turnId;
+          attempt.error = null;
+          promptChanged = true;
+        }
+      }
       if (promptChanged) {
         prompt.updatedAt = isoNow();
         promptChanges += 1;
@@ -226,7 +264,7 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
           promptId: prompt.id,
           threadId,
           codexTurnId: turnId,
-          origin: "imported",
+          origin: prompt.origin === "queue" ? "queue" : "imported",
           prompt: prompt.text,
           finalAnswer: final.text,
           captureMode: final.captureMode,
@@ -241,6 +279,7 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       } else {
         const answerPatch: Partial<AnswerRecord> = {
           promptId: prompt.id,
+          ...(prompt.origin === "queue" ? { origin: "queue" as const } : {}),
           prompt: prompt.text,
           finalAnswer: final.text,
           captureMode: final.captureMode,
@@ -258,12 +297,35 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
         else report.skipped += 1;
       }
     }
+    // final_answers.json mirrors the active conversation. Old-thread answers are
+    // reproducible from Codex and must not leak into the currently selected tab.
+    const seenAnswerTurns = new Set<string>();
+    const syncedAnswers = bundle.answers.answers.filter((answer) => {
+      const keep = answer.threadId === threadId
+        && completedTurnIds.has(answer.codexTurnId)
+        && !seenAnswerTurns.has(answer.codexTurnId);
+      if (keep) seenAnswerTurns.add(answer.codexTurnId);
+      else answerChanges += 1;
+      return keep;
+    });
+    bundle.answers.answers = syncedAnswers;
+
+    // The Codex history is authoritative and stays first. Keep this thread's
+    // local non-history state, then append unbound/current pending prompts in
+    // their existing order so closing and reopening cannot jump the queue.
     const historyPromptIds = new Set(historyPrompts.map((prompt) => prompt.id));
+    const remainder = bundle.prompts.prompts.filter((prompt) => !historyPromptIds.has(prompt.id));
+    const completedRemainder = remainder.filter((prompt) => prompt.threadId === threadId && prompt.status === "completed");
+    const currentNonPending = remainder.filter((prompt) => prompt.threadId === threadId && prompt.status !== "completed" && prompt.status !== "pending");
+    const queuedPending = remainder.filter((prompt) => prompt.status === "pending" && (!prompt.threadId || prompt.threadId === threadId));
     const orderedPrompts = [
       ...historyPrompts,
-      ...bundle.prompts.prompts.filter((prompt) => !historyPromptIds.has(prompt.id)),
+      ...completedRemainder,
+      ...currentNonPending,
+      ...queuedPending,
     ];
-    if (orderedPrompts.some((prompt, index) => bundle.prompts.prompts[index]?.id !== prompt.id)) {
+    if (orderedPrompts.length !== bundle.prompts.prompts.length
+      || orderedPrompts.some((prompt, index) => bundle.prompts.prompts[index]?.id !== prompt.id)) {
       bundle.prompts.prompts = orderedPrompts;
       promptChanges += 1;
     }

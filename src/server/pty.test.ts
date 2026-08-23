@@ -3,7 +3,7 @@ import { buildRemoteCodexCommand, parseCodexExitCode, sliceTerminalBuffer, termi
 
 describe("remote Codex terminal command", () => {
   it("resumes the selected remote thread in the selected working directory", () => {
-    const command = buildRemoteCodexCommand("ws://127.0.0.1:4500", "01a00000-0000-7000-8000-000000000001", "C:\\Users\\Tester Workspace", "dark");
+    const command = buildRemoteCodexCommand("ws://127.0.0.1:4500", { mode: "resume", threadId: "01a00000-0000-7000-8000-000000000001" }, "C:\\Users\\Tester Workspace", "dark");
     expect(command).toContain("Set-Location -LiteralPath 'C:\\Users\\Tester Workspace'");
     expect(command).toContain("codex resume 01a00000-0000-7000-8000-000000000001 --remote ws://127.0.0.1:4500 --no-alt-screen -C 'C:\\Users\\Tester Workspace'");
     expect(command).toContain('$Host.UI.RawUI.BackgroundColor = "Black"');
@@ -12,10 +12,16 @@ describe("remote Codex terminal command", () => {
   });
 
   it("uses a light PowerShell palette in light mode", () => {
-    const command = buildRemoteCodexCommand("ws://127.0.0.1:4500", "01a00000-0000-7000-8000-000000000001", "C:\\work", "light");
+    const command = buildRemoteCodexCommand("ws://127.0.0.1:4500", { mode: "resume", threadId: "01a00000-0000-7000-8000-000000000001" }, "C:\\work", "light");
     expect(command).toContain('$Host.UI.RawUI.ForegroundColor = "Black"');
     expect(command).toContain('$Host.UI.RawUI.BackgroundColor = "White"');
     expect(command).toContain("[30;47m");
+  });
+
+  it("lets the remote TUI create a fresh thread without trying to resume an unsaved id", () => {
+    const command = buildRemoteCodexCommand("ws://127.0.0.1:4500", { mode: "new" }, "C:\\work", "light");
+    expect(command).toContain("codex --remote ws://127.0.0.1:4500 --no-alt-screen -C 'C:\\work'");
+    expect(command).not.toContain("codex resume");
   });
 
   it("reads a split-buffer exit marker only after the exit code arrives", () => {
