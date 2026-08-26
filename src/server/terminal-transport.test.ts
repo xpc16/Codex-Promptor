@@ -42,6 +42,19 @@ describe("raw terminal batching", () => {
     expect(delivered).toHaveLength(2);
     expect(Buffer.from(delivered[1].dataBase64, "base64").toString("utf8")).toBe("new");
   });
+
+  it("leaves the interactive window early when output becomes a stream", () => {
+    vi.useFakeTimers();
+    const delivered: any[] = [];
+    const config = { ...defaultTerminalTransportConfig, interactiveOutputMaxBytes: 4 };
+    const batcher = new RawTerminalBatcher((value) => delivered.push(value), config);
+    batcher.markInteractive("tab-1");
+    batcher.push(chunk("tab-1", "generation-1", 0, "streaming"));
+    vi.advanceTimersByTime(config.rawBatchInteractiveMs);
+    expect(delivered).toHaveLength(0);
+    vi.advanceTimersByTime(config.rawBatchIdleMs - config.rawBatchInteractiveMs);
+    expect(delivered).toHaveLength(1);
+  });
 });
 
 describe("bounded WebSocket sending and traffic metrics", () => {
@@ -87,12 +100,14 @@ describe("terminal transport validation", () => {
       CODEX_PROMPTOR_MAX_INPUT_BYTES: "131072",
       CODEX_PROMPTOR_PROJECTION_BYTES_PER_SECOND: "4096",
       CODEX_PROMPTOR_PROJECTION_MAX_BURST_BYTES: "16384",
+      CODEX_PROMPTOR_INTERACTIVE_OUTPUT_MAX_BYTES: "32768",
     });
     expect(config.websocketHighWaterBytes).toBe(16 * 1024);
     expect(config.rawBatchIdleMs).toBe(75);
     expect(config.maxInputMessageBytes).toBe(128 * 1024);
     expect(config.projectionBytesPerSecond).toBe(4 * 1024);
     expect(config.projectionMaxBurstBytes).toBe(16 * 1024);
+    expect(config.interactiveOutputMaxBytes).toBe(32 * 1024);
   });
 });
 

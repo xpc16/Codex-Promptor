@@ -133,6 +133,55 @@ describe("TerminalProjectionScheduler", () => {
     expect(sent.at(-1).rows[0].runs[0].text).toBe("latest");
     scheduler.close();
   });
+
+  it("allows a bounded interactive echo burst to borrow future tokens", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-26T00:00:00.000Z"));
+    let current = snapshot(["initial"]);
+    const sent: any[] = [];
+    const scheduler = new TerminalProjectionScheduler(async () => current, {
+      ...defaultProjectionSchedulerConfig,
+      bytesPerSecond: 256,
+      maxBurstBytes: 1_024,
+    });
+    scheduler.subscribe("interactive", "tab", {}, {
+      isOpen: () => true,
+      bufferedAmount: () => 0,
+      send: (payload) => { sent.push(JSON.parse(payload)); return "sent"; },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    scheduler.markInteractive("tab");
+    current = snapshot(["echo"], { revision: 2 });
+    scheduler.markDirty("tab");
+    await vi.advanceTimersByTimeAsync(defaultProjectionSchedulerConfig.interactiveFrameMs);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toMatchObject({ revision: 2, full: false });
+    scheduler.close();
+  });
+
+  it("returns to the idle frame rate when an interactive command starts streaming", async () => {
+    vi.useFakeTimers();
+    let current = snapshot(["ready"]);
+    const sent: any[] = [];
+    const scheduler = new TerminalProjectionScheduler(async () => current, {
+      ...defaultProjectionSchedulerConfig,
+      interactiveOutputMaxBytes: 4,
+    });
+    scheduler.subscribe("stream", "tab", {}, {
+      isOpen: () => true,
+      bufferedAmount: () => 0,
+      send: (payload) => { sent.push(JSON.parse(payload)); return "sent"; },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    scheduler.markInteractive("tab");
+    current = snapshot(["lots of output"], { revision: 2 });
+    scheduler.markDirty("tab", 8);
+    await vi.advanceTimersByTimeAsync(defaultProjectionSchedulerConfig.interactiveFrameMs);
+    expect(sent).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(500 - defaultProjectionSchedulerConfig.interactiveFrameMs);
+    expect(sent).toHaveLength(2);
+    scheduler.close();
+  });
 });
 
 function snapshot(

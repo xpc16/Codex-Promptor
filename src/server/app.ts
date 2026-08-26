@@ -145,6 +145,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       backpressureHighBytes: transportConfig.websocketHighWaterBytes,
       backpressureLowBytes: transportConfig.websocketLowWaterBytes,
       interactiveWindowMs: transportConfig.interactiveWindowMs,
+      interactiveOutputMaxBytes: transportConfig.interactiveOutputMaxBytes,
       bytesPerSecond: transportConfig.projectionBytesPerSecond,
       maxBurstBytes: transportConfig.projectionMaxBurstBytes,
     },
@@ -851,6 +852,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           compression: websocketCompression,
           rawBatchIdleMs: transportConfig.rawBatchIdleMs,
           rawBatchInteractiveMs: transportConfig.rawBatchInteractiveMs,
+          interactiveOutputMaxBytes: transportConfig.interactiveOutputMaxBytes,
           projection: {
             defaultViewportRows: defaultProjectionSchedulerConfig.defaultViewportRows,
             defaultFps: defaultProjectionSchedulerConfig.defaultFps,
@@ -1606,7 +1608,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         endOffset: event.endOffset,
         dataBase64: event.dataBase64,
       });
-      projectionScheduler.markDirty(event.tabId);
+      projectionScheduler.markDirty(event.tabId, Math.max(0, Number(event.endOffset) - Number(event.startOffset)));
     }
     else {
       // Keep the final bytes (including an exit marker) ahead of terminal.state.

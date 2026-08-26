@@ -38,6 +38,11 @@ export type TerminalScreenModelOptions = {
   onResponse?: (data: string) => void;
 };
 
+type PendingScreenWrite = {
+  data: string;
+  waiters: Array<{ resolve: () => void; reject: (error: unknown) => void }>;
+};
+
 /**
  * A server-owned VT screen model. All parser writes, resizes and snapshots are
  * ordered through one promise tail, so a projection can never observe a
@@ -54,6 +59,8 @@ export class TerminalScreenModel {
   private cursorVisible = true;
   private theme: TerminalScreenTheme;
   private disposed = false;
+  private openWriteBatch: PendingScreenWrite | null = null;
+  private readonly writeBatches = new Set<PendingScreenWrite>();
 
   constructor(options: TerminalScreenModelOptions) {
     this.generation = options.generation;
@@ -114,15 +121,24 @@ export class TerminalScreenModel {
   setTheme(theme: TerminalScreenTheme): void { this.theme = theme; }
 
   write(data: string): Promise<void> {
-    return this.enqueue(() => new Promise<void>((resolve) => {
-      this.terminal.write(data, () => {
-        this.revisionValue += 1;
-        resolve();
-      });
-    }));
+    if (this.disposed || data.length === 0) return Promise.resolve();
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const completion = new Promise<void>((accept, decline) => { resolve = accept; reject = decline; });
+    let batch = this.openWriteBatch;
+    if (!batch) {
+      batch = { data: "", waiters: [] };
+      this.openWriteBatch = batch;
+      this.writeBatches.add(batch);
+      void this.enqueue(() => this.flushWriteBatch(batch!)).catch(() => undefined);
+    }
+    batch.data += data;
+    batch.waiters.push({ resolve, reject });
+    return completion;
   }
 
   resize(cols: number, rows: number): Promise<void> {
+    this.sealWriteBatch();
     return this.enqueue(() => {
       if (this.terminal.cols === cols && this.terminal.rows === rows) return;
       this.terminal.resize(cols, rows);
@@ -132,6 +148,7 @@ export class TerminalScreenModel {
   }
 
   async snapshot(requestedRows = 20): Promise<TerminalScreenSnapshot> {
+    this.sealWriteBatch();
     await this.tail;
     if (this.disposed) throw new Error("TERMINAL_SCREEN_DISPOSED");
     const buffer = this.terminal.buffer.active;
@@ -164,6 +181,7 @@ export class TerminalScreenModel {
   }
 
   async barrier(): Promise<{ generation: string; revision: number; sizeEpoch: number }> {
+    this.sealWriteBatch();
     await this.tail;
     return { generation: this.generation, revision: this.revisionValue, sizeEpoch: this.sizeEpochValue };
   }
@@ -171,7 +189,28 @@ export class TerminalScreenModel {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.openWriteBatch = null;
+    for (const batch of this.writeBatches) {
+      for (const waiter of batch.waiters.splice(0)) waiter.resolve();
+    }
     void this.tail.finally(() => this.terminal.dispose());
+  }
+
+  private sealWriteBatch(): void { this.openWriteBatch = null; }
+
+  private async flushWriteBatch(batch: PendingScreenWrite): Promise<void> {
+    if (this.openWriteBatch === batch) this.openWriteBatch = null;
+    try {
+      if (this.disposed) return;
+      await new Promise<void>((resolve) => this.terminal.write(batch.data, resolve));
+      this.revisionValue += 1;
+      for (const waiter of batch.waiters.splice(0)) waiter.resolve();
+    } catch (error) {
+      for (const waiter of batch.waiters.splice(0)) waiter.reject(error);
+      throw error;
+    } finally {
+      this.writeBatches.delete(batch);
+    }
   }
 
   private respond(data: string): void {
@@ -274,4 +313,3 @@ function themeColors(theme: TerminalScreenTheme): { foreground: string; backgrou
     ? { foreground: "rgb:1d1d/2727/3838", background: "rgb:f8f8/fafa/fcfc" }
     : { foreground: "rgb:e5e5/eded/f8f8", background: "rgb:0f0f/1717/2222" };
 }
-

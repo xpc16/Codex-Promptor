@@ -34,6 +34,17 @@ describe("TerminalScreenModel", () => {
     screen.dispose();
   });
 
+  it("coalesces a burst of contiguous PTY chunks into one parser revision", async () => {
+    const screen = new TerminalScreenModel({ generation: "gen-burst", cols: 30, rows: 5 });
+    const writes = Array.from({ length: 500 }, (_, index) => screen.write(`line-${index}\r\n`));
+    await Promise.all(writes);
+
+    const snapshot = await screen.snapshot(5);
+    expect(snapshot.revision).toBe(1);
+    expect(snapshot.rows.map(rowText).join("\n")).toContain("line-499");
+    screen.dispose();
+  });
+
   it("tracks alternate screen, input modes and cursor visibility", async () => {
     const screen = new TerminalScreenModel({ generation: "gen-modes", cols: 20, rows: 5 });
     await screen.write("\x1b[?1049h\x1b[?1h\x1b[?66h\x1b[?2004h\x1b[?1000h\x1b[?1004hmenu\x1b[?25l");
@@ -89,4 +100,3 @@ describe("TerminalScreenModel", () => {
 function rowText(row: { runs: Array<{ text: string }> }): string {
   return row.runs.map((run) => run.text).join("");
 }
-

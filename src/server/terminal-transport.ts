@@ -17,6 +17,7 @@ export type TerminalTransportConfig = {
   rawBatchIdleMs: number;
   rawBatchInteractiveMs: number;
   interactiveWindowMs: number;
+  interactiveOutputMaxBytes: number;
   rawBatchMaxBytes: number;
   projectionBytesPerSecond: number;
   projectionMaxBurstBytes: number;
@@ -29,6 +30,7 @@ export const defaultTerminalTransportConfig: TerminalTransportConfig = {
   rawBatchIdleMs: 50,
   rawBatchInteractiveMs: 12,
   interactiveWindowMs: 800,
+  interactiveOutputMaxBytes: 8 * 1024,
   rawBatchMaxBytes: 64 * 1024,
   projectionBytesPerSecond: 2 * 1024,
   projectionMaxBurstBytes: 8 * 1024,
@@ -44,6 +46,7 @@ export function terminalTransportConfigFromEnv(
     rawBatchIdleMs: integerEnv(env.CODEX_PROMPTOR_RAW_BATCH_IDLE_MS, 0, 1_000, defaultTerminalTransportConfig.rawBatchIdleMs),
     rawBatchInteractiveMs: integerEnv(env.CODEX_PROMPTOR_RAW_BATCH_INTERACTIVE_MS, 0, 250, defaultTerminalTransportConfig.rawBatchInteractiveMs),
     interactiveWindowMs: integerEnv(env.CODEX_PROMPTOR_INTERACTIVE_WINDOW_MS, 0, 10_000, defaultTerminalTransportConfig.interactiveWindowMs),
+    interactiveOutputMaxBytes: integerEnv(env.CODEX_PROMPTOR_INTERACTIVE_OUTPUT_MAX_BYTES, 1024, 1024 * 1024, defaultTerminalTransportConfig.interactiveOutputMaxBytes),
     rawBatchMaxBytes: integerEnv(env.CODEX_PROMPTOR_RAW_BATCH_MAX_BYTES, 1024, 1024 * 1024, defaultTerminalTransportConfig.rawBatchMaxBytes),
     projectionBytesPerSecond: integerEnv(env.CODEX_PROMPTOR_PROJECTION_BYTES_PER_SECOND, 256, 1024 * 1024, defaultTerminalTransportConfig.projectionBytesPerSecond),
     projectionMaxBurstBytes: integerEnv(env.CODEX_PROMPTOR_PROJECTION_MAX_BURST_BYTES, 1024, 1024 * 1024, defaultTerminalTransportConfig.projectionMaxBurstBytes),
@@ -76,6 +79,7 @@ type PendingRawBatch = {
 export class RawTerminalBatcher {
   private readonly pending = new Map<string, PendingRawBatch>();
   private readonly interactiveUntil = new Map<string, number>();
+  private readonly interactiveOutputBytes = new Map<string, number>();
 
   constructor(
     private readonly deliver: (chunk: RawTerminalChunk) => void,
@@ -86,6 +90,11 @@ export class RawTerminalBatcher {
   push(chunk: RawTerminalChunk): void {
     const bytes = Buffer.from(chunk.dataBase64, "base64");
     if (bytes.length === 0 && chunk.endOffset <= chunk.startOffset) return;
+    if ((this.interactiveUntil.get(chunk.tabId) ?? 0) > this.now()) {
+      const outputBytes = (this.interactiveOutputBytes.get(chunk.tabId) ?? 0) + bytes.length;
+      this.interactiveOutputBytes.set(chunk.tabId, outputBytes);
+      if (outputBytes >= this.config.interactiveOutputMaxBytes) this.interactiveUntil.delete(chunk.tabId);
+    }
     let batch = this.pending.get(chunk.tabId);
     if (batch && (batch.generation !== chunk.generation || batch.endOffset !== chunk.startOffset)) {
       this.flush(chunk.tabId);
@@ -115,6 +124,7 @@ export class RawTerminalBatcher {
 
   markInteractive(tabId: string): void {
     this.interactiveUntil.set(tabId, this.now() + this.config.interactiveWindowMs);
+    this.interactiveOutputBytes.set(tabId, 0);
     const batch = this.pending.get(tabId);
     if (batch) this.schedule(tabId, batch, this.config.rawBatchInteractiveMs);
   }
@@ -144,12 +154,14 @@ export class RawTerminalBatcher {
       }
     }
     this.interactiveUntil.clear();
+    this.interactiveOutputBytes.clear();
   }
 
   private currentDelay(tabId: string): number {
-    return (this.interactiveUntil.get(tabId) ?? 0) > this.now()
-      ? this.config.rawBatchInteractiveMs
-      : this.config.rawBatchIdleMs;
+    if ((this.interactiveUntil.get(tabId) ?? 0) > this.now()) return this.config.rawBatchInteractiveMs;
+    this.interactiveUntil.delete(tabId);
+    this.interactiveOutputBytes.delete(tabId);
+    return this.config.rawBatchIdleMs;
   }
 
   private schedule(tabId: string, batch: PendingRawBatch, delay: number): void {

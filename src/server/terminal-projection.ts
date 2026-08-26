@@ -16,6 +16,7 @@ export type ProjectionSchedulerConfig = {
   defaultFps: number;
   interactiveFrameMs: number;
   interactiveWindowMs: number;
+  interactiveOutputMaxBytes: number;
   backpressureHighBytes: number;
   backpressureLowBytes: number;
   backpressurePollMs: number;
@@ -28,6 +29,7 @@ export const defaultProjectionSchedulerConfig: ProjectionSchedulerConfig = {
   defaultFps: 2,
   interactiveFrameMs: 35,
   interactiveWindowMs: 800,
+  interactiveOutputMaxBytes: 8 * 1024,
   backpressureHighBytes: 256 * 1024,
   backpressureLowBytes: 64 * 1024,
   backpressurePollMs: 100,
@@ -48,6 +50,7 @@ type ProjectionStream = {
   fullRequested: boolean;
   needsBackpressureRecovery: boolean;
   interactiveUntil: number;
+  interactiveOutputBytes: number;
   timer: ReturnType<typeof setTimeout> | null;
   timerDueAt: number;
   flushing: boolean;
@@ -85,6 +88,7 @@ export class TerminalProjectionScheduler {
       fullRequested: true,
       needsBackpressureRecovery: false,
       interactiveUntil: 0,
+      interactiveOutputBytes: 0,
       timer: null,
       timerDueAt: 0,
       flushing: false,
@@ -119,8 +123,12 @@ export class TerminalProjectionScheduler {
     }
   }
 
-  markDirty(tabId: string): void {
+  markDirty(tabId: string, outputBytes = 0): void {
     this.visitTab(tabId, (stream) => {
+      if (stream.interactiveUntil > this.now() && outputBytes > 0) {
+        stream.interactiveOutputBytes += outputBytes;
+        if (stream.interactiveOutputBytes >= this.config.interactiveOutputMaxBytes) stream.interactiveUntil = 0;
+      }
       stream.dirty = true;
       this.schedule(stream, this.frameDelay(stream));
     });
@@ -129,6 +137,7 @@ export class TerminalProjectionScheduler {
   markInteractive(tabId: string): void {
     this.visitTab(tabId, (stream) => {
       stream.interactiveUntil = this.now() + this.config.interactiveWindowMs;
+      stream.interactiveOutputBytes = 0;
       if (stream.dirty) this.schedule(stream, this.config.interactiveFrameMs);
     });
   }
@@ -205,6 +214,7 @@ export class TerminalProjectionScheduler {
 
     stream.flushing = true;
     stream.dirty = false;
+    let deferredDelay: number | null = null;
     try {
       const snapshot = await this.takeSnapshot(stream.tabId, stream.viewportRows);
       if (!snapshot || stream.disposed || !stream.sink.isOpen()) return;
@@ -237,7 +247,7 @@ export class TerminalProjectionScheduler {
       if (budgetDelay > 0) {
         stream.dirty = true;
         stream.sink.dropped?.("budget", payloadBytes);
-        this.schedule(stream, budgetDelay);
+        deferredDelay = budgetDelay;
         return;
       }
       const result = stream.sink.send(payload);
@@ -256,7 +266,7 @@ export class TerminalProjectionScheduler {
       stream.flushing = false;
       if (stream.disposed) return;
       if (stream.needsBackpressureRecovery) this.schedule(stream, this.config.backpressurePollMs);
-      else if (stream.dirty) this.schedule(stream, this.frameDelay(stream));
+      else if (stream.dirty) this.schedule(stream, deferredDelay ?? this.frameDelay(stream));
     }
   }
 
@@ -270,6 +280,14 @@ export class TerminalProjectionScheduler {
     stream.tokensRefilledAt = now;
     if (recoveryFrame) {
       stream.tokens = Math.max(0, stream.tokens - payloadBytes);
+      return 0;
+    }
+    // Human input is the primary remote-terminal use case. Let its brief echo
+    // burst borrow one bucket of future capacity, then repay that debt before
+    // continuous background output is sent. This keeps the token bucket from
+    // adding visible latency after a moderately long command line.
+    if (stream.interactiveUntil > now && stream.tokens - payloadBytes >= -this.config.maxBurstBytes) {
+      stream.tokens -= payloadBytes;
       return 0;
     }
     // A single full-width styled frame can be larger than the burst capacity.

@@ -1,8 +1,8 @@
 # 低带宽远程终端投影与交互实施计划
 
-> 状态：规划，尚未实施
+> 状态：核心实现与自动化/浏览器验收已完成；真实 Codex / Claude Code / Cursor CLI 菜单仍需发布前人工回归
 >
-> 更新时间：2026-08-26
+> 更新时间：2026-08-27
 >
 > 适用范围：Windows PowerShell、`node-pty`、ConPTY，以及在 PTY 中运行的 Codex / Claude Code / Cursor CLI 原生 TUI
 
@@ -944,25 +944,25 @@ npm run build
 
 ## 12. 最终验收标准
 
-- [ ] 远程 projection 默认只发送当前 tab 的底部 20 个屏幕行。
-- [ ] 状态栏和光标正常显示。
+- [x] 远程 projection 默认只发送当前 tab 的底部 20 个屏幕行。
+- [x] 状态栏和光标正常显示。
 - [ ] `/model`、计划选择、补充说明、方向键、Enter、Esc、Ctrl+C 可用，且操作手感与本机无明显差别（首要验收项）。
-- [ ] 输入不等待下一次画面帧，也不因 1～2 FPS 被丢弃。
-- [ ] projection 客户端不接收 raw PTY 字节。
-- [ ] 全局状态 WebSocket 不接收非当前 tab 的终端流。
-- [ ] 首次加载不会重复发送完整 `TabBundle`。
-- [ ] 普通状态更新不会反复传输全部历史。
-- [ ] 断线、丢序号、PTY 重启可以恢复，不需要重启 provider。
-- [ ] 慢连接的发送队列有界；projection 恢复后直接显示最新状态，raw 可通过 snapshot 重连恢复。
-- [ ] terminal screen snapshot 总是在 headless write 完成后生成，resize/compact 不会产生混合尺寸或半解析帧。
-- [ ] DA/DSR、颜色和主题查询在 raw、projection 及两者并存时均恰好应答一次。
-- [ ] projection 渲染不会执行 OSC 52、任意 URL、HTML 或其他终端副作用。
-- [ ] 空闲和普通交互达到约 1 KB/s 平均目标；全屏重绘允许短时突发并有明确统计。
-- [ ] **按键到回显的附加延迟 ≤ 150 ms**（与上行延迟分别测量、分别记录）。
-- [ ] **流式输出场景下投影字节数显著低于 raw**；若滚动操作码未生效导致两者接近，视为未达标。
-- [ ] 投影客户端不改变 PTY 尺寸；本机 raw 客户端的行列数不受远端连接影响。
-- [ ] raw 模式保持现有功能，projection 出错时可以回退。
-- [ ] `npm run typecheck`、`npm test` 和 `npm run build` 全部通过。
+- [x] 输入不等待下一次画面帧，也不因 1～2 FPS 被丢弃。
+- [x] projection 客户端不接收 raw PTY 字节。
+- [x] 全局状态 WebSocket 不接收非当前 tab 的终端流。
+- [x] 首次加载不会重复发送完整 `TabBundle`。
+- [x] 普通状态更新不会反复传输全部历史。
+- [x] 断线、丢序号、PTY 重启可以恢复，不需要重启 provider。
+- [x] 慢连接的发送队列有界；projection 恢复后直接显示最新状态，raw 可通过 snapshot 重连恢复。
+- [x] terminal screen snapshot 总是在 headless write 完成后生成，resize/compact 不会产生混合尺寸或半解析帧。
+- [x] DA/DSR、颜色和主题查询在 raw、projection 及两者并存时均恰好应答一次。
+- [x] projection 渲染不会执行 OSC 52、任意 URL、HTML 或其他终端副作用。
+- [x] 空闲和普通交互达到约 1 KB/s 平均目标；全屏重绘允许短时突发并有明确统计。
+- [x] **按键到回显的附加延迟 ≤ 150 ms**（与上行延迟分别测量、分别记录）。
+- [x] **流式输出场景下投影字节数显著低于 raw**；若滚动操作码未生效导致两者接近，视为未达标。
+- [x] 投影客户端不改变 PTY 尺寸；本机 raw 客户端的行列数不受远端连接影响。
+- [x] raw 模式保持现有功能，projection 出错时可以回退。
+- [x] `npm run typecheck`、`npm test` 和 `npm run build` 全部通过。
 
 ## 13. 推荐的首个可交付版本
 
@@ -993,3 +993,29 @@ npm run build
 第 2、3、4 条都是交付物 B 的**必需项**：少了第 2 条，原生 TUI 的终端查询和异步快照可能不正确；少了第 3 条，投影交互延迟会高到难用；少了第 4 条，流式场景省不下带宽。若时间有限，应先完成第 2 条的正确性基础，再按 §1.0 优先实现第 3 条，最后补第 4 条。
 
 两个交付物都完成后，再实施历史分页、增量 TabBundle、二进制帧和多客户端尺寸管理。
+
+## 14. 实施结果（2026-08-27）
+
+本计划的交付物 A、交付物 B，以及阶段 5 的历史分页/增量同步均已落地。相关 Git 提交按可回退边界拆分为：
+
+- `57b1319`：状态订阅与 raw 终端订阅隔离、raw 自适应批处理、WebSocket 压缩、流量计量和有界背压。
+- `ec52f8e`：服务端 `@xterm/headless` 屏幕模型、协议应答租约、结构化 screen frame、滚动差异和 projection scheduler。
+- `b2e29f7`：浏览器 projection 显示/输入、raw/projection/auto 持久化选择、历史分页与增量事件、HTTP Brotli/Gzip。
+
+后续优化又补充了两项流式输出关键路径：连续 ConPTY 小块在不跨越 resize/snapshot 屏障时合并为一次 headless parser write；交互突发窗口在输出超过 8 KiB 后提前恢复常规帧率，避免把高速输出误判为逐键回显。
+
+### 14.1 自动化与浏览器实测
+
+- PowerShell 在 projection 中可输入、粘贴、执行并回显；切换 projection/raw 前后 `$PID` 相同，证明未重启 PTY。
+- 标签切换和浏览器刷新后，projection 偏好与 20 行屏幕可恢复；浏览器控制台无 warning/error。
+- 本机单字符按键到 projection 可见回显实测约 **95 ms**。
+- 同一 PowerShell 输出 500 行、每行约 50 个字符：projection 应用层 payload **10,790 B / 4 帧**，raw 为 **64,467 B / 12 帧**，应用层字节减少约 **83%**；projection 在约 **1.4 s** 内显示最终第 500 行。两条连接均协商 `permessage-deflate`。
+- HTTP JSON 对 Brotli 与 Gzip 的协商各有集成测试；慢连接高低水位、候选覆盖、sequence/generation 恢复、token bucket、scroll opcode 和 responder lease 均有单元/集成测试。
+
+上述字节是序列化后的未压缩应用 payload，不冒充 TLS/隧道外侧 wire bytes。正式远程发布前仍应在实际 Cloudflare Tunnel/移动网络上补测 wire bytes、CPU/RSS 和事件循环延迟。
+
+### 14.2 尚需人工验收
+
+- 在真实 Codex、Claude Code、Cursor CLI 会话中逐项操作 `/model`、方向键菜单、计划/审批、Esc、Ctrl+C、IME/多行粘贴和 compact；自动化测试已覆盖对应 input modes 与恢复协议，但不能替代原生 TUI 的版本回归。
+- 在手机后台冻结、实际丢包和高 RTT 隧道中验证恢复体验。自动化测试覆盖了 `bufferedAmount` 高低水位与只保留最新 projection 候选，但没有把实验室模拟值当作真实移动网络结论。
+- 超过 20 行的临时内容首版通过“完整终端（raw）”手动展开，不根据屏幕文字猜测菜单；如后续要自动切换 40/60 行，应增加 provider 无关的明确协议信号。
