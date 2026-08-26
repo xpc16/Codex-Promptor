@@ -15,9 +15,18 @@ import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-pi
 import { withCodexRolloutTurns } from "./codex-history.js";
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
-import { CLAUDE_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager } from "./pty.js";
+import { CLAUDE_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, type TerminalCursor } from "./pty.js";
 import { RunnerManager } from "./queue.js";
 import { StorageService } from "./storage.js";
+import {
+  BoundedWebSocketSender,
+  decodeTerminalInput,
+  RawTerminalBatcher,
+  TERMINAL_PROTOCOL_VERSION,
+  TerminalTrafficMeter,
+  terminalTransportConfigFromEnv,
+  type TerminalTrafficKind,
+} from "./terminal-transport.js";
 import { syncTerminalThreadSelection } from "./terminal-thread-sync.js";
 import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionHandler } from "./tui-protocol.js";
 import { TuiProxyPool } from "./tui-proxy.js";
@@ -30,7 +39,20 @@ export function isValidResumeId(provider: AgentProvider, resumeId: string): bool
   return resumeId.length > 0 && resumeId.length <= 256 && !/[\x00-\x1f\x7f]/.test(resumeId);
 }
 
-type Client = { socket: any; subscriptions: Set<string>; wantsIndex: boolean };
+type RawTerminalStream = {
+  mode: "raw";
+  cursor: TerminalCursor;
+  streamId: string;
+  sequence: number;
+};
+
+type Client = {
+  id: string;
+  socket: any;
+  stateSubscriptions: Set<string>;
+  terminalSubscriptions: Map<string, RawTerminalStream>;
+  wantsIndex: boolean;
+};
 
 export type RestoreOpenSessionsSummary = {
   restored: string[];
@@ -54,6 +76,7 @@ export type PromptorApp = FastifyInstance & {
     pty: PtyManager;
     runners: RunnerManager;
     ui: UiLifecycle;
+    traffic: TerminalTrafficMeter;
     token: string;
     restoreOpenSessions: () => Promise<RestoreOpenSessionsSummary>;
     close: () => Promise<void>;
@@ -73,6 +96,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const token = process.env.CODEX_PROMPTOR_TOKEN ?? randomBytes(32).toString("hex");
   const clients = new Set<Client>();
   const sequences = new Map<string, number>();
+  const transportConfig = terminalTransportConfigFromEnv();
+  const traffic = new TerminalTrafficMeter();
+  const socketSender = new BoundedWebSocketSender(traffic, transportConfig);
   const terminalResyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const pendingApprovals = new Map<string, { tabId: string; manager: AppServerManager; requestId: number | string }>();
   const threadSwitches = new Map<string, Promise<void>>();
@@ -93,14 +119,48 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
   await recoverTerminalRuntime(storage);
 
+  const sendClient = (client: Client, message: Record<string, unknown>, kind: TerminalTrafficKind): boolean => (
+    socketSender.send(client.id, client.socket, JSON.stringify(message), kind)
+  );
+
   const emit = (tabId: string, message: Record<string, unknown>) => {
     const sequence = (sequences.get(tabId) ?? 0) + 1;
     sequences.set(tabId, sequence);
-    const payload = JSON.stringify({ ...message, tabId, sequence });
     for (const client of clients) {
-      if (client.subscriptions.has(tabId) && client.socket.readyState === 1) client.socket.send(payload);
+      if (client.stateSubscriptions.has(tabId)) sendClient(client, { ...message, tabId, sequence }, stateTrafficKind(message.type));
     }
   };
+
+  const sendRawTerminal = (
+    client: Client,
+    tabId: string,
+    message: Record<string, unknown>,
+    kind: "terminal.raw" | "terminal.snapshot",
+  ): boolean => {
+    const stream = client.terminalSubscriptions.get(tabId);
+    if (!stream || stream.mode !== "raw") return false;
+    stream.sequence += 1;
+    return sendClient(client, { ...message, tabId, streamId: stream.streamId, sequence: stream.sequence }, kind);
+  };
+
+  const emitRawTerminal = (
+    tabId: string,
+    message: Record<string, unknown>,
+    kind: "terminal.raw" | "terminal.snapshot" = "terminal.raw",
+  ): void => {
+    for (const client of clients) sendRawTerminal(client, tabId, message, kind);
+  };
+
+  const rawBatcher = new RawTerminalBatcher((chunk) => {
+    emitRawTerminal(chunk.tabId, {
+      type: "terminal.output",
+      generation: chunk.generation,
+      startOffset: chunk.startOffset,
+      endOffset: chunk.endOffset,
+      reset: false,
+      dataBase64: chunk.dataBase64,
+    });
+  }, transportConfig);
 
   const emitAnswer = (tabId: string, answer: AnswerRecord) => {
     emit(tabId, { type: answerEventType(answer), answer });
@@ -112,9 +172,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   // otherwise a phone and the desktop drift apart until someone reloads, and
   // the stale one can overwrite the fresh one on the next reorder.
   const broadcastIndex = (index: IndexFile) => {
-    const payload = JSON.stringify({ type: "index.changed", index });
     for (const client of clients) {
-      if (client.wantsIndex && client.socket.readyState === 1) client.socket.send(payload);
+      if (client.wantsIndex) sendClient(client, { type: "index.changed", index }, "index");
     }
   };
   storage.onIndexChanged(broadcastIndex);
@@ -124,8 +183,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     if (previous) clearTimeout(previous);
     const timer = setTimeout(() => {
       terminalResyncTimers.delete(tabId);
+      rawBatcher.flush(tabId);
       const terminal = pty.snapshot(tabId, {});
-      if (terminal) emit(tabId, { type: "terminal.output", reason: "context_compacted", ...terminal });
+      if (terminal) emitRawTerminal(tabId, { type: "terminal.output", reason: "context_compacted", ...terminal }, "terminal.snapshot");
     }, 650);
     timer.unref?.();
     terminalResyncTimers.set(tabId, timer);
@@ -601,8 +661,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return restoreOpenSessionsPromise;
   };
 
-  app.promptor = { storage, codex, claude, cursor, pty, runners, ui, token, restoreOpenSessions, close: async () => {
+  app.promptor = { storage, codex, claude, cursor, pty, runners, ui, traffic, token, restoreOpenSessions, close: async () => {
     ui.stop();
+    rawBatcher.close(false);
     for (const timer of terminalResyncTimers.values()) clearTimeout(timer);
     terminalResyncTimers.clear();
     await directoryPicker.stop();
@@ -638,7 +699,19 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     wildcard: true,
     index: "index.html",
   });
-  await app.register(fastifyWebsocket);
+  const websocketCompression = process.env.CODEX_PROMPTOR_WS_COMPRESSION !== "0";
+  await app.register(fastifyWebsocket, {
+    options: {
+      maxPayload: Math.ceil(transportConfig.maxInputMessageBytes / 3) * 4 + 16 * 1024,
+      perMessageDeflate: websocketCompression ? {
+        serverNoContextTakeover: true,
+        clientNoContextTakeover: true,
+        concurrencyLimit: 4,
+        threshold: 1024,
+        zlibDeflateOptions: { level: 3, memLevel: 7 },
+      } : false,
+    },
+  });
 
   // Claude Code invokes these hooks from the local TUI process. The per-launch
   // URL carries Promptor's random local token; this route intentionally lives
@@ -677,6 +750,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
 
   app.get("/api/health", async (_request, reply) => reply.send({ data: { ok: true, codex: codex.status, claude: await claudeVersion, cursor: await cursorVersion } }));
 
+  app.get("/api/diagnostics/terminal-traffic", async (_request, reply) => reply.send({ data: traffic.snapshot() }));
+
+  app.post("/api/diagnostics/terminal-traffic/reset", async (_request, reply) => {
+    traffic.reset();
+    return reply.send({ data: traffic.snapshot() });
+  });
+
   app.get("/api/bootstrap", async (_request, reply) => {
     const index = await storage.readIndex();
     const activities: Record<string, TabActivitySummary> = {};
@@ -687,7 +767,20 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return reply.send({ data: {
       index,
       activities,
-      app: { version: "0.1.0", codex: codex.status, claude: await claudeVersion, cursor: await cursorVersion, protocol: "multi-provider" },
+      app: {
+        version: "0.1.0",
+        codex: codex.status,
+        claude: await claudeVersion,
+        cursor: await cursorVersion,
+        protocol: "multi-provider",
+        terminal: {
+          protocolVersion: TERMINAL_PROTOCOL_VERSION,
+          modes: ["raw"],
+          compression: websocketCompression,
+          rawBatchIdleMs: transportConfig.rawBatchIdleMs,
+          rawBatchInteractiveMs: transportConfig.rawBatchInteractiveMs,
+        },
+      },
     } });
   });
 
@@ -1228,51 +1321,93 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   app.get("/ws", { websocket: true }, (socket, request) => {
     const queryToken = (request.query as any)?.token;
     if (!noAuth && queryToken !== token && !isTrustedBrowserRequest(request.headers, trustedHosts)) { socket.close(1008, "Unauthorized"); return; }
-    const client: Client = { socket, subscriptions: new Set(), wantsIndex: false };
+    const client: Client = {
+      id: traffic.register(socket),
+      socket,
+      stateSubscriptions: new Set(),
+      terminalSubscriptions: new Map(),
+      wantsIndex: false,
+    };
     clients.add(client);
     ui.connect();
     socket.on("close", () => {
       if (!clients.delete(client)) return;
+      traffic.unregister(client.id);
       ui.disconnect();
     });
     socket.on("message", async (raw: Buffer) => {
       try {
         const message = JSON.parse(raw.toString()) as any;
         if (message.type === "subscribe") {
-          client.subscriptions = new Set(Array.isArray(message.tabIds) ? message.tabIds.map(String) : []);
+          client.stateSubscriptions = parseTabSubscriptions(message.tabIds);
+          client.terminalSubscriptions = parseRawTerminalSubscriptions(message.terminals);
           client.wantsIndex = message.index === true;
+          traffic.setRole(client.id, client.stateSubscriptions.size > 0 || client.wantsIndex, client.terminalSubscriptions.size > 0);
+
+          // Terminal snapshots are synchronous and go first. This establishes
+          // the raw cursor before any awaited index/TabBundle read can let a
+          // live PTY increment interleave ahead of the reset frame.
+          for (const [tabId, stream] of client.terminalSubscriptions) {
+            const terminal = pty.snapshot(tabId, stream.cursor);
+            if (terminal) sendRawTerminal(client, tabId, { type: "terminal.output", ...terminal }, "terminal.snapshot");
+          }
+
           // A reconnecting page missed every change made while it was away
           // (a phone that slept, a tunnel that dropped). Replay current
           // navigation on subscribe so it resyncs without a reload.
-          if (client.wantsIndex) socket.send(JSON.stringify({ type: "index.changed", index: await storage.readIndex() }));
+          if (client.wantsIndex) sendClient(client, { type: "index.changed", index: await storage.readIndex() }, "index");
           if (message.snapshots !== false) {
-            for (const tabId of client.subscriptions) {
+            for (const tabId of client.stateSubscriptions) {
               try {
                 const data = await storage.readTab(tabId);
-                socket.send(JSON.stringify({ type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, data }));
-                const terminal = pty.snapshot(tabId, message.terminals?.[tabId] ?? {});
-                if (terminal) socket.send(JSON.stringify({ type: "terminal.output", tabId, sequence: sequences.get(tabId) ?? 0, ...terminal }));
+                sendClient(client, { type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, data }, "snapshot");
               } catch { /* tab may have been deleted */ }
             }
           }
         } else if (message.type === "terminal.sync" && message.tabId) {
           const tabId = String(message.tabId);
+          if (!client.terminalSubscriptions.has(tabId)) {
+            sendClient(client, wsError("TERMINAL_NOT_SUBSCRIBED", "Subscribe to the terminal before requesting a sync."), "error");
+            return;
+          }
+          rawBatcher.flush(tabId);
           const terminal = pty.snapshot(tabId, message.cursor ?? {});
-          if (terminal) socket.send(JSON.stringify({ type: "terminal.output", tabId, sequence: sequences.get(tabId) ?? 0, ...terminal }));
+          if (terminal) sendRawTerminal(client, tabId, { type: "terminal.output", ...terminal }, "terminal.snapshot");
         } else if (message.type === "snapshot.request" && message.tabId) {
-          const data = await storage.readTab(String(message.tabId));
-          socket.send(JSON.stringify({ type: "snapshot", tabId: String(message.tabId), sequence: sequences.get(String(message.tabId)) ?? 0, data }));
-        } else if (message.type === "terminal.input" && message.tabId && typeof message.dataBase64 === "string") {
           const tabId = String(message.tabId);
+          if (!client.stateSubscriptions.has(tabId)) {
+            sendClient(client, wsError("TAB_NOT_SUBSCRIBED", "Subscribe to the tab before requesting a snapshot."), "error");
+            return;
+          }
+          const data = await storage.readTab(tabId);
+          sendClient(client, { type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, data }, "snapshot");
+        } else if (message.type === "terminal.input" && message.tabId) {
+          const tabId = String(message.tabId);
+          if (!client.terminalSubscriptions.has(tabId)) {
+            sendClient(client, wsError("TERMINAL_NOT_SUBSCRIBED", "Subscribe to the terminal before sending input."), "error");
+            return;
+          }
+          const data = decodeTerminalInput(message.dataBase64, transportConfig.maxInputMessageBytes);
+          if (data === null) {
+            sendClient(client, wsError("TERMINAL_INPUT_INVALID", `Terminal input must be valid Base64 and no larger than ${transportConfig.maxInputMessageBytes} bytes.`), "error");
+            return;
+          }
           const tab = await storage.getTabMeta(tabId);
           if (tab.session.state !== "closed") {
-            const data = Buffer.from(message.dataBase64, "base64").toString("utf8");
+            rawBatcher.markInteractive(tabId);
             pty.write(tabId, data);
             if (tab.session.provider === "claude") claude.existing(tabId)?.observeTerminalInput(data);
             if (tab.session.provider === "cursor") cursor.existing(tabId)?.observeTerminalInput(data);
+            if (typeof message.inputId === "string" && message.inputId.length <= 128) {
+              sendClient(client, { type: "terminal.input.ack", tabId, inputId: message.inputId }, "state");
+            }
           }
         } else if (message.type === "terminal.resize" && message.tabId) {
           const tabId = String(message.tabId);
+          if (!client.terminalSubscriptions.has(tabId)) {
+            sendClient(client, wsError("TERMINAL_NOT_SUBSCRIBED", "Subscribe to the terminal before resizing it."), "error");
+            return;
+          }
           if ((await storage.getTabMeta(tabId)).session.state !== "closed") {
             const cols = Number(message.cols);
             const rows = Number(message.rows);
@@ -1286,20 +1421,23 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             pendingApprovals.delete(requestKey);
           }
         }
-      } catch { socket.send(JSON.stringify({ type: "error", error: { code: "INVALID_WS_MESSAGE", message: "Invalid WebSocket message." } })); }
+      } catch {
+        sendClient(client, wsError("INVALID_WS_MESSAGE", "Invalid WebSocket message."), "error");
+      }
     });
   });
 
   pty.on("event", async (event: any) => {
-    if (event.type === "output") emit(event.tabId, {
-      type: "terminal.output",
+    if (event.type === "output") rawBatcher.push({
+      tabId: event.tabId,
       generation: event.generation,
       startOffset: event.startOffset,
       endOffset: event.endOffset,
-      reset: false,
       dataBase64: event.dataBase64,
     });
     else {
+      // Keep the final bytes (including an exit marker) ahead of terminal.state.
+      rawBatcher.flush(event.tabId);
       const state = event.state === "stopped" ? "stopped" : event.state === "running" ? "running" : event.state === "starting" ? "starting" : event.state === "error" ? "error" : "exited";
       try {
         const provider = (await storage.getTabMeta(event.tabId)).session.provider;
@@ -1327,6 +1465,46 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   });
 
   return app;
+}
+
+function stateTrafficKind(type: unknown): TerminalTrafficKind {
+  if (type === "snapshot") return "snapshot";
+  if (type === "error") return "error";
+  return "state";
+}
+
+function wsError(code: string, message: string): { type: "error"; error: { code: string; message: string } } {
+  return { type: "error", error: { code, message } };
+}
+
+function parseTabSubscriptions(value: unknown): Set<string> {
+  if (!Array.isArray(value)) return new Set();
+  const ids = value
+    .slice(0, 1_000)
+    .map(String)
+    .filter((id) => id.length > 0 && id.length <= 256);
+  return new Set(ids);
+}
+
+function parseRawTerminalSubscriptions(value: unknown): Map<string, RawTerminalStream> {
+  const result = new Map<string, RawTerminalStream>();
+  if (!value || typeof value !== "object" || Array.isArray(value)) return result;
+  for (const [tabId, rawConfig] of Object.entries(value).slice(0, 64)) {
+    if (!tabId || tabId.length > 256 || !rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) continue;
+    const config = rawConfig as Record<string, unknown>;
+    if (config.mode !== undefined && config.mode !== "raw") throw new Error("Unsupported terminal transport mode");
+    const nextOffset = Number(config.nextOffset);
+    result.set(tabId, {
+      mode: "raw",
+      cursor: {
+        generation: typeof config.generation === "string" ? config.generation : null,
+        nextOffset: Number.isSafeInteger(nextOffset) && nextOffset >= 0 ? nextOffset : null,
+      },
+      streamId: randomUUID(),
+      sequence: 0,
+    });
+  }
+  return result;
 }
 
 async function validWorkingDirectory(value: unknown): Promise<string | null> {

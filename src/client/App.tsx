@@ -1175,7 +1175,9 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBund
         setConnected(true);
         if (connectedOnce) resizeScheduler.invalidate();
         connectedOnce = true;
-        ws.send(JSON.stringify({ type: "subscribe", tabIds: [tabId], terminals: { [tabId]: cursor } }));
+        // TabView already loaded its bundle over REST. This socket needs the
+        // terminal cursor snapshot and live tab events, not a duplicate bundle.
+        ws.send(JSON.stringify({ type: "subscribe", tabIds: [tabId], snapshots: false, terminals: { [tabId]: { mode: "raw", ...cursor } } }));
         scheduleSize();
       };
       ws.onmessage = (event) => {
