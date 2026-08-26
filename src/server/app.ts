@@ -27,6 +27,7 @@ import {
   terminalTransportConfigFromEnv,
   type TerminalTrafficKind,
 } from "./terminal-transport.js";
+import { defaultProjectionSchedulerConfig, TerminalProjectionScheduler } from "./terminal-projection.js";
 import { syncTerminalThreadSelection } from "./terminal-thread-sync.js";
 import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionHandler } from "./tui-protocol.js";
 import { TuiProxyPool } from "./tui-proxy.js";
@@ -46,11 +47,20 @@ type RawTerminalStream = {
   sequence: number;
 };
 
+type ProjectionTerminalStream = {
+  mode: "projection";
+  viewportRows: number;
+  fps: number;
+  streamId: string;
+};
+
+type TerminalStream = RawTerminalStream | ProjectionTerminalStream;
+
 type Client = {
   id: string;
   socket: any;
   stateSubscriptions: Set<string>;
-  terminalSubscriptions: Map<string, RawTerminalStream>;
+  terminalSubscriptions: Map<string, TerminalStream>;
   wantsIndex: boolean;
 };
 
@@ -100,6 +110,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const traffic = new TerminalTrafficMeter();
   const socketSender = new BoundedWebSocketSender(traffic, transportConfig);
   const terminalResyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const rawResponderOwners = new Map<string, string>();
+  const responderLeaseEpochs = new Map<string, number>();
   const pendingApprovals = new Map<string, { tabId: string; manager: AppServerManager; requestId: number | string }>();
   const threadSwitches = new Map<string, Promise<void>>();
   const noAuth = process.env.CODEX_PROMPTOR_NO_AUTH === "1";
@@ -121,6 +133,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
 
   const sendClient = (client: Client, message: Record<string, unknown>, kind: TerminalTrafficKind): boolean => (
     socketSender.send(client.id, client.socket, JSON.stringify(message), kind)
+  );
+
+  const projectionScheduler = new TerminalProjectionScheduler(
+    (tabId, viewportRows) => pty.screenSnapshot(tabId, viewportRows),
+    {
+      ...defaultProjectionSchedulerConfig,
+      backpressureHighBytes: transportConfig.websocketHighWaterBytes,
+      backpressureLowBytes: transportConfig.websocketLowWaterBytes,
+      interactiveWindowMs: transportConfig.interactiveWindowMs,
+    },
   );
 
   const emit = (tabId: string, message: Record<string, unknown>) => {
@@ -162,6 +184,32 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     });
   }, transportConfig);
 
+  const refreshResponderLease = (tabId: string): void => {
+    const rawClients = [...clients].filter((candidate) => candidate.socket.readyState === 1 && candidate.terminalSubscriptions.get(tabId)?.mode === "raw");
+    const previousOwner = rawResponderOwners.get(tabId) ?? null;
+    const owner = rawClients.some((candidate) => candidate.id === previousOwner)
+      ? previousOwner
+      : rawClients[0]?.id ?? null;
+    if (owner) rawResponderOwners.set(tabId, owner);
+    else rawResponderOwners.delete(tabId);
+    // The browser raw emulator owns DA/DSR/theme replies while a healthy raw
+    // stream exists. Projection-only tabs are answered by the headless model.
+    pty.setScreenResponder(tabId, rawClients.length === 0);
+    if (owner === previousOwner) return;
+    const epoch = (responderLeaseEpochs.get(tabId) ?? 0) + 1;
+    responderLeaseEpochs.set(tabId, epoch);
+    for (const candidate of rawClients) {
+      sendClient(candidate, {
+        type: "terminal.lease",
+        tabId,
+        mode: "raw",
+        writable: candidate.id === owner,
+        responder: candidate.id === owner,
+        leaseEpoch: epoch,
+      }, "state");
+    }
+  };
+
   const emitAnswer = (tabId: string, answer: AnswerRecord) => {
     emit(tabId, { type: answerEventType(answer), answer });
   };
@@ -186,6 +234,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       rawBatcher.flush(tabId);
       const terminal = pty.snapshot(tabId, {});
       if (terminal) emitRawTerminal(tabId, { type: "terminal.output", reason: "context_compacted", ...terminal }, "terminal.snapshot");
+      projectionScheduler.forceFull(tabId);
     }, 650);
     timer.unref?.();
     terminalResyncTimers.set(tabId, timer);
@@ -407,7 +456,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     await restoreTerminalSize(storage, pty, tabId);
     await pty.startCommand(tabId, cwd, command, "Claude Code", CLAUDE_EXIT_MARKER, {
       CODEX_PROMPTOR_CLAUDE_HOOK_URL: claudeHookUrl(tabId),
-    });
+    }, theme);
     const session = await manager.waitForSession(30_000, () => pty.startupError(tabId));
     if (launch.mode === "resume" && session.sessionId !== launch.sessionId) {
       throw new Error(`CLAUDE_RESUME_ID_MISMATCH:${launch.sessionId}:${session.sessionId}`);
@@ -434,6 +483,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       "Cursor CLI",
       CURSOR_EXIT_MARKER,
       { CODEX_PROMPTOR_CURSOR_HOOK_URL: cursorHookUrl(tabId) },
+      theme,
     );
     const session = await manager.waitForSession(30_000, () => pty.startupError(tabId));
     if (launch.mode === "resume" && session.sessionId !== launch.sessionId) {
@@ -664,6 +714,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   app.promptor = { storage, codex, claude, cursor, pty, runners, ui, traffic, token, restoreOpenSessions, close: async () => {
     ui.stop();
     rawBatcher.close(false);
+    projectionScheduler.close();
     for (const timer of terminalResyncTimers.values()) clearTimeout(timer);
     terminalResyncTimers.clear();
     await directoryPicker.stop();
@@ -775,10 +826,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         protocol: "multi-provider",
         terminal: {
           protocolVersion: TERMINAL_PROTOCOL_VERSION,
-          modes: ["raw"],
+          modes: ["raw", "projection"],
           compression: websocketCompression,
           rawBatchIdleMs: transportConfig.rawBatchIdleMs,
           rawBatchInteractiveMs: transportConfig.rawBatchInteractiveMs,
+          projection: {
+            defaultViewportRows: defaultProjectionSchedulerConfig.defaultViewportRows,
+            defaultFps: defaultProjectionSchedulerConfig.defaultFps,
+            maxViewportRows: 60,
+            maxFps: 5,
+          },
         },
       },
     } });
@@ -797,6 +854,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           ...(body.ungroupedCollapsed !== undefined ? { ungroupedCollapsed: Boolean(body.ungroupedCollapsed) } : {}),
         },
       }));
+      if (body.theme === "light" || body.theme === "dark") {
+        for (const tab of index.tabs) pty.setScreenTheme(tab.id, body.theme);
+      }
       return reply.send({ data: index });
     } catch (error) { return apiError(reply, 400, "PREFERENCES_INVALID", error instanceof Error ? error.message : String(error)); }
   });
@@ -894,7 +954,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     // The tab directory is moved immediately below; do not enqueue a terminal
     // runtime write that can race the directory rename on Windows.
     await pty.stop(tabId, false);
-    pty.forgetSize(tabId);
+    pty.forget(tabId);
     await tuiProxy.stop(tabId);
     await runners.remove(tabId);
     await cursor.stop(tabId);
@@ -1332,6 +1392,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     ui.connect();
     socket.on("close", () => {
       if (!clients.delete(client)) return;
+      const rawTabs = [...client.terminalSubscriptions.entries()]
+        .filter(([, stream]) => stream.mode === "raw")
+        .map(([tabId]) => tabId);
+      projectionScheduler.unsubscribeClient(client.id);
+      for (const tabId of rawTabs) refreshResponderLease(tabId);
       traffic.unregister(client.id);
       ui.disconnect();
     });
@@ -1339,15 +1404,45 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       try {
         const message = JSON.parse(raw.toString()) as any;
         if (message.type === "subscribe") {
+          const previousRawTabs = [...client.terminalSubscriptions.entries()]
+            .filter(([, stream]) => stream.mode === "raw")
+            .map(([tabId]) => tabId);
+          projectionScheduler.unsubscribeClient(client.id);
           client.stateSubscriptions = parseTabSubscriptions(message.tabIds);
-          client.terminalSubscriptions = parseRawTerminalSubscriptions(message.terminals);
+          client.terminalSubscriptions = parseTerminalSubscriptions(message.terminals);
           client.wantsIndex = message.index === true;
           traffic.setRole(client.id, client.stateSubscriptions.size > 0 || client.wantsIndex, client.terminalSubscriptions.size > 0);
+
+          for (const [tabId, stream] of client.terminalSubscriptions) {
+            if (stream.mode !== "projection") continue;
+            const subscription = projectionScheduler.subscribe(client.id, tabId, stream, {
+              isOpen: () => client.socket.readyState === 1,
+              bufferedAmount: () => Number(client.socket.bufferedAmount ?? 0),
+              send: (payload) => socketSender.sendProjection(client.id, client.socket, payload),
+            });
+            stream.streamId = subscription.streamId;
+            stream.viewportRows = subscription.viewportRows;
+            stream.fps = subscription.fps;
+            sendClient(client, {
+              type: "terminal.subscription",
+              tabId,
+              mode: "projection",
+              streamId: stream.streamId,
+              viewportRows: stream.viewportRows,
+              fps: stream.fps,
+              writable: true,
+            }, "state");
+          }
+
+          const affectedRawTabs = new Set(previousRawTabs);
+          for (const [tabId, stream] of client.terminalSubscriptions) if (stream.mode === "raw") affectedRawTabs.add(tabId);
+          for (const tabId of affectedRawTabs) refreshResponderLease(tabId);
 
           // Terminal snapshots are synchronous and go first. This establishes
           // the raw cursor before any awaited index/TabBundle read can let a
           // live PTY increment interleave ahead of the reset frame.
           for (const [tabId, stream] of client.terminalSubscriptions) {
+            if (stream.mode !== "raw") continue;
             const terminal = pty.snapshot(tabId, stream.cursor);
             if (terminal) sendRawTerminal(client, tabId, { type: "terminal.output", ...terminal }, "terminal.snapshot");
           }
@@ -1366,13 +1461,24 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           }
         } else if (message.type === "terminal.sync" && message.tabId) {
           const tabId = String(message.tabId);
-          if (!client.terminalSubscriptions.has(tabId)) {
+          const stream = client.terminalSubscriptions.get(tabId);
+          if (!stream) {
             sendClient(client, wsError("TERMINAL_NOT_SUBSCRIBED", "Subscribe to the terminal before requesting a sync."), "error");
+            return;
+          }
+          if (stream.mode === "projection") {
+            projectionScheduler.requestFull(client.id, tabId);
             return;
           }
           rawBatcher.flush(tabId);
           const terminal = pty.snapshot(tabId, message.cursor ?? {});
           if (terminal) sendRawTerminal(client, tabId, { type: "terminal.output", ...terminal }, "terminal.snapshot");
+        } else if (message.type === "terminal.screen.snapshot.request" && message.tabId) {
+          const tabId = String(message.tabId);
+          const stream = client.terminalSubscriptions.get(tabId);
+          if (!stream || stream.mode !== "projection" || !projectionScheduler.requestFull(client.id, tabId)) {
+            sendClient(client, wsError("TERMINAL_PROJECTION_NOT_SUBSCRIBED", "Subscribe in projection mode before requesting a screen snapshot."), "error");
+          }
         } else if (message.type === "snapshot.request" && message.tabId) {
           const tabId = String(message.tabId);
           if (!client.stateSubscriptions.has(tabId)) {
@@ -1383,8 +1489,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           sendClient(client, { type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, data }, "snapshot");
         } else if (message.type === "terminal.input" && message.tabId) {
           const tabId = String(message.tabId);
-          if (!client.terminalSubscriptions.has(tabId)) {
+          const stream = client.terminalSubscriptions.get(tabId);
+          if (!stream) {
             sendClient(client, wsError("TERMINAL_NOT_SUBSCRIBED", "Subscribe to the terminal before sending input."), "error");
+            return;
+          }
+          if (stream.mode === "raw" && rawResponderOwners.get(tabId) !== client.id) {
+            sendClient(client, wsError("TERMINAL_READ_ONLY", "Another raw terminal client owns the input and responder lease."), "error");
             return;
           }
           const data = decodeTerminalInput(message.dataBase64, transportConfig.maxInputMessageBytes);
@@ -1395,6 +1506,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           const tab = await storage.getTabMeta(tabId);
           if (tab.session.state !== "closed") {
             rawBatcher.markInteractive(tabId);
+            projectionScheduler.markInteractive(tabId);
             pty.write(tabId, data);
             if (tab.session.provider === "claude") claude.existing(tabId)?.observeTerminalInput(data);
             if (tab.session.provider === "cursor") cursor.existing(tabId)?.observeTerminalInput(data);
@@ -1404,8 +1516,17 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           }
         } else if (message.type === "terminal.resize" && message.tabId) {
           const tabId = String(message.tabId);
-          if (!client.terminalSubscriptions.has(tabId)) {
+          const stream = client.terminalSubscriptions.get(tabId);
+          if (!stream) {
             sendClient(client, wsError("TERMINAL_NOT_SUBSCRIBED", "Subscribe to the terminal before resizing it."), "error");
+            return;
+          }
+          if (stream.mode !== "raw") {
+            sendClient(client, wsError("TERMINAL_PROJECTION_RESIZE_FORBIDDEN", "Projection viewports do not resize the shared PTY."), "error");
+            return;
+          }
+          if (rawResponderOwners.get(tabId) !== client.id) {
+            sendClient(client, wsError("TERMINAL_READ_ONLY", "Another raw terminal client owns the resize lease."), "error");
             return;
           }
           if ((await storage.getTabMeta(tabId)).session.state !== "closed") {
@@ -1428,16 +1549,20 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   });
 
   pty.on("event", async (event: any) => {
-    if (event.type === "output") rawBatcher.push({
-      tabId: event.tabId,
-      generation: event.generation,
-      startOffset: event.startOffset,
-      endOffset: event.endOffset,
-      dataBase64: event.dataBase64,
-    });
+    if (event.type === "output") {
+      rawBatcher.push({
+        tabId: event.tabId,
+        generation: event.generation,
+        startOffset: event.startOffset,
+        endOffset: event.endOffset,
+        dataBase64: event.dataBase64,
+      });
+      projectionScheduler.markDirty(event.tabId);
+    }
     else {
       // Keep the final bytes (including an exit marker) ahead of terminal.state.
       rawBatcher.flush(event.tabId);
+      refreshResponderLease(event.tabId);
       const state = event.state === "stopped" ? "stopped" : event.state === "running" ? "running" : event.state === "starting" ? "starting" : event.state === "error" ? "error" : "exited";
       try {
         const provider = (await storage.getTabMeta(event.tabId)).session.provider;
@@ -1461,6 +1586,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         });
       } catch { /* tab could be deleted */ }
       emit(event.tabId, { type: "terminal.state", state: event.state, exitCode: event.exitCode ?? null, message: event.message ?? null });
+      projectionScheduler.forceFull(event.tabId);
     }
   });
 
@@ -1486,12 +1612,21 @@ function parseTabSubscriptions(value: unknown): Set<string> {
   return new Set(ids);
 }
 
-function parseRawTerminalSubscriptions(value: unknown): Map<string, RawTerminalStream> {
-  const result = new Map<string, RawTerminalStream>();
+function parseTerminalSubscriptions(value: unknown): Map<string, TerminalStream> {
+  const result = new Map<string, TerminalStream>();
   if (!value || typeof value !== "object" || Array.isArray(value)) return result;
   for (const [tabId, rawConfig] of Object.entries(value).slice(0, 64)) {
     if (!tabId || tabId.length > 256 || !rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) continue;
     const config = rawConfig as Record<string, unknown>;
+    if (config.mode === "projection") {
+      result.set(tabId, {
+        mode: "projection",
+        viewportRows: boundedInteger(config.viewportRows, 5, 60, 20),
+        fps: boundedInteger(config.fps, 1, 5, 2),
+        streamId: "",
+      });
+      continue;
+    }
     if (config.mode !== undefined && config.mode !== "raw") throw new Error("Unsupported terminal transport mode");
     const nextOffset = Number(config.nextOffset);
     result.set(tabId, {
@@ -1505,6 +1640,12 @@ function parseRawTerminalSubscriptions(value: unknown): Map<string, RawTerminalS
     });
   }
   return result;
+}
+
+function boundedInteger(value: unknown, min: number, max: number, fallback: number): number {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(number)));
 }
 
 async function validWorkingDirectory(value: unknown): Promise<string | null> {

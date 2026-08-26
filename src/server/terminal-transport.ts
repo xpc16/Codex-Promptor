@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-
-export const TERMINAL_PROTOCOL_VERSION = 1;
+export { TERMINAL_PROTOCOL_VERSION } from "../shared/terminal-protocol.js";
 
 export type TerminalTrafficKind =
   | "index"
@@ -174,6 +173,7 @@ type TrafficCounters = {
   stateBytes: number;
   snapshots: number;
   backpressureClosures: number;
+  projectionCandidatesDropped: number;
   peakBufferedAmount: number;
 };
 
@@ -193,6 +193,7 @@ const emptyCounters = (): TrafficCounters => ({
   stateBytes: 0,
   snapshots: 0,
   backpressureClosures: 0,
+  projectionCandidatesDropped: 0,
   peakBufferedAmount: 0,
 });
 
@@ -236,6 +237,15 @@ export class TerminalTrafficMeter {
     const connection = this.connections.get(id);
     if (!connection) return;
     connection.backpressureClosures += 1;
+    connection.peakBufferedAmount = Math.max(connection.peakBufferedAmount, bufferedAmount);
+  }
+
+  recordProjectionCandidateDropped(id: string, bufferedAmount: number): void {
+    this.totals.projectionCandidatesDropped += 1;
+    this.totals.peakBufferedAmount = Math.max(this.totals.peakBufferedAmount, bufferedAmount);
+    const connection = this.connections.get(id);
+    if (!connection) return;
+    connection.projectionCandidatesDropped += 1;
     connection.peakBufferedAmount = Math.max(connection.peakBufferedAmount, bufferedAmount);
   }
 
@@ -289,6 +299,27 @@ export class BoundedWebSocketSender {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Projection is latest-state synchronization: under backpressure it drops
+   * candidates and later sends one fresh full frame instead of closing the
+   * stream or queueing stale screens in ws.
+   */
+  sendProjection(id: string, socket: SocketLike, payload: string): "sent" | "backpressured" | "closed" {
+    if (socket.readyState !== 1) return "closed";
+    const bufferedAmount = Number.isFinite(socket.bufferedAmount) ? Number(socket.bufferedAmount) : 0;
+    if (bufferedAmount >= this.config.websocketHighWaterBytes) {
+      this.meter.recordProjectionCandidateDropped(id, bufferedAmount);
+      return "backpressured";
+    }
+    try {
+      socket.send(payload);
+      this.meter.recordSend(id, "terminal.projection", Buffer.byteLength(payload, "utf8"), bufferedAmount);
+      return "sent";
+    } catch {
+      return "closed";
     }
   }
 }

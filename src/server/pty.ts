@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import * as pty from "node-pty";
 import { terminateProcessTree } from "./codex.js";
+import { TerminalScreenModel, type TerminalScreenSnapshot } from "./terminal-screen.js";
 
 export type TerminalEvent =
   | { tabId: string; type: "output"; generation: string; startOffset: number; endOffset: number; dataBase64: string }
@@ -41,13 +42,16 @@ export class PtyManager extends EventEmitter {
   private readonly sessions = new Map<string, Session>();
   private readonly archives = new Map<string, TerminalBuffer>();
   private readonly requestedSizes = new Map<string, TerminalSize>();
+  // A stopped PTY keeps its final screen until the tab is restarted/deleted so
+  // a reconnecting projection client can still see the last meaningful frame.
+  private readonly screens = new Map<string, TerminalScreenModel>();
 
   async start(tabId: string, cwd: string, remoteUrl: string, launch: TerminalLaunch, theme: TerminalTheme = "light"): Promise<void> {
-    return this.startCommand(tabId, cwd, buildRemoteCodexCommand(remoteUrl, launch, cwd, theme), "Codex", CODEX_EXIT_MARKER);
+    return this.startCommand(tabId, cwd, buildRemoteCodexCommand(remoteUrl, launch, cwd, theme), "Codex", CODEX_EXIT_MARKER, {}, theme);
   }
   /** A conversation that is only a PowerShell: no agent, no TUI, no App Server. */
   async startShell(tabId: string, cwd: string, theme: TerminalTheme = "light"): Promise<void> {
-    return this.startCommand(tabId, cwd, buildShellCommand(cwd, theme), "PowerShell", SHELL_EXIT_MARKER);
+    return this.startCommand(tabId, cwd, buildShellCommand(cwd, theme), "PowerShell", SHELL_EXIT_MARKER, {}, theme);
   }
 
   async startCommand(
@@ -57,9 +61,12 @@ export class PtyManager extends EventEmitter {
     agentLabel: string,
     exitMarker: string,
     envPatch: Record<string, string> = {},
+    theme: TerminalTheme = "light",
   ): Promise<void> {
     await this.stop(tabId, false);
     this.archives.delete(tabId);
+    this.screens.get(tabId)?.dispose();
+    this.screens.delete(tabId);
     this.emitEvent({ tabId, type: "state", state: "starting" });
     try {
       const shell = process.platform === "win32" ? "powershell.exe" : "pwsh";
@@ -75,9 +82,20 @@ export class PtyManager extends EventEmitter {
         env: { ...process.env, ...envPatch } as Record<string, string>,
         useConpty: true,
       });
+      const generation = randomUUID();
+      const screen = new TerminalScreenModel({
+        generation,
+        cols: initialSize.cols,
+        rows: initialSize.rows,
+        theme,
+        onResponse: (data) => {
+          if (this.sessions.get(tabId)?.process !== child) return;
+          try { child.write(data); } catch { /* process exited during a protocol reply */ }
+        },
+      });
       const session: Session = {
         process: child,
-        generation: randomUUID(),
+        generation,
         buffer: Buffer.alloc(0),
         bufferStart: 0,
         nextOffset: 0,
@@ -89,7 +107,11 @@ export class PtyManager extends EventEmitter {
         agentLabel,
       };
       this.sessions.set(tabId, session);
+      this.screens.set(tabId, screen);
       child.onData((data) => {
+        // Queue parser work before publishing the output event. Projection
+        // snapshots triggered by that event await the same queue barrier.
+        void screen.write(data);
         const bytes = Buffer.from(data, "utf8");
         const startOffset = session.nextOffset;
         session.nextOffset += bytes.length;
@@ -165,6 +187,9 @@ export class PtyManager extends EventEmitter {
     const session = this.sessions.get(tabId);
     if (!session || (session.cols === cols && session.rows === rows)) return requestedChanged;
     try {
+      // Enqueue the emulator resize before ConPTY can emit its resize repaint.
+      // Any following onData callback is therefore parsed against the new grid.
+      void this.screens.get(tabId)?.resize(cols, rows);
       session.process.resize(cols, rows);
       session.cols = cols;
       session.rows = rows;
@@ -173,6 +198,20 @@ export class PtyManager extends EventEmitter {
     return requestedChanged;
   }
   forgetSize(tabId: string): void { this.requestedSizes.delete(tabId); }
+  forget(tabId: string): void {
+    this.requestedSizes.delete(tabId);
+    this.archives.delete(tabId);
+    this.screens.get(tabId)?.dispose();
+    this.screens.delete(tabId);
+  }
+  setScreenResponder(tabId: string, enabled: boolean): void { this.screens.get(tabId)?.setResponderEnabled(enabled); }
+  setScreenTheme(tabId: string, theme: TerminalTheme): void { this.screens.get(tabId)?.setTheme(theme); }
+  async screenSnapshot(tabId: string, viewportRows = 20): Promise<TerminalScreenSnapshot | null> {
+    const screen = this.screens.get(tabId);
+    if (!screen) return null;
+    try { return await screen.snapshot(viewportRows); }
+    catch { return null; }
+  }
   async stop(tabId: string, notify = true): Promise<void> {
     const session = this.sessions.get(tabId);
     if (session) {
@@ -184,7 +223,11 @@ export class PtyManager extends EventEmitter {
     }
     if (notify) this.emitEvent({ tabId, type: "state", state: "stopped", exitCode: null });
   }
-  async stopAll(): Promise<void> { await Promise.all([...this.sessions.keys()].map((tabId) => this.stop(tabId))); }
+  async stopAll(): Promise<void> {
+    await Promise.all([...this.sessions.keys()].map((tabId) => this.stop(tabId)));
+    for (const screen of this.screens.values()) screen.dispose();
+    this.screens.clear();
+  }
   has(tabId: string): boolean { return this.sessions.has(tabId); }
   startupError(tabId: string): string | null {
     const source = this.sessions.get(tabId) ?? this.archives.get(tabId);

@@ -12,15 +12,16 @@ import { PtyManager } from "./pty.js";
 
 function fakePty() {
   let exitHandler: ((event: { exitCode: number }) => void) | null = null;
+  let dataHandler: ((data: string) => void) | null = null;
   const process = {
     pid: 12345,
     write: vi.fn(),
     resize: vi.fn(),
     kill: vi.fn(),
-    onData: vi.fn(),
+    onData: vi.fn((handler: (data: string) => void) => { dataHandler = handler; }),
     onExit: vi.fn((handler: (event: { exitCode: number }) => void) => { exitHandler = handler; }),
   };
-  return { process, exit: (exitCode = 0) => exitHandler?.({ exitCode }) };
+  return { process, data: (value: string) => dataHandler?.(value), exit: (exitCode = 0) => exitHandler?.({ exitCode }) };
 }
 
 describe("PtyManager terminal sizing", () => {
@@ -90,6 +91,26 @@ describe("PtyManager terminal sizing", () => {
     child.exit();
     vi.clearAllTimers();
     vi.useRealTimers();
+  });
+
+  it("feeds PTY data into the ordered headless screen and preserves the final screen after stop", async () => {
+    vi.useRealTimers();
+    const child = fakePty();
+    mocks.spawn.mockReturnValue(child.process);
+    const manager = new PtyManager();
+    await manager.start("tab-screen", "C:\\work", "ws://127.0.0.1:4500", { mode: "new" });
+
+    child.data("plain \x1b[32;1mready\x1b[0m");
+    const live = await manager.screenSnapshot("tab-screen", 12);
+    expect(live?.rows[0].runs).toEqual([
+      { text: "plain ", style: { fg: "default", bg: "default", flags: [] } },
+      { text: "ready", style: { fg: 2, bg: "default", flags: ["bold"] } },
+    ]);
+
+    await manager.stop("tab-screen", false);
+    expect((await manager.screenSnapshot("tab-screen", 12))?.rows[0].runs[1].text).toBe("ready");
+    manager.forget("tab-screen");
+    expect(await manager.screenSnapshot("tab-screen", 12)).toBeNull();
   });
 });
 

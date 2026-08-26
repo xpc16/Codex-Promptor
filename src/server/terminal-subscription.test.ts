@@ -103,6 +103,64 @@ describe("terminal WebSocket subscription isolation", () => {
     expect(JSON.stringify(metrics)).not.toContain("allowed");
     expect(JSON.stringify(metrics)).not.toContain("blocked");
   });
+
+  it("sends structured projection frames without raw bytes and never lets a projection viewport resize the PTY", async () => {
+    const tab = await app.promptor.storage.createTab("projection");
+    const screenSnapshot = vi.spyOn(app.promptor.pty, "screenSnapshot").mockResolvedValue({
+      generation: "screen-generation",
+      revision: 7,
+      sizeEpoch: 2,
+      cols: 100,
+      totalRows: 30,
+      viewportTop: 10,
+      viewportRows: 20,
+      alternateScreen: true,
+      inputModes: {
+        applicationCursorKeys: true,
+        applicationKeypad: false,
+        bracketedPaste: true,
+        mouseTracking: "none",
+        sendFocus: false,
+      },
+      cursor: { row: 19, col: 4, visible: true },
+      rows: Array.from({ length: 20 }, (_, row) => ({
+        row,
+        clearToEnd: true as const,
+        runs: row === 19 ? [{ text: "ready", style: { fg: "default" as const, bg: "default" as const, flags: [] } }] : [],
+        hash: row === 19 ? "ready" : `blank-${row}`,
+      })),
+    });
+    const resize = vi.spyOn(app.promptor.pty, "resize");
+    const write = vi.spyOn(app.promptor.pty, "write");
+    const socket = await connect(url, sockets);
+    const messages = collect(socket);
+    socket.send(JSON.stringify({
+      type: "subscribe",
+      terminalProtocolVersion: 2,
+      tabIds: [tab.id],
+      snapshots: false,
+      terminals: { [tab.id]: { mode: "projection", viewportRows: 20, fps: 2 } },
+    }));
+
+    await eventually(() => messages.some((message) => message.type === "terminal.screen"));
+    const screen = messages.find((message) => message.type === "terminal.screen");
+    expect(screen).toMatchObject({ full: true, sequence: 1, revision: 7, viewportRows: 20 });
+    expect(screen.rows[19].runs[0].text).toBe("ready");
+    expect(screen.rows[19]).not.toHaveProperty("hash");
+    expect(screenSnapshot).toHaveBeenCalledWith(tab.id, 20);
+
+    app.promptor.pty.emit("event", rawEvent(tab.id, 0, "must stay server-side"));
+    await delay(80);
+    expect(messages.some((message) => message.type === "terminal.output")).toBe(false);
+
+    socket.send(JSON.stringify({ type: "terminal.input", tabId: tab.id, inputId: "projected-input", dataBase64: Buffer.from("x").toString("base64") }));
+    await eventually(() => messages.some((message) => message.inputId === "projected-input"));
+    expect(write).toHaveBeenCalledWith(tab.id, "x");
+
+    socket.send(JSON.stringify({ type: "terminal.resize", tabId: tab.id, cols: 40, rows: 10 }));
+    await eventually(() => messages.some((message) => message.error?.code === "TERMINAL_PROJECTION_RESIZE_FORBIDDEN"));
+    expect(resize).not.toHaveBeenCalled();
+  });
 });
 
 function rawEvent(tabId: string, startOffset: number, text: string) {
