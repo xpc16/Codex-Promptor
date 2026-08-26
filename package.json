@@ -25,6 +25,7 @@
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
     "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
     "uuid": "^11.1.0",
     "write-file-atomic": "^6.0.0",
     "ws": "^8.18.0",
