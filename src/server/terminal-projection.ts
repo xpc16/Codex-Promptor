@@ -8,6 +8,7 @@ export type ProjectionSink = {
   isOpen: () => boolean;
   bufferedAmount: () => number;
   send: (payload: string) => ProjectionSendResult;
+  dropped?: (reason: "backpressure" | "budget", payloadBytes?: number) => void;
 };
 
 export type ProjectionSchedulerConfig = {
@@ -18,6 +19,8 @@ export type ProjectionSchedulerConfig = {
   backpressureHighBytes: number;
   backpressureLowBytes: number;
   backpressurePollMs: number;
+  bytesPerSecond: number;
+  maxBurstBytes: number;
 };
 
 export const defaultProjectionSchedulerConfig: ProjectionSchedulerConfig = {
@@ -28,6 +31,8 @@ export const defaultProjectionSchedulerConfig: ProjectionSchedulerConfig = {
   backpressureHighBytes: 256 * 1024,
   backpressureLowBytes: 64 * 1024,
   backpressurePollMs: 100,
+  bytesPerSecond: 2 * 1024,
+  maxBurstBytes: 8 * 1024,
 };
 
 type ProjectionStream = {
@@ -47,6 +52,8 @@ type ProjectionStream = {
   timerDueAt: number;
   flushing: boolean;
   disposed: boolean;
+  tokens: number;
+  tokensRefilledAt: number;
 };
 
 /**
@@ -82,6 +89,8 @@ export class TerminalProjectionScheduler {
       timerDueAt: 0,
       flushing: false,
       disposed: false,
+      tokens: this.config.maxBurstBytes,
+      tokensRefilledAt: this.now(),
     };
     const key = streamKey(clientId, tabId);
     this.streams.set(key, stream);
@@ -186,6 +195,7 @@ export class TerminalProjectionScheduler {
     }
     if (!stream.dirty && !stream.fullRequested) return;
     if (stream.sink.bufferedAmount() >= this.config.backpressureHighBytes) {
+      if (!stream.needsBackpressureRecovery) stream.sink.dropped?.("backpressure");
       stream.needsBackpressureRecovery = true;
       stream.fullRequested = true;
       stream.dirty = true;
@@ -221,7 +231,16 @@ export class TerminalProjectionScheduler {
         rows: diff.rows,
         ...(diff.scroll ? { scroll: diff.scroll } : {}),
       };
-      const result = stream.sink.send(JSON.stringify(frame));
+      const payload = JSON.stringify(frame);
+      const payloadBytes = Buffer.byteLength(payload, "utf8");
+      const budgetDelay = this.consumeBudget(stream, payloadBytes, stream.previous === null || stream.needsBackpressureRecovery);
+      if (budgetDelay > 0) {
+        stream.dirty = true;
+        stream.sink.dropped?.("budget", payloadBytes);
+        this.schedule(stream, budgetDelay);
+        return;
+      }
+      const result = stream.sink.send(payload);
       if (result === "backpressured") {
         stream.needsBackpressureRecovery = true;
         stream.fullRequested = true;
@@ -239,6 +258,29 @@ export class TerminalProjectionScheduler {
       if (stream.needsBackpressureRecovery) this.schedule(stream, this.config.backpressurePollMs);
       else if (stream.dirty) this.schedule(stream, this.frameDelay(stream));
     }
+  }
+
+  private consumeBudget(stream: ProjectionStream, payloadBytes: number, recoveryFrame: boolean): number {
+    const now = this.now();
+    const elapsedMs = Math.max(0, now - stream.tokensRefilledAt);
+    stream.tokens = Math.min(
+      this.config.maxBurstBytes,
+      stream.tokens + (elapsedMs / 1_000) * this.config.bytesPerSecond,
+    );
+    stream.tokensRefilledAt = now;
+    if (recoveryFrame) {
+      stream.tokens = Math.max(0, stream.tokens - payloadBytes);
+      return 0;
+    }
+    // A single full-width styled frame can be larger than the burst capacity.
+    // Requiring one full bucket still bounds its frequency while guaranteeing
+    // that a large but valid screen eventually makes progress.
+    const required = Math.min(payloadBytes, this.config.maxBurstBytes);
+    if (stream.tokens >= required) {
+      stream.tokens = Math.max(0, stream.tokens - payloadBytes);
+      return 0;
+    }
+    return Math.max(1, Math.ceil(((required - stream.tokens) / this.config.bytesPerSecond) * 1_000));
   }
 }
 
@@ -334,4 +376,3 @@ function clampInteger(value: number | undefined, min: number, max: number, fallb
 }
 
 function streamKey(clientId: string, tabId: string): string { return `${clientId}\u0000${tabId}`; }
-

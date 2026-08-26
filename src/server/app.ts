@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
+import fastifyCompress from "@fastify/compress";
 import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
 import { AgentProviderSchema, type AgentProvider, type AnswerRecord, type Group, type IndexFile, IndexFileSchema, isoNow, newPrompt, PromptFileSchema, RuntimeFileSchema, type RuntimeFile, type TabBundle, type TabMeta } from "../shared/schemas.js";
@@ -62,6 +63,7 @@ type Client = {
   stateSubscriptions: Set<string>;
   terminalSubscriptions: Map<string, TerminalStream>;
   wantsIndex: boolean;
+  wantsDetails: boolean;
 };
 
 export type RestoreOpenSessionsSummary = {
@@ -128,6 +130,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const cursorVersion = probeCursorVersion();
 
   await storage.ensure();
+  const readClientTab = (tabId: string): Promise<TabBundle> => storage.readTabWindow(tabId, 200, 80);
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
   await recoverTerminalRuntime(storage);
 
@@ -142,14 +145,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       backpressureHighBytes: transportConfig.websocketHighWaterBytes,
       backpressureLowBytes: transportConfig.websocketLowWaterBytes,
       interactiveWindowMs: transportConfig.interactiveWindowMs,
+      bytesPerSecond: transportConfig.projectionBytesPerSecond,
+      maxBurstBytes: transportConfig.projectionMaxBurstBytes,
     },
   );
 
-  const emit = (tabId: string, message: Record<string, unknown>) => {
+  const emit = (tabId: string, message: Record<string, unknown>, detailsOnly = false) => {
     const sequence = (sequences.get(tabId) ?? 0) + 1;
     sequences.set(tabId, sequence);
     for (const client of clients) {
-      if (client.stateSubscriptions.has(tabId)) sendClient(client, { ...message, tabId, sequence }, stateTrafficKind(message.type));
+      if (client.stateSubscriptions.has(tabId) && (!detailsOnly || client.wantsDetails)) sendClient(client, { ...message, tabId, sequence }, stateTrafficKind(message.type));
     }
   };
 
@@ -195,8 +200,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     // The browser raw emulator owns DA/DSR/theme replies while a healthy raw
     // stream exists. Projection-only tabs are answered by the headless model.
     pty.setScreenResponder(tabId, rawClients.length === 0);
-    if (owner === previousOwner) return;
-    const epoch = (responderLeaseEpochs.get(tabId) ?? 0) + 1;
+    const epoch = owner === previousOwner
+      ? (responderLeaseEpochs.get(tabId) ?? 0)
+      : (responderLeaseEpochs.get(tabId) ?? 0) + 1;
     responderLeaseEpochs.set(tabId, epoch);
     for (const candidate of rawClients) {
       sendClient(candidate, {
@@ -210,10 +216,6 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
   };
 
-  const emitAnswer = (tabId: string, answer: AnswerRecord) => {
-    emit(tabId, { type: answerEventType(answer), answer });
-  };
-
   // Terminal traffic is per-tab, so emit() only reaches subscribers. Navigation
   // is not: every viewer reads the same index file, so a rename, deletion,
   // group move or reorder made in one browser has to reach all the others —
@@ -225,6 +227,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
   };
   storage.onIndexChanged(broadcastIndex);
+  storage.onTabChanged((tabId, tab) => emit(tabId, { type: "tab.changed", tab }, true));
+  storage.onPromptsChanged((tabId, delta) => emit(tabId, { type: "prompts.changed", delta }, true));
+  storage.onAnswersChanged((tabId, delta) => {
+    emit(tabId, { type: "answers.changed", delta }, true);
+  });
+  storage.onRuntimeChanged((tabId, runtime) => emit(tabId, { type: "runner.changed", runner: runtime }));
 
   const scheduleCompactionTerminalResync = (tabId: string): void => {
     const previous = terminalResyncTimers.get(tabId);
@@ -241,9 +249,19 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   };
 
   const runners = new RunnerManager(storage, (tabId) => cursor.existing(tabId) ?? claude.existing(tabId) ?? codex.get(tabId), (event) => {
-    if (event.type === "runtime") emit(event.tabId, { type: "runner.changed", runner: event.data });
-    else if (event.type === "answer") emitAnswer(event.tabId, event.data as AnswerRecord);
-    else emit(event.tabId, { type: "error", error: event.data });
+    if (event.type === "error") emit(event.tabId, { type: "error", error: event.data });
+    if (event.type === "answer") {
+      const answer = event.data as AnswerRecord | undefined;
+      if (answer?.origin === "queue" && answer.status === "completed") {
+        emit(event.tabId, {
+          type: "answer.activity",
+          answerId: answer.id,
+          completedAt: answer.completedAt ?? answer.recordedAt,
+          status: answer.status,
+          origin: answer.origin,
+        });
+      }
+    }
   });
 
   const scheduleThreadSwitch = (tabId: string, manager: AppServerManager, selection: TuiThreadSelection): Promise<void> => {
@@ -260,11 +278,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       });
       if (!result) return;
       emit(tabId, { type: "thread.switched", switch: result });
-      emit(tabId, { type: "snapshot", data: await storage.readTab(tabId) });
+      emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
     }).catch(async (error) => {
       const message = error instanceof Error ? error.message : String(error);
       emit(tabId, { type: "error", error: { code: "TERMINAL_THREAD_SYNC_FAILED", message } });
-      try { emit(tabId, { type: "snapshot", data: await storage.readTab(tabId) }); } catch { /* tab may have been deleted */ }
+      try { emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true); } catch { /* tab may have been deleted */ }
     });
     threadSwitches.set(tabId, task);
     void task.finally(() => {
@@ -303,8 +321,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         // Other turns may still contain queue prompts delivered via turn/steer;
         // those are reconciled here together with the manual turn.
         if (bundle.runtime.runner.activeTurnId === event.turnId) return;
-        const result = await recordTurn(storage, tabId, { threadId: event.threadId, turn: event.turn, items: event.items, origin: "manual" });
-        if (result.answer) emitAnswer(tabId, result.answer);
+        await recordTurn(storage, tabId, { threadId: event.threadId, turn: event.turn, items: event.items, origin: "manual" });
       } catch { /* manual history is reconciled by the explicit sync endpoint */ }
     });
     manager.rpc.on("serverRequest", (request: any) => {
@@ -370,7 +387,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       else await syncCursorHistoryIfAvailable(tabId, session.sessionId, session.transcriptPath);
       await clearSessionNotReadyError(storage, tabId);
       emit(tabId, { type: "thread.switched", switch: { fromThreadId, toThreadId: session.sessionId, method: "session/start", switchedAt } });
-      emit(tabId, { type: "snapshot", data: await storage.readTab(tabId) });
+        emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
     }).catch(async (error) => {
       const message = error instanceof Error ? error.message : String(error);
       try {
@@ -381,7 +398,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         }));
       } catch { /* tab may have been deleted */ }
       emit(tabId, { type: "error", error: { code: "TERMINAL_THREAD_SYNC_FAILED", message } });
-      try { emit(tabId, { type: "snapshot", data: await storage.readTab(tabId) }); } catch { /* deleted */ }
+      try { emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true); } catch { /* deleted */ }
     });
     threadSwitches.set(tabId, task);
     void task.finally(() => {
@@ -399,13 +416,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         const bundle = await storage.readTab(tabId);
         // Queue turns are finalized by QueueRunner after waitForTurn resolves.
         if (bundle.runtime.runner.activeTurnId === event.turnId) return;
-        const result = await recordTurn(storage, tabId, {
+        await recordTurn(storage, tabId, {
           threadId: event.threadId,
           turn: event.turn,
           items: event.items,
           origin: "manual",
         });
-        if (result.answer) emitAnswer(tabId, result.answer);
       } catch { /* explicit history sync can reconstruct the transcript later */ }
     });
   });
@@ -418,14 +434,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         if (tab.session.provider !== "cursor" || tab.session.threadId !== event.threadId) return;
         const bundle = await storage.readTab(tabId);
         if (bundle.runtime.runner.activeTurnId === event.turnId) return;
-        const result = await recordTurn(storage, tabId, { threadId: event.threadId, turn: event.turn, items: event.items, origin: "manual" });
-        if (result.answer) emitAnswer(tabId, result.answer);
+        await recordTurn(storage, tabId, { threadId: event.threadId, turn: event.turn, items: event.items, origin: "manual" });
       } catch { /* explicit history sync can reconstruct the transcript later */ }
     });
   });
 
   const emitSnapshot = async (tabId: string): Promise<void> => {
-    try { emit(tabId, { type: "snapshot", data: await storage.readTab(tabId) }); }
+    try { emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true); }
     catch { /* the tab may have been deleted while a restore was finishing */ }
   };
 
@@ -539,7 +554,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       }));
       await clearSessionNotReadyError(storage, tabId);
       const bundle = await storage.readTab(tabId);
-      emit(tabId, { type: "snapshot", data: bundle });
+      emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
       return { ok: true, bundle };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -582,7 +597,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       }));
       await clearSessionNotReadyError(storage, tabId);
       const bundle = await storage.readTab(tabId);
-      emit(tabId, { type: "snapshot", data: bundle });
+      emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
       return { ok: true, bundle };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -665,7 +680,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       // queue prompts continue to use App Server turn/start or turn/steer.
       pty.primeCodexInput(tabId);
       const bundle = await storage.readTab(tabId);
-      emit(tabId, { type: "snapshot", data: bundle });
+      emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
       return { ok: true, bundle };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -739,6 +754,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
   };
 
+  await app.register(fastifyCompress, {
+    global: true,
+    globalDecompression: false,
+    threshold: 512,
+    encodings: ["br", "gzip"],
+  });
   await app.register(fastifyStatic, {
     root: path.join(rootDir, "dist", "client"),
     prefix: "/",
@@ -835,6 +856,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             defaultFps: defaultProjectionSchedulerConfig.defaultFps,
             maxViewportRows: 60,
             maxFps: 5,
+            bytesPerSecond: transportConfig.projectionBytesPerSecond,
+            maxBurstBytes: transportConfig.projectionMaxBurstBytes,
           },
         },
       },
@@ -966,13 +989,36 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
 
   app.get("/api/tabs/:tabId", async (request, reply) => {
     const tabId = String((request.params as any).tabId);
-    try { return reply.send({ data: await storage.readTab(tabId) }); }
+    const query = (request.query ?? {}) as any;
+    const promptLimit = boundedInteger(query.promptLimit, 1, 500, 200);
+    const answerLimit = boundedInteger(query.answerLimit, 1, 500, 80);
+    try { return reply.send({ data: await storage.readTabWindow(tabId, promptLimit, answerLimit) }); }
     catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const missing = (error as NodeJS.ErrnoException)?.code === "ENOENT";
       return missing
         ? apiError(reply, 404, "TAB_NOT_FOUND", message)
         : apiError(reply, 503, "TAB_READ_FAILED", message, true);
+    }
+  });
+
+  app.get("/api/tabs/:tabId/prompts/page", async (request, reply) => {
+    const tabId = String((request.params as any).tabId);
+    const query = (request.query ?? {}) as any;
+    try {
+      return reply.send({ data: await storage.readPromptPage(tabId, Number(query.before), boundedInteger(query.limit, 1, 500, 100)) });
+    } catch (error) {
+      return apiError(reply, 404, "TAB_NOT_FOUND", error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  app.get("/api/tabs/:tabId/answers/page", async (request, reply) => {
+    const tabId = String((request.params as any).tabId);
+    const query = (request.query ?? {}) as any;
+    try {
+      return reply.send({ data: await storage.readAnswerPage(tabId, Number(query.before), boundedInteger(query.limit, 1, 500, 40)) });
+    } catch (error) {
+      return apiError(reply, 404, "TAB_NOT_FOUND", error instanceof Error ? error.message : String(error));
     }
   });
 
@@ -1387,6 +1433,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       stateSubscriptions: new Set(),
       terminalSubscriptions: new Map(),
       wantsIndex: false,
+      wantsDetails: true,
     };
     clients.add(client);
     ui.connect();
@@ -1411,6 +1458,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           client.stateSubscriptions = parseTabSubscriptions(message.tabIds);
           client.terminalSubscriptions = parseTerminalSubscriptions(message.terminals);
           client.wantsIndex = message.index === true;
+          client.wantsDetails = message.details !== false;
           traffic.setRole(client.id, client.stateSubscriptions.size > 0 || client.wantsIndex, client.terminalSubscriptions.size > 0);
 
           for (const [tabId, stream] of client.terminalSubscriptions) {
@@ -1419,6 +1467,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
               isOpen: () => client.socket.readyState === 1,
               bufferedAmount: () => Number(client.socket.bufferedAmount ?? 0),
               send: (payload) => socketSender.sendProjection(client.id, client.socket, payload),
+              dropped: () => traffic.recordProjectionCandidateDropped(client.id, Number(client.socket.bufferedAmount ?? 0)),
             });
             stream.streamId = subscription.streamId;
             stream.viewportRows = subscription.viewportRows;
@@ -1454,7 +1503,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           if (message.snapshots !== false) {
             for (const tabId of client.stateSubscriptions) {
               try {
-                const data = await storage.readTab(tabId);
+                const data = await readClientTab(tabId);
                 sendClient(client, { type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, data }, "snapshot");
               } catch { /* tab may have been deleted */ }
             }
@@ -1485,7 +1534,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             sendClient(client, wsError("TAB_NOT_SUBSCRIBED", "Subscribe to the tab before requesting a snapshot."), "error");
             return;
           }
-          const data = await storage.readTab(tabId);
+          const data = await readClientTab(tabId);
           sendClient(client, { type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, data }, "snapshot");
         } else if (message.type === "terminal.input" && message.tabId) {
           const tabId = String(message.tabId);

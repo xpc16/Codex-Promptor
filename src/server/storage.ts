@@ -16,12 +16,16 @@ import {
   PromptFileSchema,
   type RuntimeFile,
   RuntimeFileSchema,
+  type AnswerRecord,
+  type PromptRecord,
   type TabBundle,
+  type TabRecordPage,
   type TabMeta,
   TabMetaSchema,
   defaultSession,
 } from "../shared/schemas.js";
 import { latestQueueCompletion, type TabActivitySummary } from "../shared/tab-activity.js";
+import { buildRecordDelta, type AnswerDelta, type PromptDelta } from "../shared/tab-delta.js";
 
 export class KeyedMutex {
   private readonly locks = new Map<string, Promise<void>>();
@@ -79,6 +83,10 @@ export class StorageService {
   readonly trashDir: string;
   readonly mutex = new KeyedMutex();
   private readonly indexListeners = new Set<(index: IndexFile) => void>();
+  private readonly tabListeners = new Set<(tabId: string, tab: TabMeta) => void>();
+  private readonly promptListeners = new Set<(tabId: string, delta: PromptDelta) => void>();
+  private readonly answerListeners = new Set<(tabId: string, delta: AnswerDelta) => void>();
+  private readonly runtimeListeners = new Set<(tabId: string, runtime: RuntimeFile) => void>();
 
   constructor(rootDir: string) {
     this.rootDir = path.resolve(rootDir);
@@ -140,6 +148,11 @@ export class StorageService {
     this.indexListeners.add(listener);
     return () => { this.indexListeners.delete(listener); };
   }
+
+  onTabChanged(listener: (tabId: string, tab: TabMeta) => void): () => void { this.tabListeners.add(listener); return () => { this.tabListeners.delete(listener); }; }
+  onPromptsChanged(listener: (tabId: string, delta: PromptDelta) => void): () => void { this.promptListeners.add(listener); return () => { this.promptListeners.delete(listener); }; }
+  onAnswersChanged(listener: (tabId: string, delta: AnswerDelta) => void): () => void { this.answerListeners.add(listener); return () => { this.answerListeners.delete(listener); }; }
+  onRuntimeChanged(listener: (tabId: string, runtime: RuntimeFile) => void): () => void { this.runtimeListeners.add(listener); return () => { this.runtimeListeners.delete(listener); }; }
 
   async writeIndex(index: IndexFile): Promise<void> {
     const value = IndexFileSchema.parse(index);
@@ -205,6 +218,44 @@ export class StorageService {
     return { tab, prompts, answers, runtime };
   }
 
+  async readTabWindow(tabId: string, promptLimit = 200, answerLimit = 80): Promise<TabBundle> {
+    const bundle = await this.readTab(tabId);
+    const { prompts, answers } = recordsForCurrentThread(bundle);
+    const promptTail = Math.max(0, prompts.length - boundedPageLimit(promptLimit, 200));
+    const firstRunningPrompt = prompts.findIndex((prompt) => prompt.status === "running");
+    // Keep the active turn visible, but never let an unusually large pending
+    // queue turn the initial REST response back into an unbounded history dump.
+    const promptStart = firstRunningPrompt >= 0
+      ? Math.max(0, prompts.length - 500, Math.min(promptTail, firstRunningPrompt))
+      : promptTail;
+    const answerTail = Math.max(0, answers.length - boundedPageLimit(answerLimit, 80));
+    const firstRunning = answers.findIndex((answer) => answer.status === "running");
+    const answerStart = firstRunning >= 0
+      ? Math.max(0, answers.length - 500, Math.min(answerTail, firstRunning))
+      : answerTail;
+    return {
+      ...bundle,
+      prompts: { ...bundle.prompts, prompts: prompts.slice(promptStart) },
+      answers: { ...bundle.answers, answers: answers.slice(answerStart) },
+      window: {
+        prompts: { start: promptStart, total: prompts.length, completed: prompts.filter((prompt) => prompt.status === "completed").length },
+        answers: { start: answerStart, total: answers.length },
+      },
+    };
+  }
+
+  async readPromptPage(tabId: string, before: number, limit = 100): Promise<TabRecordPage<PromptRecord>> {
+    const bundle = await this.readTab(tabId);
+    const records = recordsForCurrentThread(bundle).prompts;
+    return recordPage(records, before, limit, bundle.prompts.revision, bundle.prompts.updatedAt);
+  }
+
+  async readAnswerPage(tabId: string, before: number, limit = 40): Promise<TabRecordPage<AnswerRecord>> {
+    const bundle = await this.readTab(tabId);
+    const records = recordsForCurrentThread(bundle).answers;
+    return recordPage(records, before, limit, bundle.answers.revision, bundle.answers.updatedAt);
+  }
+
   async readTabActivity(tabId: string): Promise<TabActivitySummary> {
     const [prompts, runtime] = await Promise.all([
       this.readFile(this.promptPath(tabId), (value) => PromptFileSchema.parse(value)),
@@ -227,19 +278,54 @@ export class StorageService {
   }
 
   async writeTab(tab: TabMeta): Promise<void> {
-    await this.writeFile(this.tabPath(tab.id), TabMetaSchema.parse(tab));
+    const value = TabMetaSchema.parse(tab);
+    await this.writeFile(this.tabPath(tab.id), value);
+    notify(this.tabListeners, (listener) => listener(value.id, value));
   }
 
   async writePrompts(tabId: string, prompts: PromptFile): Promise<void> {
-    await this.writeFile(this.promptPath(tabId), PromptFileSchema.parse(prompts));
+    const value = PromptFileSchema.parse(prompts);
+    const [previous, tab, answers] = await Promise.all([
+      this.readFile(this.promptPath(tabId), (raw) => PromptFileSchema.parse(raw)).catch(() => null),
+      this.readFile(this.tabPath(tabId), (raw) => TabMetaSchema.parse(raw)).catch(() => null),
+      this.readFile(this.answerPath(tabId), (raw) => AnswerFileSchema.parse(raw)).catch(() => null),
+    ]);
+    await this.writeFile(this.promptPath(tabId), value);
+    const currentAnswers = answers?.answers ?? [];
+    const previousRecords = tab && previous
+      ? currentPromptRecords(tab, previous.prompts, currentAnswers)
+      : previous?.prompts ?? null;
+    const nextRecords = tab
+      ? currentPromptRecords(tab, value.prompts, currentAnswers)
+      : value.prompts;
+    const delta: PromptDelta = {
+      ...buildRecordDelta(previousRecords, nextRecords, value.revision, value.updatedAt),
+      completed: nextRecords.filter((prompt) => prompt.status === "completed").length,
+    };
+    notify(this.promptListeners, (listener) => listener(tabId, delta));
   }
 
   async writeAnswers(tabId: string, answers: AnswerFile): Promise<void> {
-    await this.writeFile(this.answerPath(tabId), AnswerFileSchema.parse(answers));
+    const value = AnswerFileSchema.parse(answers);
+    const [previous, tab] = await Promise.all([
+      this.readFile(this.answerPath(tabId), (raw) => AnswerFileSchema.parse(raw)).catch(() => null),
+      this.readFile(this.tabPath(tabId), (raw) => TabMetaSchema.parse(raw)).catch(() => null),
+    ]);
+    await this.writeFile(this.answerPath(tabId), value);
+    const previousRecords = tab && previous
+      ? currentAnswerRecords(tab, previous.answers)
+      : previous?.answers ?? null;
+    const nextRecords = tab
+      ? currentAnswerRecords(tab, value.answers)
+      : value.answers;
+    const delta = buildRecordDelta(previousRecords, nextRecords, value.revision, value.updatedAt) as AnswerDelta;
+    notify(this.answerListeners, (listener) => listener(tabId, delta));
   }
 
   async writeRuntime(tabId: string, runtime: RuntimeFile): Promise<void> {
-    await this.writeFile(this.runtimePath(tabId), RuntimeFileSchema.parse(runtime));
+    const value = RuntimeFileSchema.parse(runtime);
+    await this.writeFile(this.runtimePath(tabId), value);
+    notify(this.runtimeListeners, (listener) => listener(tabId, value));
   }
 
   async updateTab(tabId: string, mutator: (tab: TabMeta) => TabMeta | Promise<TabMeta>): Promise<TabMeta> {
@@ -288,6 +374,43 @@ export class StorageService {
   async listTabMeta(): Promise<TabMeta[]> {
     const index = await this.readIndex();
     return [...index.tabs].sort((a, b) => a.order - b.order);
+  }
+}
+
+function recordsForCurrentThread(bundle: TabBundle): { prompts: PromptRecord[]; answers: AnswerRecord[] } {
+  const answers = currentAnswerRecords(bundle.tab, bundle.answers.answers);
+  const prompts = currentPromptRecords(bundle.tab, bundle.prompts.prompts, answers);
+  return { prompts, answers };
+}
+
+function currentAnswerRecords(tab: TabMeta, records: readonly AnswerRecord[]): AnswerRecord[] {
+  if (tab.session.provider === "shell" || !tab.session.threadId) return [];
+  return records.filter((answer) => answer.threadId === tab.session.threadId);
+}
+
+function currentPromptRecords(tab: TabMeta, records: readonly PromptRecord[], answers: readonly AnswerRecord[]): PromptRecord[] {
+  if (tab.session.provider === "shell") return [];
+  const threadId = tab.session.threadId;
+  const answerPromptIds = new Set(answers.map((answer) => answer.promptId));
+  return records.filter((prompt) => Boolean(threadId) && prompt.threadId === threadId
+    || (!prompt.threadId && answerPromptIds.has(prompt.id))
+    || (prompt.status === "pending" && !prompt.threadId));
+}
+
+function recordPage<T>(records: T[], before: number, limit: number, revision: number, updatedAt: string): TabRecordPage<T> {
+  const end = Math.max(0, Math.min(records.length, Number.isFinite(before) ? Math.trunc(before) : records.length));
+  const start = Math.max(0, end - boundedPageLimit(limit, 100));
+  return { records: records.slice(start, end), start, total: records.length, revision, updatedAt };
+}
+
+function boundedPageLimit(value: number, fallback: number): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(1, Math.min(500, Math.trunc(number))) : fallback;
+}
+
+function notify<T>(listeners: ReadonlySet<T>, call: (listener: T) => void): void {
+  for (const listener of listeners) {
+    try { call(listener); } catch { /* persistence succeeded; notifications are best-effort */ }
   }
 }
 

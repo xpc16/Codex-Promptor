@@ -213,6 +213,19 @@ export type TabBundle = {
   prompts: PromptFile;
   answers: AnswerFile;
   runtime: RuntimeFile;
+  /** Present on bandwidth-bounded reads; omitted by internal full-file reads. */
+  window?: {
+    prompts: { start: number; total: number; completed: number };
+    answers: { start: number; total: number };
+  };
+};
+
+export type TabRecordPage<T> = {
+  records: T[];
+  start: number;
+  total: number;
+  revision: number;
+  updatedAt: string;
 };
 
 export const defaultSession = (): Session => ({

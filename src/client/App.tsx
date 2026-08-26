@@ -11,7 +11,8 @@ import {
   type PointerEvent,
   type TouchEvent as ReactTouchEvent,
 } from "react";
-import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta } from "../shared/schemas.js";
+import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta, TabRecordPage } from "../shared/schemas.js";
+import type { TerminalScreenFrame, TerminalTransportMode, TerminalTransportPreference } from "../shared/terminal-protocol.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
 import { completionNoticeExpiresAt, latestQueueCompletion, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
 import ReactMarkdown from "react-markdown";
@@ -24,8 +25,11 @@ import { sameTerminalSize, terminalFrameLooksSettled, terminalResetNeedsSettling
 import { loadTabWithRetry, retainRecentTabIds } from "./tab-load.js";
 import { MOBILE_PANES, nextMobilePane, swipeDirection, type MobilePane } from "./mobile-pane.js";
 import { dialogSurvivesIndex, nextSelectedTabId, shouldAdoptIndexRevision } from "./index-sync.js";
+import { applyTabMessage } from "./tab-bundle-delta.js";
 import { CONSOLE_WIDTH, readPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
 import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
+import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenState } from "./terminal-projection.js";
+import { readTerminalTransportPreference, resolveTerminalTransportPreference, writeTerminalTransportPreference } from "./terminal-preference.js";
 import {
   createI18n,
   I18nContext,
@@ -133,6 +137,7 @@ export function App() {
   const [clock, setClock] = useState(() => new Date());
   const [activities, setActivities] = useState<Record<string, TabActivitySummary>>({});
   const [recentCompletionExpiries, setRecentCompletionExpiries] = useState<Record<string, number>>({});
+  const [terminalPreference, setTerminalPreference] = useState<TerminalTransportPreference>(() => readTerminalTransportPreference());
   const consoleDragging = useRef(false);
   const consoleWidthRef = useRef(readPaneSize(CONSOLE_WIDTH));
   // Highest index revision already applied, so a replayed or out-of-order push
@@ -145,6 +150,10 @@ export function App() {
   const locale: Locale = index?.ui.locale ?? "zh-CN";
   const i18n = useMemo(() => createI18n(locale), [locale]);
   const { t } = i18n;
+  const changeTerminalPreference = useCallback((value: TerminalTransportPreference) => {
+    writeTerminalTransportPreference(value);
+    setTerminalPreference(value);
+  }, []);
 
   const markRecentCompletion = useCallback((tabId: string, completedAt: string | null, audible: boolean) => {
     const expiresAt = completionNoticeExpiresAt(completedAt);
@@ -235,6 +244,7 @@ export function App() {
         type: "subscribe",
         tabIds: tabIdsKey ? tabIdsKey.split(",") : [],
         snapshots: false,
+        details: false,
         // Only this socket wants navigation pushes; the per-tab terminal
         // sockets would just receive copies they have no use for.
         index: true,
@@ -254,9 +264,8 @@ export function App() {
               lastQueueCompletedAt: current[tabId]?.lastQueueCompletedAt ?? null,
             },
           }));
-        } else if (message.type === "answer.added" && tabId && message.answer?.origin === "queue" && message.answer?.status === "completed") {
-          const answer = message.answer as AnswerRecord;
-          const completedAt = answer.completedAt ?? answer.recordedAt;
+        } else if ((message.type === "answer.activity" || message.type === "answer.added") && tabId && (message.origin === "queue" || message.answer?.origin === "queue") && (message.status === "completed" || message.answer?.status === "completed")) {
+          const completedAt = String(message.completedAt ?? message.answer?.completedAt ?? message.answer?.recordedAt ?? "");
           setActivities((current) => ({
             ...current,
             [tabId]: {
@@ -489,7 +498,7 @@ export function App() {
     <div className="console-splitter" role="separator" aria-label={t("aria.resizeConsole")} onMouseDown={() => { consoleDragging.current = true; }} />
     <main className="workspace" aria-label={t("aria.conversationPage")}>
       {Boolean(error) && <div className="toast error-toast">{i18n.errorText(error)}<button onClick={() => setError(null)}>×</button></div>}
-      {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} onBundleChanged={applyTabBundle} onError={setError} />)}
+      {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} terminalPreference={terminalPreference} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} onTerminalPreferenceChange={changeTerminalPreference} onBundleChanged={applyTabBundle} onError={setError} />)}
       {!selected && <Welcome onCreate={() => void createTab()} />}
     </main>
     <nav className="mobile-pane-bar" aria-label={t("aria.paneSwitcher")}>
@@ -638,22 +647,38 @@ function Welcome({ onCreate }: { onCreate: () => void }) {
   return <div className="welcome"><div className="welcome-icon">✦</div><h1>{t("welcome.title")}</h1><p>{t("welcome.body")}</p><button className="primary" onClick={onCreate}>{t("welcome.start")}</button></div>;
 }
 
-function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: number) {
+function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: number, hasEarlier = false, onLoadEarlier?: () => Promise<number>) {
   const [visibleCount, setVisibleCount] = useState(pageSize);
   const scrollRef = useRef<HTMLDivElement>(null);
   const prependAnchor = useRef<{ height: number; top: number } | null>(null);
+  const loadingEarlier = useRef(false);
   const startIndex = Math.max(0, items.length - visibleCount);
   const visibleItems = items.slice(startIndex);
 
-  const revealEarlier = useCallback(() => {
+  const revealEarlier = useCallback(async () => {
     const element = scrollRef.current;
-    if (!element || prependAnchor.current || visibleCount >= items.length) return;
+    if (!element || prependAnchor.current || loadingEarlier.current) return;
+    if (visibleCount < items.length) {
+      prependAnchor.current = { height: element.scrollHeight, top: element.scrollTop };
+      setVisibleCount((current) => Math.min(items.length, current + pageSize));
+      return;
+    }
+    if (!hasEarlier || !onLoadEarlier) return;
+    loadingEarlier.current = true;
     prependAnchor.current = { height: element.scrollHeight, top: element.scrollTop };
-    setVisibleCount((current) => Math.min(items.length, current + pageSize));
-  }, [items.length, pageSize, visibleCount]);
+    try {
+      const added = await onLoadEarlier();
+      if (added > 0) setVisibleCount((current) => current + added);
+      else prependAnchor.current = null;
+    } catch {
+      prependAnchor.current = null;
+    } finally {
+      loadingEarlier.current = false;
+    }
+  }, [hasEarlier, items.length, onLoadEarlier, pageSize, visibleCount]);
 
   const onScroll = useCallback(() => {
-    if ((scrollRef.current?.scrollTop ?? Number.POSITIVE_INFINITY) <= 48) revealEarlier();
+    if ((scrollRef.current?.scrollTop ?? Number.POSITIVE_INFINITY) <= 48) void revealEarlier();
   }, [revealEarlier]);
 
   useLayoutEffect(() => {
@@ -675,7 +700,7 @@ function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: num
   return { onScroll, scrollRef, startIndex, visibleItems };
 }
 
-function TabView({ tab, active, refreshNonce, theme, onBundleChanged, onError }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void }) {
+function TabView({ tab, active, refreshNonce, theme, terminalPreference, projectionSupported, onTerminalPreferenceChange, onBundleChanged, onError }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; terminalPreference: TerminalTransportPreference; projectionSupported: boolean; onTerminalPreferenceChange: (value: TerminalTransportPreference) => void; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   const [bundle, setBundle] = useState<TabBundle | null>(null);
@@ -689,8 +714,10 @@ function TabView({ tab, active, refreshNonce, theme, onBundleChanged, onError }:
   const [reopening, setReopening] = useState(false);
   const loadSequence = useRef(0);
   const initialBundleApplied = useRef(false);
+  const bundleRef = useRef<TabBundle | null>(null);
   const applyBundle = useCallback((next: TabBundle) => {
     initialBundleApplied.current = true;
+    bundleRef.current = next;
     setBundle(next);
     setLoadError(null);
     onBundleChanged(next);
@@ -698,7 +725,7 @@ function TabView({ tab, active, refreshNonce, theme, onBundleChanged, onError }:
   const load = useCallback(async () => {
     const sequence = ++loadSequence.current;
     try {
-      const next = await loadTabWithRetry(() => api<TabBundle>(`/api/tabs/${tab.id}`));
+      const next = await loadTabWithRetry(() => api<TabBundle>(`/api/tabs/${tab.id}?promptLimit=200&answerLimit=80`));
       if (!initialBundleApplied.current) {
         // A fast response followed by Markdown/xterm setup can otherwise land
         // before the browser paints this newly selected view, producing a
@@ -715,6 +742,65 @@ function TabView({ tab, active, refreshNonce, theme, onBundleChanged, onError }:
       return null;
     }
   }, [applyBundle, tab.id, onError]);
+  const applyRealtimeMessage = useCallback((message: any) => {
+    const current = bundleRef.current;
+    if (!current) return;
+    const result = applyTabMessage(current, message);
+    if (result.needsSnapshot) {
+      void load();
+      return;
+    }
+    if (!result.changed) return;
+    bundleRef.current = result.bundle;
+    setBundle(result.bundle);
+    onBundleChanged(result.bundle);
+  }, [load, onBundleChanged]);
+  const loadEarlierPrompts = useCallback(async (): Promise<number> => {
+    try {
+      const current = bundleRef.current;
+      const before = current?.window?.prompts.start ?? 0;
+      if (!current || before <= 0) return 0;
+      const page = await api<TabRecordPage<PromptRecord>>(`/api/tabs/${tab.id}/prompts/page?before=${before}&limit=100`);
+      if (bundleRef.current?.prompts.revision !== page.revision) { void load(); return 0; }
+      const known = new Set(current.prompts.prompts.map((item) => item.id));
+      const earlier = page.records.filter((item) => !known.has(item.id));
+      const next: TabBundle = {
+        ...current,
+        prompts: { ...current.prompts, prompts: [...earlier, ...current.prompts.prompts] },
+        window: { ...(current.window ?? { prompts: { start: 0, total: 0, completed: 0 }, answers: { start: 0, total: 0 } }), prompts: { start: page.start, total: page.total, completed: current.window?.prompts.completed ?? current.prompts.prompts.filter((prompt) => prompt.status === "completed").length } },
+      };
+      bundleRef.current = next;
+      setBundle(next);
+      onBundleChanged(next);
+      return earlier.length;
+    } catch (error) {
+      onError(error);
+      return 0;
+    }
+  }, [load, onBundleChanged, onError, tab.id]);
+  const loadEarlierAnswers = useCallback(async (): Promise<number> => {
+    try {
+      const current = bundleRef.current;
+      const before = current?.window?.answers.start ?? 0;
+      if (!current || before <= 0) return 0;
+      const page = await api<TabRecordPage<AnswerRecord>>(`/api/tabs/${tab.id}/answers/page?before=${before}&limit=40`);
+      if (bundleRef.current?.answers.revision !== page.revision) { void load(); return 0; }
+      const known = new Set(current.answers.answers.map((item) => item.id));
+      const earlier = page.records.filter((item) => !known.has(item.id));
+      const next: TabBundle = {
+        ...current,
+        answers: { ...current.answers, answers: [...earlier, ...current.answers.answers] },
+        window: { ...(current.window ?? { prompts: { start: 0, total: 0, completed: 0 }, answers: { start: 0, total: 0 } }), answers: { start: page.start, total: page.total } },
+      };
+      bundleRef.current = next;
+      setBundle(next);
+      onBundleChanged(next);
+      return earlier.length;
+    } catch (error) {
+      onError(error);
+      return 0;
+    }
+  }, [load, onBundleChanged, onError, tab.id]);
   useEffect(() => { void load(); }, [load, refreshNonce]);
   useEffect(() => {
     const move = (event: MouseEvent) => { if (!active || !dragging.current) return; const rect = workspace.current?.getBoundingClientRect(); if (!rect) return; setLeftWidth(Math.max(24, Math.min(76, ((event.clientX - rect.left) / rect.width) * 100))); };
@@ -735,9 +821,9 @@ function TabView({ tab, active, refreshNonce, theme, onBundleChanged, onError }:
   const threadId = bundle.tab.session.threadId;
   const answers = threadId ? bundle.answers.answers.filter((answer) => answer.threadId === threadId) : [];
   return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspace} style={{ gridTemplateColumns: `${leftWidth}fr 7px ${100 - leftWidth}fr` }}>
-    <section className="conversation-pane">{active && <><SessionPanel bundle={bundle} reopening={reopening} onReopen={reopen} onBundle={applyBundle} onError={onError} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
+    <section className="conversation-pane">{active && <><SessionPanel bundle={bundle} reopening={reopening} onReopen={reopen} onBundle={applyBundle} onError={onError} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
     <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) dragging.current = true; }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
-    <section className="queue-pane">{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} disabled={closed} runnable={runnable} onChanged={() => void load()} onError={onError} />}<TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} onBundle={applyBundle} onChanged={load} onError={onError} /></section>
+    <section className="queue-pane">{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={() => void load()} onError={onError} />}<TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} terminalPreference={terminalPreference} projectionSupported={projectionSupported} onTerminalPreferenceChange={onTerminalPreferenceChange} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
   </div></div>;
 }
 
@@ -804,12 +890,12 @@ function SessionPanel({ bundle, reopening, onReopen, onBundle, onError }: { bund
   </div>;
 }
 
-function AnswerHistory({ answers, emptyKey }: { answers: AnswerRecord[]; emptyKey: "answers.empty" | "answers.shellEmpty" }) {
+function AnswerHistory({ answers, total, hasEarlier, onLoadEarlier, emptyKey }: { answers: AnswerRecord[]; total: number; hasEarlier: boolean; onLoadEarlier: () => Promise<number>; emptyKey: "answers.empty" | "answers.shellEmpty" }) {
   const i18n = useI18n();
   const { t } = i18n;
   const contentKey = answers.map((answer) => `${answer.id}:${answer.status}:${answer.completedAt ?? ""}:${answer.finalAnswer.length}`).join("|");
-  const { onScroll, scrollRef, visibleItems } = useTailWindow(answers, contentKey, 12);
-  return <div className="answers"><div className="answers-heading"><span>{t("answers.title")}</span><em>{answers.length}</em></div><div className="answer-scroll" ref={scrollRef} onScroll={onScroll}>{answers.length === 0 ? <div className="empty-answers">{t(emptyKey)}</div> : <div className="answer-list">{visibleItems.map((answer) => {
+  const { onScroll, scrollRef, visibleItems } = useTailWindow(answers, contentKey, 12, hasEarlier, onLoadEarlier);
+  return <div className="answers"><div className="answers-heading"><span>{t("answers.title")}</span><em>{total}</em></div><div className="answer-scroll" ref={scrollRef} onScroll={onScroll}>{answers.length === 0 ? <div className="empty-answers">{t(emptyKey)}</div> : <div className="answer-list">{visibleItems.map((answer) => {
     const statusLabel = t(answer.status === "running" ? "answers.running" : answer.status === "completed" ? "answers.completed" : answer.status === "interrupted" ? "answers.interrupted" : "answers.failed");
     // A turn can end without a clean final answer (interrupted mid-stream, or
     // Claude's transcript never reaching end_turn) yet still carry the last
@@ -832,7 +918,7 @@ function AnswerHistory({ answers, emptyKey }: { answers: AnswerRecord[]; emptyKe
   })}</div>}</div></div>;
 }
 
-function PromptQueue({ bundle, disabled, runnable, onChanged, onError }: { bundle: TabBundle; disabled: boolean; runnable: boolean; onChanged: () => void; onError: (error: unknown) => void }) {
+function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runnable, onChanged, onError }: { bundle: TabBundle; total: number; hasEarlier: boolean; onLoadEarlier: () => Promise<number>; disabled: boolean; runnable: boolean; onChanged: () => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   // The composer holds unsaved work, so it is restored from this browser rather
@@ -853,7 +939,7 @@ function PromptQueue({ bundle, disabled, runnable, onChanged, onError }: { bundl
     || (!prompt.threadId && currentAnswerPromptIds.has(prompt.id))
     || (prompt.status === "pending" && !prompt.threadId));
   const promptContentKey = prompts.map((prompt) => prompt.id).join("|");
-  const { onScroll: onPromptScroll, scrollRef: promptWindow, startIndex: promptStartIndex, visibleItems: visiblePrompts } = useTailWindow(prompts, promptContentKey, 24);
+  const { onScroll: onPromptScroll, scrollRef: promptWindow, startIndex: promptStartIndex, visibleItems: visiblePrompts } = useTailWindow(prompts, promptContentKey, 24, hasEarlier, onLoadEarlier);
   const runtime = bundle.runtime;
   // Two different facts, and they come apart: the agent can be idle between
   // prompts while the queue is still set to keep feeding it, and the agent can
@@ -901,8 +987,8 @@ function PromptQueue({ bundle, disabled, runnable, onChanged, onError }: { bundl
   };
   const pendingIds = prompts.filter((item) => item.status === "pending").map((item) => item.id);
   const runnerState = runnerLabel(i18n, runtime);
-  const completedCount = prompts.filter((item) => item.status === "completed").length;
-  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{prompts.length}</span><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "running" ? "running" : runtime.runner.state === "error" ? "error" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "start"} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
+  const completedCount = bundle.window?.prompts.completed ?? prompts.filter((item) => item.status === "completed").length;
+  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "running" ? "running" : runtime.runner.state === "error" ? "error" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "start"} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
     <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t("queue.empty")}</div>}{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; const pendingIndex = pendingIds.indexOf(prompt.id); return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} canMoveUp={pendingIndex > 0} canMoveDown={pendingIndex >= 0 && pendingIndex < pendingIds.length - 1} onMove={(direction) => { const target = pendingIds[pendingIndex + direction]; if (target) void reorder(prompt.id, target); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}
@@ -953,7 +1039,7 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
   return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={Math.min(5, Math.max(1, text.split("\n").length))} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button>}{pendingStatus && <span className="move-buttons"><button aria-label={t("queue.moveUp")} title={t("queue.moveUp")} disabled={locked || insertingNow || !canMoveUp} onClick={() => onMove(-1)}>↑</button><button aria-label={t("queue.moveDown")} title={t("queue.moveDown")} disabled={locked || insertingNow || !canMoveDown} onClick={() => onMove(1)}>↓</button></span>}{pendingStatus && <button className="link-button insert-now-button" disabled={locked || insertingNow || editing} title={t("queue.insertNowHelp")} onClick={() => void insertNow()}>{t(insertingNow ? "queue.insertingNow" : "queue.insertNow")}</button>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
-function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBundle, onChanged, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; onBundle: (bundle: TabBundle) => void; onChanged: () => void; onError: (error: unknown) => void }) {
+function TerminalPanel({ tabId, provider, runtime, theme, active, closed, terminalPreference, projectionSupported, onTerminalPreferenceChange, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; terminalPreference: TerminalTransportPreference; projectionSupported: boolean; onTerminalPreferenceChange: (value: TerminalTransportPreference) => void; onBundle: (bundle: TabBundle) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   const host = useRef<HTMLDivElement>(null);
@@ -965,18 +1051,23 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBund
   const closedRef = useRef(closed);
   const themeRef = useRef(theme);
   const providerRef = useRef(provider);
-  const callbacks = useRef({ onBundle, onChanged, onError });
+  const callbacks = useRef({ onBundle, onMessage, onError });
   const [connected, setConnected] = useState(false);
   const [hasOutput, setHasOutput] = useState(false);
+  const transportMode: TerminalTransportMode = projectionSupported
+    ? resolveTerminalTransportPreference(terminalPreference, location.hostname)
+    : "raw";
   const runnerBusy = runtime.runner.desiredState === "running"
     || ["starting", "waiting_for_thread", "dispatching", "running", "waiting_for_prompt", "pausing"].includes(runtime.runner.state);
   closedRef.current = closed;
   activeRef.current = active;
   themeRef.current = theme;
   providerRef.current = provider;
-  callbacks.current = { onBundle, onChanged, onError };
+  callbacks.current = { onBundle, onMessage, onError };
   useEffect(() => {
     if (!host.current) return;
+    setConnected(false);
+    setHasOutput(false);
     let disposed = false;
     let reconnectTimer: number | null = null;
     let connectFrame: number | null = null;
@@ -988,16 +1079,23 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBund
     let terminalWriteQueue = Promise.resolve();
     let longTerminal = false;
     let connectedOnce = false;
+    const projectionMode = transportMode === "projection";
     const cursor: { generation: string | null; nextOffset: number | null } = { generation: null, nextOffset: null };
-    const initialSize = runtime.terminal.cols !== null && runtime.terminal.rows !== null
+    let projectionState: ProjectionScreenState | null = null;
+    let projectionRenderPending = 0;
+    let rawLeaseWritable = true;
+    const pendingProjectionInput: string[] = [];
+    const initialSize = !projectionMode && runtime.terminal.cols !== null && runtime.terminal.rows !== null
       ? { cols: runtime.terminal.cols, rows: runtime.terminal.rows }
       : null;
-    const term = new Terminal({ ...(initialSize ?? {}), cursorBlink: false, cursorStyle: "block", cursorInactiveStyle: "none", fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 14, lineHeight: 1.18, theme: getTerminalTheme(themeRef.current), scrollback: 5000, allowProposedApi: false });
+    const term = new Terminal({ ...(initialSize ?? (projectionMode ? { cols: 80, rows: 20 } : {})), cursorBlink: false, cursorStyle: "block", cursorInactiveStyle: "none", fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 14, lineHeight: 1.18, theme: getTerminalTheme(themeRef.current), scrollback: projectionMode ? 0 : 5000, allowProposedApi: false });
+    host.current.classList.toggle("projection", projectionMode);
     const fit = new FitAddon(); term.loadAddon(fit); term.open(host.current); term.blur(); terminal.current = term;
     const cursorQuietScheduler = new TerminalCursorQuietScheduler((suppressed) => {
       host.current?.classList.toggle("terminal-updating", suppressed);
     });
     const resizeScheduler = new TerminalResizeScheduler(({ cols, rows }) => {
+      if (projectionMode || !rawLeaseWritable) return;
       const ws = socket.current;
       if (ws?.readyState === WebSocket.OPEN) {
         if (longTerminal) {
@@ -1067,22 +1165,61 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBund
       }).catch(() => finishTerminalUpdate(sequence));
     };
     const protocol = location.protocol === "https:" ? "wss" : "ws";
-    const sendInput = (data: string) => {
+    const sendInputNow = (data: string) => {
       const ws = socket.current;
+      if (!projectionMode && !rawLeaseWritable) return;
       if (!closedRef.current && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "terminal.input", tabId, dataBase64: encodeBase64(data) }));
+    };
+    const flushProjectionInput = () => {
+      if (projectionRenderPending > 0 || pendingProjectionInput.length === 0) return;
+      for (const data of pendingProjectionInput.splice(0)) sendInputNow(data);
+    };
+    const sendInput = (data: string) => {
+      // A projection frame carries the input modes used to encode the next
+      // keystroke. Hold input for the few milliseconds in which xterm applies
+      // those controlled mode sequences, then forward it immediately.
+      if (projectionMode && projectionRenderPending > 0) {
+        pendingProjectionInput.push(data);
+        return;
+      }
+      sendInputNow(data);
+    };
+    const queueProjectionWrite = (state: ProjectionScreenState, sequence: number, epoch: number, reset: boolean) => {
+      projectionRenderPending += 1;
+      let settled = false;
+      const settleProjectionWrite = () => {
+        if (settled) return;
+        settled = true;
+        projectionRenderPending = Math.max(0, projectionRenderPending - 1);
+        finishTerminalUpdate(sequence);
+        flushProjectionInput();
+      };
+      terminalWriteQueue = terminalWriteQueue.then(async () => {
+        try {
+          if (disposed || epoch !== terminalWriteEpoch) return;
+          if (reset) term.reset();
+          if (term.cols !== state.cols || term.rows !== state.viewportRows) term.resize(state.cols, state.viewportRows);
+          await new Promise<void>((resolve) => term.write(projectionScreenToAnsi(state), resolve));
+          term.options.cursorBlink = false;
+        } finally {
+          settleProjectionWrite();
+        }
+      }).catch(() => {
+        settleProjectionWrite();
+      });
     };
     const inputDisposable = term.onData(sendInput);
     const foregroundQuery = term.parser.registerOscHandler(10, (data) => {
-      if (data.trim() === "?") sendInput(`\x1b]10;${themeRef.current === "light" ? "rgb:1d1d/2727/3838" : "rgb:e5e5/eded/f8f8"}\x1b\\`);
+      if (!projectionMode && data.trim() === "?") sendInput(`\x1b]10;${themeRef.current === "light" ? "rgb:1d1d/2727/3838" : "rgb:e5e5/eded/f8f8"}\x1b\\`);
       return true;
     });
     const backgroundQuery = term.parser.registerOscHandler(11, (data) => {
-      if (data.trim() === "?") sendInput(`\x1b]11;${themeRef.current === "light" ? "rgb:f8f8/fafa/fcfc" : "rgb:0f0f/1717/2222"}\x1b\\`);
+      if (!projectionMode && data.trim() === "?") sendInput(`\x1b]11;${themeRef.current === "light" ? "rgb:f8f8/fafa/fcfc" : "rgb:0f0f/1717/2222"}\x1b\\`);
       return true;
     });
     const colorSchemeQuery = term.parser.registerCsiHandler({ prefix: "?", final: "n" }, (params) => {
       if (params[0] !== 996) return false;
-      sendInput(themeRef.current === "light" ? "\x1b[?997;2n" : "\x1b[?997;1n");
+      if (!projectionMode) sendInput(themeRef.current === "light" ? "\x1b[?997;2n" : "\x1b[?997;1n");
       return true;
     });
     const cursorBlinkOn = term.parser.registerCsiHandler({ prefix: "?", final: "h" }, (params) => {
@@ -1097,7 +1234,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBund
     });
     const sendSize = () => {
       resizeFrame = null;
-      if (!activeRef.current) return;
+      if (!activeRef.current || projectionMode) return;
       try {
         const dimensions = fit.proposeDimensions();
         if (!dimensions) return;
@@ -1122,7 +1259,20 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBund
     const observer = new ResizeObserver(scheduleSize); observer.observe(host.current);
     const requestSync = () => {
       const ws = socket.current;
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "terminal.sync", tabId, cursor }));
+      if (ws?.readyState !== WebSocket.OPEN) return;
+      if (projectionMode) {
+        ws.send(JSON.stringify({
+          type: "terminal.screen.snapshot.request",
+          tabId,
+          generation: projectionState?.generation ?? null,
+          streamId: projectionState?.streamId ?? null,
+          revision: projectionState?.revision ?? null,
+          sizeEpoch: projectionState?.sizeEpoch ?? null,
+          viewportRows: 20,
+        }));
+      } else {
+        ws.send(JSON.stringify({ type: "terminal.sync", tabId, cursor }));
+      }
     };
     const handleOutput = (message: any) => {
       const generation = String(message.generation ?? "");
@@ -1166,6 +1316,20 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBund
         scheduleTerminalSettled(120);
       }
     };
+    const handleScreen = (message: TerminalScreenFrame) => {
+      const result = applyProjectionFrame(projectionState, message);
+      if (result.needsSnapshot) {
+        requestSync();
+        return;
+      }
+      if (!result.applied || !result.state) return;
+      const reset = message.full;
+      if (reset) terminalWriteEpoch += 1;
+      projectionState = result.state;
+      const sequence = beginTerminalUpdate();
+      setHasOutput(true);
+      queueProjectionWrite(result.state, sequence, terminalWriteEpoch, reset);
+    };
     const connect = () => {
       if (disposed || closedRef.current || !activeRef.current || socket.current?.readyState === WebSocket.OPEN || socket.current?.readyState === WebSocket.CONNECTING) return;
       const ws = new WebSocket(`${protocol}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ""}`);
@@ -1173,25 +1337,41 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBund
       ws.onopen = () => {
         if (disposed || closedRef.current || !activeRef.current) { ws.close(); return; }
         setConnected(true);
-        if (connectedOnce) resizeScheduler.invalidate();
+        const reconnecting = connectedOnce;
+        if (!projectionMode && reconnecting) resizeScheduler.invalidate();
         connectedOnce = true;
         // TabView already loaded its bundle over REST. This socket needs the
         // terminal cursor snapshot and live tab events, not a duplicate bundle.
-        ws.send(JSON.stringify({ type: "subscribe", tabIds: [tabId], snapshots: false, terminals: { [tabId]: { mode: "raw", ...cursor } } }));
-        scheduleSize();
+        const terminalSubscription = projectionMode
+          ? {
+            mode: "projection",
+            viewportRows: 20,
+            fps: 2,
+            generation: projectionState?.generation ?? null,
+            revision: projectionState?.revision ?? null,
+            sizeEpoch: projectionState?.sizeEpoch ?? null,
+          }
+          : { mode: "raw", ...cursor };
+        ws.send(JSON.stringify({ type: "subscribe", terminalProtocolVersion: 2, tabIds: [tabId], snapshots: reconnecting, details: true, terminals: { [tabId]: terminalSubscription } }));
+        if (!projectionMode) scheduleSize();
       };
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
-          if (message.type === "terminal.output") handleOutput(message);
+          if (!projectionMode && message.type === "terminal.output") handleOutput(message);
+          else if (projectionMode && message.type === "terminal.screen") handleScreen(message as TerminalScreenFrame);
+          else if (!projectionMode && message.type === "terminal.lease" && message.tabId === tabId) rawLeaseWritable = message.writable === true;
           else if (message.type === "snapshot" && message.data) callbacks.current.onBundle(message.data as TabBundle);
-          else if (["runner.changed", "answer.added", "answer.changed", "terminal.state", "service.changed"].includes(message.type)) {
-            callbacks.current.onChanged();
+          else if (["runner.changed", "runtime.changed", "prompts.changed", "answers.changed", "answer.added", "answer.changed", "tab.changed", "terminal.state"].includes(message.type)) {
+            callbacks.current.onMessage(message);
             if (message.type === "terminal.state") {
-              if (message.state === "starting" || message.state === "running") resizeScheduler.invalidate();
-              scheduleSize();
+              if (!projectionMode && (message.state === "starting" || message.state === "running")) resizeScheduler.invalidate();
+              if (!projectionMode) scheduleSize();
             }
-          } else if (message.type === "error" && message.error) callbacks.current.onError(message.error);
+          } else if (message.type === "error" && message.error) {
+            if (projectionMode && String(message.error.code ?? "").startsWith("TERMINAL_PROJECTION")) onTerminalPreferenceChange("raw");
+            callbacks.current.onError(message.error);
+          }
         } catch { /* ignore malformed terminal frames */ }
       };
       ws.onerror = () => { if (!closedRef.current && activeRef.current) callbacks.current.onError({ code: "TERMINAL_WEBSOCKET_FAILED", message: "Terminal WebSocket connection failed" }); };
@@ -1233,7 +1413,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBund
       inputDisposable.dispose(); foregroundQuery.dispose(); backgroundQuery.dispose(); colorSchemeQuery.dispose(); cursorBlinkOn.dispose(); cursorBlinkOff.dispose();
       socket.current?.close(); term.dispose(); terminal.current = null; socket.current = null;
     };
-  }, [tabId]);
+  }, [tabId, transportMode]);
   useEffect(() => {
     if (!active) {
       socket.current?.close();
@@ -1263,7 +1443,25 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, onBund
   }, [closed]);
   const placeholder = t(runtime.terminal.state === "stopped" ? "terminal.notStarted" : runtime.terminal.state === "starting" ? "terminal.startingHelp" : runtime.terminal.state === "running" ? "terminal.runningHelp" : runtime.terminal.state === "error" ? "terminal.failedHelp" : "terminal.exitedHelp");
   const terminalProvider = provider === "claude" ? t("provider.claude") : provider === "cursor" ? t("provider.cursor") : provider === "shell" ? t("provider.shell") : t("provider.codex");
-  return <div className={`terminal-card ${closed ? "locked" : ""} ${runnerBusy ? "runner-busy" : ""}`}><div className="terminal-heading"><span><i className={`status-dot ${runtime.terminal.state === "running" ? "running" : runtime.terminal.state === "error" ? "error" : ""}`} />PowerShell / {terminalProvider}</span><span className="terminal-meta"><i className={`connection-dot ${connected ? "connected" : ""}`} />{t(closed ? "terminal.inputDisabled" : connected ? "terminal.inputConnected" : "terminal.inputConnecting")}<b>{closed ? t("terminal.closed") : terminalStateLabel(i18n, runtime.terminal.state)}</b></span></div>{runtime.terminal.lastError && <div className="terminal-error">{i18n.errorText(runtime.terminal.lastError)}</div>}<div className={`terminal-body ${theme} ${closed ? "locked" : ""}`} onMouseDown={() => { if (!closed) terminal.current?.focus(); }}><div className="terminal-host" ref={host} /><div className="terminal-settling-overlay" role="status"><span className="terminal-settling-spinner" />{t("terminal.settling")}</div>{!hasOutput && <div className="terminal-placeholder">{closed ? t("terminal.closedPlaceholder") : placeholder}</div>}</div></div>;
+  return <div className={`terminal-card ${closed ? "locked" : ""} ${runnerBusy ? "runner-busy" : ""}`}>
+    <div className="terminal-heading">
+      <span><i className={`status-dot ${runtime.terminal.state === "running" ? "running" : runtime.terminal.state === "error" ? "error" : ""}`} />PowerShell / {terminalProvider}</span>
+      <span className="terminal-meta">
+        <label className="terminal-mode-control" title={t("terminal.transportHelp")}>
+          <span className="sr-only">{t("terminal.transport")}</span>
+          <select aria-label={t("terminal.transport")} value={terminalPreference} onChange={(event) => onTerminalPreferenceChange(event.currentTarget.value as TerminalTransportPreference)}>
+            <option value="auto">{t("terminal.transportAuto")}</option>
+            <option value="projection" disabled={!projectionSupported}>{t("terminal.transportProjection")}</option>
+            <option value="raw">{t("terminal.transportRaw")}</option>
+          </select>
+        </label>
+        <span className={`terminal-mode-badge ${transportMode}`}>{t(transportMode === "projection" ? "terminal.modeProjection" : "terminal.modeRaw")}</span>
+        <i className={`connection-dot ${connected ? "connected" : ""}`} />{t(closed ? "terminal.inputDisabled" : connected ? "terminal.inputConnected" : "terminal.inputConnecting")}<b>{closed ? t("terminal.closed") : terminalStateLabel(i18n, runtime.terminal.state)}</b>
+      </span>
+    </div>
+    {runtime.terminal.lastError && <div className="terminal-error">{i18n.errorText(runtime.terminal.lastError)}</div>}
+    <div className={`terminal-body ${theme} ${transportMode} ${closed ? "locked" : ""}`} onMouseDown={() => { if (!closed) terminal.current?.focus(); }}><div className="terminal-host" ref={host} /><div className="terminal-settling-overlay" role="status"><span className="terminal-settling-spinner" />{t("terminal.settling")}</div>{!hasOutput && <div className="terminal-placeholder">{closed ? t("terminal.closedPlaceholder") : placeholder}</div>}</div>
+  </div>;
 }
 
 function getTerminalTheme(theme: "light" | "dark") {

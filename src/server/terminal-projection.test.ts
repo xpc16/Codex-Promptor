@@ -98,6 +98,41 @@ describe("TerminalProjectionScheduler", () => {
     expect(sent[1].rows[0].runs[0].text).toBe("latest");
     scheduler.close();
   });
+
+  it("defers screen candidates when the token bucket is empty and then sends the latest state", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-26T00:00:00.000Z"));
+    let current = snapshot(["initial"]);
+    const sent: any[] = [];
+    const dropped: string[] = [];
+    const scheduler = new TerminalProjectionScheduler(async () => current, {
+      ...defaultProjectionSchedulerConfig,
+      defaultFps: 5,
+      bytesPerSecond: 256,
+      maxBurstBytes: 128,
+    });
+    scheduler.subscribe("budget", "tab", { fps: 5 }, {
+      isOpen: () => true,
+      bufferedAmount: () => 0,
+      send: (payload) => { sent.push(JSON.parse(payload)); return "sent"; },
+      dropped: (reason) => dropped.push(reason),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toHaveLength(1);
+
+    current = snapshot(["intermediate"], { revision: 2 });
+    scheduler.markDirty("tab");
+    await vi.advanceTimersByTimeAsync(200);
+    expect(sent).toHaveLength(1);
+    expect(dropped).toContain("budget");
+
+    current = snapshot(["latest"], { revision: 3 });
+    scheduler.markDirty("tab");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sent.at(-1)).toMatchObject({ sequence: 2, revision: 3 });
+    expect(sent.at(-1).rows[0].runs[0].text).toBe("latest");
+    scheduler.close();
+  });
 });
 
 function snapshot(
@@ -135,4 +170,3 @@ function screenRow(row: number, text: string): TerminalScreenSnapshotRow {
   };
   return { ...wire, hash: JSON.stringify([false, wire.runs]) };
 }
-

@@ -85,10 +85,14 @@ describe("terminal transport validation", () => {
       CODEX_PROMPTOR_WS_HIGH_WATER_BYTES: "1",
       CODEX_PROMPTOR_RAW_BATCH_IDLE_MS: "75",
       CODEX_PROMPTOR_MAX_INPUT_BYTES: "131072",
+      CODEX_PROMPTOR_PROJECTION_BYTES_PER_SECOND: "4096",
+      CODEX_PROMPTOR_PROJECTION_MAX_BURST_BYTES: "16384",
     });
     expect(config.websocketHighWaterBytes).toBe(16 * 1024);
     expect(config.rawBatchIdleMs).toBe(75);
     expect(config.maxInputMessageBytes).toBe(128 * 1024);
+    expect(config.projectionBytesPerSecond).toBe(4 * 1024);
+    expect(config.projectionMaxBurstBytes).toBe(16 * 1024);
   });
 });
 
