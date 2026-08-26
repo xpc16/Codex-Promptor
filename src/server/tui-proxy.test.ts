@@ -9,25 +9,29 @@ describe("Codex TUI loopback proxy", () => {
     const address = upstream.address();
     if (!address || typeof address === "string") throw new Error("upstream address missing");
     const onSelection = vi.fn();
+    const onContextCompacted = vi.fn();
     upstream.on("connection", (socket) => socket.on("message", (raw) => {
       const request = JSON.parse(raw.toString());
       socket.send(JSON.stringify({ id: request.id, result: { thread: { id: request.params.threadId, cwd: request.params.cwd } } }));
+      socket.send(JSON.stringify({ method: "item/completed", params: { threadId: request.params.threadId, turnId: "turn-compact", item: { type: "contextCompaction", id: "compact-1" } } }));
     }));
 
     const pool = new TuiProxyPool();
-    const proxyUrl = await pool.start("tab-1", `ws://127.0.0.1:${address.port}`, { onThreadSelection: onSelection, onError: vi.fn() });
+    const proxyUrl = await pool.start("tab-1", `ws://127.0.0.1:${address.port}`, { onThreadSelection: onSelection, onContextCompacted, onError: vi.fn() });
     expect(proxyUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/);
     const client = new WebSocket(proxyUrl);
     try {
       await opened(client);
       client.send(JSON.stringify({ id: 1, method: "thread/resume", params: { threadId: "thread-b", cwd: "D:\\live" } }));
       await eventually(() => onSelection.mock.calls.length === 1);
+      await eventually(() => onContextCompacted.mock.calls.length === 1);
       expect(onSelection).toHaveBeenCalledWith(expect.objectContaining({
         method: "thread/resume",
         requestedThreadId: "thread-b",
         requestedCwd: "D:\\live",
         thread: expect.objectContaining({ id: "thread-b" }),
       }));
+      expect(onContextCompacted).toHaveBeenCalledWith({ threadId: "thread-b", turnId: "turn-compact" });
     } finally {
       client.close();
       await pool.stopAll();

@@ -2,9 +2,21 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { isoNow } from "../shared/schemas.js";
-import { isTrustedBrowserOrigin, isTrustedBrowserRequest, recordOpenSessionsForNextLaunch, recoverTerminalRuntime, tabsToRestore } from "./app.js";
+import { isoNow, newAttempt, newPrompt } from "../shared/schemas.js";
+import { answerEventType, isLocalHost, isTrustedBrowserOrigin, isTrustedBrowserRequest, isValidResumeId, recordOpenSessionsForNextLaunch, recoverTerminalRuntime, tabsToRestore } from "./app.js";
 import { StorageService } from "./storage.js";
+
+describe("provider resume id validation", () => {
+  it("keeps UUID sessions for Codex and Claude while accepting Cursor chat IDs", () => {
+    const uuid = "01a02a16-5acd-7623-a916-91e8fddcab0f";
+    expect(isValidResumeId("codex", uuid)).toBe(true);
+    expect(isValidResumeId("claude", uuid)).toBe(true);
+    expect(isValidResumeId("codex", "project-chat-name")).toBe(false);
+    expect(isValidResumeId("cursor", "project-chat-name")).toBe(true);
+    expect(isValidResumeId("cursor", "chat\nname")).toBe(false);
+    expect(isValidResumeId("cursor", "")).toBe(false);
+  });
+});
 
 describe("runtime recovery", () => {
   it("clears terminal states that cannot survive a service restart", async () => {
@@ -39,8 +51,24 @@ describe("runtime recovery", () => {
         session: { ...current.session, state: "ready", reopenOnLaunch: true, workingDirectory: root, threadId: "thread-1", sessionId: "thread-1", connectedAt: isoNow() },
       }));
       const bundle = await storage.readTab(tab.id);
+      const prompt = newPrompt("重启前正在执行");
+      const attempt = newAttempt();
+      const startedAt = isoNow();
+      prompt.status = "running";
+      prompt.threadId = "thread-1";
+      prompt.codexTurnId = "turn-1";
+      prompt.clientUserMessageId = "client-1";
+      prompt.startedAt = startedAt;
+      attempt.status = "running";
+      attempt.startedAt = startedAt;
+      attempt.codexTurnId = "turn-1";
+      attempt.clientUserMessageId = "client-1";
+      prompt.attempts.push(attempt);
+      bundle.prompts.prompts.push(prompt);
+      await storage.writePrompts(tab.id, bundle.prompts);
       bundle.runtime.runner.desiredState = "running";
       bundle.runtime.runner.state = "running";
+      bundle.runtime.runner.activePromptId = prompt.id;
       bundle.runtime.runner.activeTurnId = "turn-1";
       await storage.writeRuntime(tab.id, bundle.runtime);
 
@@ -49,6 +77,44 @@ describe("runtime recovery", () => {
       expect(recovered.tab.session.state).toBe("closed");
       expect(recovered.tab.session.reopenOnLaunch).toBe(true);
       expect(recovered.runtime.runner).toMatchObject({ desiredState: "paused", state: "paused", activeTurnId: null, activePromptId: null });
+      expect(recovered.prompts.prompts[0]).toMatchObject({ status: "interrupted", error: { code: "SERVICE_RESTARTED" } });
+      expect(recovered.prompts.prompts[0].completedAt).not.toBeNull();
+      expect(recovered.prompts.prompts[0].attempts[0]).toMatchObject({ status: "interrupted", error: { code: "SERVICE_RESTARTED" } });
+      expect(recovered.prompts.prompts[0].attempts[0].completedAt).not.toBeNull();
+      expect(recovered.answers.answers).toHaveLength(1);
+      expect(recovered.answers.answers[0]).toMatchObject({
+        promptId: prompt.id,
+        threadId: "thread-1",
+        codexTurnId: "turn-1",
+        status: "interrupted",
+        finalAnswer: "",
+        startedAt,
+        error: { code: "SERVICE_RESTARTED" },
+      });
+      expect(recovered.answers.answers[0].completedAt).not.toBeNull();
+      expect(await recoverTerminalRuntime(storage)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("repairs an orphaned running prompt even when runtime and session are already paused", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-prompt-recovery-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      const tab = await storage.createTab("孤立运行记录");
+      const bundle = await storage.readTab(tab.id);
+      const prompt = newPrompt("没有存活运行器的 prompt");
+      prompt.status = "dispatching";
+      bundle.prompts.prompts.push(prompt);
+      await storage.writePrompts(tab.id, bundle.prompts);
+
+      expect(await recoverTerminalRuntime(storage)).toBe(1);
+      expect((await storage.readTab(tab.id)).prompts.prompts[0]).toMatchObject({
+        status: "interrupted",
+        error: { code: "SERVICE_RESTARTED" },
+      });
       expect(await recoverTerminalRuntime(storage)).toBe(0);
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -106,6 +172,15 @@ describe("runtime recovery", () => {
   });
 });
 
+describe("answer WebSocket events", () => {
+  it("reserves the audible event for completed answers", () => {
+    expect(answerEventType({ status: "running" })).toBe("answer.changed");
+    expect(answerEventType({ status: "interrupted" })).toBe("answer.changed");
+    expect(answerEventType({ status: "failed" })).toBe("answer.changed");
+    expect(answerEventType({ status: "completed" })).toBe("answer.added");
+  });
+});
+
 describe("launch restoration state", () => {
   it("restores marked tabs, supports legacy ready tabs, and records the final open set", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-open-state-"));
@@ -148,5 +223,24 @@ describe("local browser origin", () => {
     expect(isTrustedBrowserOrigin(undefined, "127.0.0.1:4317")).toBe(false);
     expect(isTrustedBrowserRequest({ referer: "http://127.0.0.1:4317/", host: "127.0.0.1:4317" })).toBe(true);
     expect(isTrustedBrowserRequest({ referer: "http://example.com/", host: "127.0.0.1:4317" })).toBe(false);
+  });
+
+  it("also trusts an operator-configured host (e.g. a Cloudflare Tunnel hostname) but never by default", () => {
+    const trustedHosts = ["promptor.example.com"];
+    expect(isTrustedBrowserOrigin("https://promptor.example.com", "promptor.example.com", trustedHosts)).toBe(true);
+    // Without the allowlist, a non-loopback host is rejected exactly as before.
+    expect(isTrustedBrowserOrigin("https://promptor.example.com", "promptor.example.com")).toBe(false);
+    // The allowlist does not weaken the same-origin check itself.
+    expect(isTrustedBrowserOrigin("https://evil.example.com", "promptor.example.com", trustedHosts)).toBe(false);
+    expect(isTrustedBrowserOrigin("https://promptor.example.com", "other.example.com", trustedHosts)).toBe(false);
+    expect(isTrustedBrowserRequest({ origin: "https://promptor.example.com", host: "promptor.example.com" }, trustedHosts)).toBe(true);
+  });
+
+  it("isLocalHost only accepts 127.0.0.1/localhost, with or without a port", () => {
+    expect(isLocalHost("127.0.0.1")).toBe(true);
+    expect(isLocalHost("127.0.0.1:4317")).toBe(true);
+    expect(isLocalHost("localhost:4317")).toBe(true);
+    expect(isLocalHost("promptor.example.com")).toBe(false);
+    expect(isLocalHost(undefined)).toBe(false);
   });
 });

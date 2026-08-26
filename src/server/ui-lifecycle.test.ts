@@ -4,6 +4,20 @@ import { UiLifecycle } from "./ui-lifecycle.js";
 describe("UI lifecycle", () => {
   afterEach(() => vi.useRealTimers());
 
+  it("uses a 30 second default grace period", () => {
+    vi.useFakeTimers();
+    const lifecycle = new UiLifecycle();
+    const idle = vi.fn();
+    lifecycle.on("idle", idle);
+
+    lifecycle.connect();
+    lifecycle.disconnect();
+    vi.advanceTimersByTime(29_999);
+    expect(idle).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(idle).toHaveBeenCalledOnce();
+  });
+
   it("emits idle after the last connected page closes", () => {
     vi.useFakeTimers();
     const lifecycle = new UiLifecycle(5_000);

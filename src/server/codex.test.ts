@@ -21,7 +21,7 @@ describe("remote TUI attach", () => {
 });
 
 describe("turn completion recovery", () => {
-  it("polls thread history when the controller misses the completion notification", async () => {
+  it("polls a lightweight summary and reads history once after the thread settles", async () => {
     const rpc = new CodexRpcClient();
     (rpc as any).turns.set("turn-polled", {
       threadId: "thread-polled",
@@ -30,6 +30,9 @@ describe("turn completion recovery", () => {
       items: [],
       startedAt: null,
     });
+    rpc.readThreadSummary = vi.fn()
+      .mockResolvedValueOnce({ thread: { id: "thread-polled", status: { type: "active" }, updatedAt: "2026-08-25T00:00:00Z" } })
+      .mockResolvedValueOnce({ thread: { id: "thread-polled", status: { type: "idle" }, updatedAt: "2026-08-25T00:01:00Z" } });
     rpc.readThread = vi.fn().mockResolvedValue({
       thread: {
         id: "thread-polled",
@@ -46,17 +49,79 @@ describe("turn completion recovery", () => {
       turnId: "turn-polled",
       turn: { status: "completed" },
     });
+    expect(rpc.readThreadSummary).toHaveBeenCalledTimes(2);
     expect(rpc.readThread).toHaveBeenCalledWith("thread-polled", expect.any(Number));
+    expect(rpc.readThread).toHaveBeenCalledTimes(1);
   });
 
-  it("clears a stale active-thread marker from an idle thread snapshot", async () => {
+  it("does not repeatedly read full history while the settled summary is unchanged", async () => {
+    const rpc = new CodexRpcClient();
+    (rpc as any).turns.set("turn-stable", {
+      threadId: "thread-stable",
+      turnId: "turn-stable",
+      turn: { id: "turn-stable", status: "inProgress" },
+      items: [],
+      startedAt: null,
+    });
+    let summaryReads = 0;
+    rpc.readThreadSummary = vi.fn().mockImplementation(async () => {
+      summaryReads += 1;
+      if (summaryReads === 3) {
+        (rpc as any).handleNotification("turn/completed", {
+          threadId: "thread-stable",
+          turn: { id: "turn-stable", status: "completed", items: [] },
+        });
+      }
+      return { thread: { id: "thread-stable", status: { type: "idle" }, updatedAt: "stable" } };
+    });
+    rpc.readThread = vi.fn().mockResolvedValue({
+      thread: { id: "thread-stable", turns: [{ id: "turn-stable", status: "inProgress", items: [] }] },
+    });
+
+    await expect(rpc.waitForTurn("turn-stable", 1_000, 0)).resolves.toMatchObject({ turnId: "turn-stable" });
+    expect(rpc.readThreadSummary).toHaveBeenCalledTimes(3);
+    expect(rpc.readThread).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears a stale active-thread marker from an idle thread summary", async () => {
     const rpc = new CodexRpcClient();
     (rpc as any).activeThreads.add("thread-idle");
-    rpc.readThread = vi.fn().mockResolvedValue({ thread: { id: "thread-idle", status: { type: "idle" }, turns: [] } });
+    rpc.readThreadSummary = vi.fn().mockResolvedValue({ thread: { id: "thread-idle", status: { type: "idle" } } });
+    rpc.readThread = vi.fn();
 
     await expect(rpc.waitForThreadIdle("thread-idle", 1_000, 0)).resolves.toBeUndefined();
     expect(rpc.activeTurnIds("thread-idle")).toEqual([]);
-    expect(rpc.readThread).toHaveBeenCalledWith("thread-idle", expect.any(Number));
+    expect(rpc.readThreadSummary).toHaveBeenCalledWith("thread-idle", expect.any(Number));
+    expect(rpc.readThread).not.toHaveBeenCalled();
+  });
+});
+
+describe("context compaction notifications", () => {
+  it("surfaces both current item events and the legacy thread event", () => {
+    const rpc = new CodexRpcClient();
+    const compacted = vi.fn();
+    rpc.on("threadCompacted", compacted);
+
+    (rpc as any).handleNotification("item/completed", {
+      threadId: "thread-compact",
+      turnId: "turn-compact",
+      item: { id: "item-compact", type: "contextCompaction" },
+    });
+    (rpc as any).handleNotification("thread/compacted", {
+      threadId: "thread-compact",
+      turnId: "turn-compact",
+    });
+
+    expect(compacted).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      threadId: "thread-compact",
+      turnId: "turn-compact",
+      item: { id: "item-compact", type: "contextCompaction" },
+    }));
+    expect(compacted).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      threadId: "thread-compact",
+      turnId: "turn-compact",
+      item: null,
+    }));
   });
 });
 

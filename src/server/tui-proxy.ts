@@ -4,6 +4,7 @@ import { TuiThreadRequestTracker, type TuiThreadSelection } from "./tui-protocol
 
 export type TuiProxyCallbacks = {
   onThreadSelection: (selection: TuiThreadSelection) => Promise<void> | void;
+  onContextCompacted?: (event: { threadId: string; turnId: string }) => Promise<void> | void;
   onError: (error: Error) => void;
 };
 
@@ -98,8 +99,11 @@ export function bridgeCodexRemote(downstream: WebSocket, upstreamUrl: string, ca
     const frame = rawDataBuffer(data);
     if (downstream.readyState === WebSocket.OPEN) downstream.send(frame, { binary: isBinary });
     if (isBinary) return;
-    const selection = tracker.observeServerMessage(frame.toString("utf8"));
+    const raw = frame.toString("utf8");
+    const selection = tracker.observeServerMessage(raw);
     if (selection) Promise.resolve(callbacks.onThreadSelection(selection)).catch(reportError);
+    const compacted = contextCompactionFromServerMessage(raw);
+    if (compacted && callbacks.onContextCompacted) Promise.resolve(callbacks.onContextCompacted(compacted)).catch(reportError);
   });
   upstream.on("error", (error) => {
     if (!closing) reportError(error);
@@ -111,6 +115,26 @@ export function bridgeCodexRemote(downstream: WebSocket, upstreamUrl: string, ca
   });
   upstream.on("close", (code, reason) => closeBoth(normalizeWebSocketCloseCode(code), reason.toString() || "Codex App Server closed"));
   downstream.on("close", (code, reason) => closeBoth(normalizeWebSocketCloseCode(code), reason.toString() || "Codex TUI closed"));
+}
+
+export function contextCompactionFromServerMessage(raw: string): { threadId: string; turnId: string } | null {
+  try {
+    const message = JSON.parse(raw);
+    if (!message || typeof message !== "object" || Array.isArray(message)) return null;
+    if (message.method === "thread/compacted") {
+      const threadId = String(message.params?.threadId ?? "");
+      return threadId ? { threadId, turnId: String(message.params?.turnId ?? "") } : null;
+    }
+    if (message.method !== "item/completed") return null;
+    const item = message.params?.item ?? message.params;
+    const itemType = String(item?.type ?? "").replace(/[_-]/g, "").toLowerCase();
+    const threadId = String(message.params?.threadId ?? item?.threadId ?? "");
+    return itemType === "contextcompaction" && threadId
+      ? { threadId, turnId: String(message.params?.turnId ?? item?.turnId ?? "") }
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

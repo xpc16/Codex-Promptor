@@ -78,6 +78,7 @@ export class StorageService {
   readonly backupsDir: string;
   readonly trashDir: string;
   readonly mutex = new KeyedMutex();
+  private readonly indexListeners = new Set<(index: IndexFile) => void>();
 
   constructor(rootDir: string) {
     this.rootDir = path.resolve(rootDir);
@@ -129,8 +130,25 @@ export class StorageService {
     return this.readFile(this.indexPath(), (value) => IndexFileSchema.parse(value));
   }
 
+  /**
+   * Every index write funnels through writeIndex, so a listener here sees all
+   * navigation changes — renames, deletions, group moves, reordering, session
+   * state — no matter which route made them. Registering per-route would go
+   * stale the moment someone adds another one.
+   */
+  onIndexChanged(listener: (index: IndexFile) => void): () => void {
+    this.indexListeners.add(listener);
+    return () => { this.indexListeners.delete(listener); };
+  }
+
   async writeIndex(index: IndexFile): Promise<void> {
-    await this.writeFile(this.indexPath(), IndexFileSchema.parse(index));
+    const value = IndexFileSchema.parse(index);
+    await this.writeFile(this.indexPath(), value);
+    for (const listener of this.indexListeners) {
+      // The write already landed; a listener that throws must not turn a
+      // successful save into a failed request.
+      try { listener(value); } catch { /* notification is best-effort */ }
+    }
   }
 
   async updateIndex(mutator: (index: IndexFile) => IndexFile | Promise<IndexFile>): Promise<IndexFile> {

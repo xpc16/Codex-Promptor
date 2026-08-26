@@ -3,6 +3,11 @@ import { z } from "zod";
 export const isoNow = () => new Date().toISOString();
 const makeId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
+// "shell" is a conversation with no coding agent at all: just a PowerShell in
+// a working directory. Turns, final answers and history do not apply to it.
+export const AgentProviderSchema = z.enum(["codex", "claude", "cursor", "shell"]);
+export type AgentProvider = z.infer<typeof AgentProviderSchema>;
+
 export const OriginSchema = z.enum(["queue", "manual", "imported"]);
 export type Origin = z.infer<typeof OriginSchema>;
 
@@ -20,6 +25,7 @@ export type PromptStatus = z.infer<typeof PromptStatusSchema>;
 export const AttemptSchema = z.object({
   attemptId: z.string(),
   origin: OriginSchema,
+  delivery: z.enum(["turn", "steer"]).default("turn"),
   startedAt: z.string().nullable(),
   completedAt: z.string().nullable(),
   status: PromptStatusSchema,
@@ -55,6 +61,9 @@ export const PromptFileSchema = z.object({
 });
 export type PromptFile = z.infer<typeof PromptFileSchema>;
 
+export const AnswerStatusSchema = z.enum(["running", "completed", "interrupted", "failed"]);
+export type AnswerStatus = z.infer<typeof AnswerStatusSchema>;
+
 export const AnswerSchema = z.object({
   id: z.string(),
   promptId: z.string(),
@@ -62,12 +71,14 @@ export const AnswerSchema = z.object({
   codexTurnId: z.string(),
   origin: OriginSchema,
   prompt: z.string(),
-  finalAnswer: z.string(),
-  captureMode: z.enum(["phase_final_answer", "fallback_last_agent_message", "fallback_plan", "manual_text"]),
+  status: AnswerStatusSchema.default("completed"),
+  finalAnswer: z.string().default(""),
+  captureMode: z.enum(["phase_final_answer", "fallback_last_agent_message", "fallback_plan", "fallback_partial_answer", "manual_text"]).nullable().default(null),
   startedAt: z.string().nullable(),
   completedAt: z.string().nullable(),
   recordedAt: z.string(),
   clientUserMessageId: z.string().nullable(),
+  error: z.object({ code: z.string(), message: z.string() }).nullable().default(null),
   metadata: z.record(z.string(), z.unknown()).default({}),
 });
 export type AnswerRecord = z.infer<typeof AnswerSchema>;
@@ -81,6 +92,9 @@ export const AnswerFileSchema = z.object({
 export type AnswerFile = z.infer<typeof AnswerFileSchema>;
 
 export const SessionSchema = z.object({
+  // Existing v1 tabs did not persist a provider and are Codex conversations.
+  // The default keeps those files readable without a destructive migration.
+  provider: AgentProviderSchema.default("codex"),
   state: z.enum(["unconfigured", "connecting", "ready", "closed", "error"]),
   reopenOnLaunch: z.boolean().default(false),
   workingDirectory: z.string().nullable(),
@@ -92,7 +106,7 @@ export const SessionSchema = z.object({
   lastThreadSwitch: z.object({
     fromThreadId: z.string(),
     toThreadId: z.string(),
-    method: z.enum(["thread/start", "thread/resume", "thread/fork"]),
+    method: z.enum(["thread/start", "thread/resume", "thread/fork", "session/start"]),
     switchedAt: z.string(),
   }).nullable().default(null),
 });
@@ -154,7 +168,9 @@ export const RuntimeFileSchema = z.object({
     lastStartedAt: z.string().nullable().default(null),
     lastError: z.object({ code: z.string(), message: z.string() }).nullable().default(null),
     appServer: AppServerOwnershipSchema.nullable().default(null),
-  }).default({ state: "stopped", lastExitCode: null, lastStartedAt: null, lastError: null, appServer: null }),
+    cols: z.number().int().min(20).max(500).nullable().default(null),
+    rows: z.number().int().min(5).max(200).nullable().default(null),
+  }).default({ state: "stopped", lastExitCode: null, lastStartedAt: null, lastError: null, appServer: null, cols: null, rows: null }),
   reconciliation: z.object({
     required: z.boolean().default(false),
     lastCompletedAt: z.string().nullable().default(null),
@@ -196,6 +212,7 @@ export type TabBundle = {
 };
 
 export const defaultSession = (): Session => ({
+  provider: "codex",
   state: "unconfigured",
   reopenOnLaunch: false,
   workingDirectory: null,
@@ -218,7 +235,7 @@ export const defaultRuntime = (): RuntimeFile => RuntimeFileSchema.parse({
     lastError: null,
     lastTransitionAt: isoNow(),
   },
-  terminal: { state: "stopped", lastExitCode: null, lastStartedAt: null, lastError: null, appServer: null },
+  terminal: { state: "stopped", lastExitCode: null, lastStartedAt: null, lastError: null, appServer: null, cols: null, rows: null },
   reconciliation: { required: false, lastCompletedAt: null },
 });
 
@@ -256,6 +273,7 @@ export const newPrompt = (text: string, origin: Origin = "queue"): PromptRecord 
 export const newAttempt = (origin: Origin = "queue"): PromptAttempt => ({
   attemptId: makeId(),
   origin,
+  delivery: "turn",
   startedAt: null,
   completedAt: null,
   status: "pending",

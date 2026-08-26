@@ -185,6 +185,15 @@ describe("queue pause boundary", () => {
 
       await runner.start();
       await firstStarted;
+      await waitUntil(async () => (await storage.readTab(tab.id)).answers.answers.length === 1);
+      const activeAnswer = (await storage.readTab(tab.id)).answers.answers[0];
+      expect(activeAnswer).toMatchObject({
+        prompt: "第一条",
+        status: "running",
+        finalAnswer: "",
+        completedAt: null,
+      });
+      expect(activeAnswer.startedAt).not.toBeNull();
       await storage.withTabLock(tab.id, async () => {
         const during = await storage.readTab(tab.id);
         during.prompts.prompts.push(newPrompt("最后执行期间追加", "queue"));
@@ -199,14 +208,17 @@ describe("queue pause boundary", () => {
       });
       expect(calls.map((call) => call.text)).toEqual(["第一条", "最后执行期间追加"]);
       expect(calls.every((call) => call.cwd === root)).toBe(true);
-      expect((await storage.readTab(tab.id)).answers.answers).toHaveLength(2);
+      const completedAnswers = (await storage.readTab(tab.id)).answers.answers;
+      expect(completedAnswers).toHaveLength(2);
+      expect(completedAnswers[0]).toMatchObject({ id: activeAnswer.id, status: "completed", finalAnswer: "第一条完成" });
+      expect(completedAnswers[0].completedAt).not.toBeNull();
       await runner.stop();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("freezes the queue and interrupts its active turn", async () => {
+  it("interrupts the current prompt, records it, and pauses the queue", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-queue-freeze-"));
     const storage = new StorageService(root);
     try {
@@ -232,7 +244,13 @@ describe("queue pause boundary", () => {
           startTurn: async () => { reportStarted(); return { turnId: "turn-freeze" }; },
           waitForTurn: async () => {
             await turnFinished;
-            return { turn: { id: "turn-freeze", status: "interrupted" }, items: [] };
+            return {
+              turn: { id: "turn-freeze", status: "interrupted" },
+              items: [
+                { type: "userMessage", text: "执行中的 prompt" },
+                { type: "agentMessage", phase: "commentary", text: "尚未完成的过程更新" },
+              ],
+            };
           },
           interruptTurn: async (threadId: string, turnId: string) => {
             interruptions.push({ threadId, turnId });
@@ -245,10 +263,234 @@ describe("queue pause boundary", () => {
       await runner.start();
       await started;
       await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.activeTurnId === "turn-freeze");
-      await runner.freeze();
+      await expect(runner.interruptCurrent()).resolves.toBe(true);
 
       expect(interruptions).toEqual([{ threadId: "thread-freeze", turnId: "turn-freeze" }]);
-      expect((await storage.readTab(tab.id)).runtime.runner.desiredState).toBe("paused");
+      const frozen = await storage.readTab(tab.id);
+      expect(frozen.runtime.runner).toMatchObject({ desiredState: "paused", state: "paused", activePromptId: null, activeTurnId: null, lastError: null });
+      expect(frozen.prompts.prompts[0]).toMatchObject({ status: "interrupted", error: { code: "TURN_INTERRUPTED" } });
+      expect(frozen.prompts.prompts[0].attempts[0]).toMatchObject({ status: "interrupted", error: { code: "TURN_INTERRUPTED" } });
+      expect(frozen.answers.answers).toHaveLength(1);
+      expect(frozen.answers.answers[0]).toMatchObject({
+        prompt: "执行中的 prompt",
+        status: "interrupted",
+        finalAnswer: "",
+        error: { code: "TURN_INTERRUPTED" },
+      });
+      expect(frozen.answers.answers[0].startedAt).not.toBeNull();
+      expect(frozen.answers.answers[0].completedAt).not.toBeNull();
+      await runner.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("detaches a timed-out interrupted turn so later prompts can run", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-queue-freeze-timeout-"));
+    const storage = new StorageService(root);
+    try {
+      await storage.ensure();
+      const tab = await storage.createTab("中断超时兜底");
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        updatedAt: isoNow(),
+        session: { ...current.session, state: "ready", workingDirectory: root, threadId: "thread-timeout", sessionId: "thread-timeout", connectedAt: isoNow() },
+      }));
+      const bundle = await storage.readTab(tab.id);
+      bundle.prompts.prompts.push(newPrompt("等待中断确认", "queue"), newPrompt("中断后的下一条", "queue"));
+      await storage.writePrompts(tab.id, bundle.prompts);
+
+      let releaseTurn!: () => void;
+      const turnGate = new Promise<void>((resolve) => { releaseTurn = resolve; });
+      const started: string[] = [];
+      const codex = {
+        rpc: {
+          waitForThreadIdle: async () => undefined,
+          startTurn: async (_threadId: string, text: string) => {
+            started.push(text);
+            return { turnId: started.length === 1 ? "turn-timeout" : "turn-after-timeout" };
+          },
+          waitForTurn: async (turnId: string) => {
+            if (turnId === "turn-timeout") {
+              await turnGate;
+              return { turn: { id: turnId, status: "interrupted" }, items: [{ type: "userMessage", text: "等待中断确认" }] };
+            }
+            return {
+              turn: { id: turnId, status: "completed" },
+              items: [
+                { type: "userMessage", text: "中断后的下一条" },
+                { type: "agentMessage", phase: "final_answer", text: "下一条已完成" },
+              ],
+            };
+          },
+          interruptTurn: async () => undefined,
+        },
+      } as unknown as AppServerManager;
+      const runner = new QueueRunner(tab.id, storage, codex, 5);
+
+      await runner.start();
+      await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.activeTurnId === "turn-timeout");
+      await runner.freeze();
+
+      const frozen = await storage.readTab(tab.id);
+      expect(frozen.runtime.runner).toMatchObject({ desiredState: "paused", state: "paused", activePromptId: null, activeTurnId: null });
+      expect(frozen.prompts.prompts[0]).toMatchObject({ status: "interrupted", error: { code: "TURN_INTERRUPTED" } });
+      expect(frozen.answers.answers[0]).toMatchObject({ status: "interrupted", finalAnswer: "", error: { code: "TURN_INTERRUPTED" } });
+      expect(frozen.answers.answers[0].completedAt).not.toBeNull();
+
+      await runner.start();
+      await waitUntil(async () => {
+        const current = await storage.readTab(tab.id);
+        return current.runtime.runner.state === "paused" && current.prompts.prompts[1]?.status === "completed";
+      });
+      expect(started).toEqual(["等待中断确认", "中断后的下一条"]);
+
+      releaseTurn();
+      await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.state === "paused");
+      await runner.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("interrupts a turn whose id arrives after the Interrupt button was pressed", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-queue-late-turn-id-"));
+    const storage = new StorageService(root);
+    try {
+      await storage.ensure();
+      const tab = await storage.createTab("启动期间中断");
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        updatedAt: isoNow(),
+        session: { ...current.session, state: "ready", workingDirectory: root, threadId: "thread-late-id", sessionId: "thread-late-id", connectedAt: isoNow() },
+      }));
+      const bundle = await storage.readTab(tab.id);
+      bundle.prompts.prompts.push(newPrompt("启动尚未返回", "queue"));
+      await storage.writePrompts(tab.id, bundle.prompts);
+
+      let releaseStart!: () => void;
+      const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+      const interruptions: string[] = [];
+      const codex = {
+        rpc: {
+          waitForThreadIdle: async () => undefined,
+          startTurn: async () => { await startGate; return { turnId: "turn-late-id" }; },
+          interruptTurn: async (_threadId: string, turnId: string) => { interruptions.push(turnId); },
+          waitForTurn: async () => { throw new Error("detached turn must not be awaited"); },
+        },
+      } as unknown as AppServerManager;
+      const runner = new QueueRunner(tab.id, storage, codex, 5);
+
+      await runner.start();
+      await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.activePromptId !== null);
+      await expect(runner.interruptCurrent()).resolves.toBe(false);
+      releaseStart();
+
+      await waitUntil(async () => {
+        const current = await storage.readTab(tab.id);
+        return current.prompts.prompts[0]?.status === "interrupted" && current.runtime.runner.activePromptId === null;
+      });
+      const interrupted = await storage.readTab(tab.id);
+      expect(interruptions).toEqual(["turn-late-id"]);
+      expect(interrupted.runtime.runner).toMatchObject({ desiredState: "paused", state: "paused", activePromptId: null, activeTurnId: null });
+      expect(interrupted.answers.answers[0]).toMatchObject({ status: "interrupted", codexTurnId: "turn-late-id" });
+      await runner.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("insert now", () => {
+  it("steers a pending prompt into the active turn without interrupting it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-steer-active-"));
+    const storage = new StorageService(root);
+    try {
+      await storage.ensure();
+      const tab = await storage.createTab("运行中插入");
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        updatedAt: isoNow(),
+        session: { ...current.session, state: "ready", workingDirectory: root, threadId: "thread-steer", sessionId: "thread-steer", connectedAt: isoNow() },
+      }));
+      const bundle = await storage.readTab(tab.id);
+      const pending = newPrompt("追加要求", "queue");
+      bundle.prompts.prompts.push(pending);
+      await storage.writePrompts(tab.id, bundle.prompts);
+
+      const calls: any[][] = [];
+      const codex = {
+        rpc: {
+          activeTurnIds: () => ["turn-active"],
+          steerTurn: async (...args: any[]) => { calls.push(args); return {}; },
+        },
+      } as unknown as AppServerManager;
+      const runner = new QueueRunner(tab.id, storage, codex);
+
+      const result = await runner.insertNow(pending.id);
+      const updated = (await storage.readTab(tab.id)).prompts.prompts[0];
+
+      expect(result).toEqual({ mode: "steered", turnId: "turn-active" });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.slice(0, 3)).toEqual(["thread-steer", "turn-active", "追加要求"]);
+      expect(updated).toMatchObject({ status: "running", threadId: "thread-steer", codexTurnId: "turn-active" });
+      expect(updated.attempts[0]).toMatchObject({ status: "running", delivery: "steer", codexTurnId: "turn-active" });
+      await runner.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("runs only the selected prompt when the queue was idle and paused", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-insert-idle-"));
+    const storage = new StorageService(root);
+    try {
+      await storage.ensure();
+      const tab = await storage.createTab("空闲时立即运行");
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        updatedAt: isoNow(),
+        session: { ...current.session, state: "ready", workingDirectory: root, threadId: "thread-idle-now", sessionId: "thread-idle-now", connectedAt: isoNow() },
+      }));
+      const bundle = await storage.readTab(tab.id);
+      const earlier = newPrompt("原先排队", "queue");
+      const selected = newPrompt("只运行这一条", "queue");
+      bundle.prompts.prompts.push(earlier, selected);
+      await storage.writePrompts(tab.id, bundle.prompts);
+
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const calls: string[] = [];
+      const codex = {
+        rpc: {
+          activeTurnIds: () => [],
+          waitForThreadIdle: async () => undefined,
+          startTurn: async (_threadId: string, text: string) => { calls.push(text); return { turnId: "turn-one-shot" }; },
+          waitForTurn: async () => {
+            await gate;
+            return {
+              turn: { id: "turn-one-shot", status: "completed" },
+              items: [
+                { type: "userMessage", text: "只运行这一条" },
+                { type: "agentMessage", phase: "final_answer", text: "单条完成" },
+              ],
+            };
+          },
+        },
+      } as unknown as AppServerManager;
+      const runner = new QueueRunner(tab.id, storage, codex);
+
+      expect(await runner.insertNow(selected.id)).toEqual({ mode: "started", turnId: null });
+      await waitUntil(async () => calls.length === 1);
+      expect(calls).toEqual(["只运行这一条"]);
+      release();
+      await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.state === "paused");
+
+      const finished = await storage.readTab(tab.id);
+      expect(finished.runtime.runner.desiredState).toBe("paused");
+      expect(finished.prompts.prompts.find((item) => item.id === selected.id)?.status).toBe("completed");
+      expect(finished.prompts.prompts.find((item) => item.id === earlier.id)?.status).toBe("pending");
+      expect(finished.answers.answers).toHaveLength(1);
       await runner.stop();
     } finally {
       await rm(root, { recursive: true, force: true });

@@ -36,6 +36,8 @@ type TurnAccumulator = {
   startedAt: string | null;
 };
 
+const THREAD_SUMMARY_POLL_MS = 5_000;
+
 export class CodexRpcClient extends EventEmitter {
   private socket: WebSocket | null = null;
   private nextId = 1;
@@ -131,6 +133,13 @@ export class CodexRpcClient extends EventEmitter {
       const accumulator = this.turns.get(turnId);
       if (accumulator && method === "item/completed") accumulator.items.push(item);
       this.emit(method === "item/completed" ? "itemCompleted" : "itemStarted", { ...params, item, turnId });
+      if (method === "item/completed" && String(item?.type ?? "").replace(/[_-]/g, "").toLowerCase() === "contextcompaction") {
+        this.emit("threadCompacted", {
+          threadId: String(params.threadId ?? item.threadId ?? accumulator?.threadId ?? ""),
+          turnId,
+          item,
+        });
+      }
     } else if (method === "turn/completed") {
       const turn = params.turn ?? params;
       const threadId = String(params.threadId ?? turn.threadId ?? "");
@@ -140,6 +149,12 @@ export class CodexRpcClient extends EventEmitter {
       if (Array.isArray(turn.items)) accumulator.items = turn.items;
       const event: TurnCompletedEvent = { threadId: accumulator.threadId, turnId, turn, items: accumulator.items };
       this.rememberCompletedTurn(event);
+    } else if (method === "thread/compacted") {
+      this.emit("threadCompacted", {
+        threadId: String(params.threadId ?? ""),
+        turnId: String(params.turnId ?? ""),
+        item: null,
+      });
     }
   }
 
@@ -203,6 +218,15 @@ export class CodexRpcClient extends EventEmitter {
     return this.request("turn/interrupt", { threadId, turnId });
   }
 
+  async steerTurn(threadId: string, expectedTurnId: string, text: string, clientUserMessageId: string): Promise<any> {
+    return this.request("turn/steer", {
+      threadId,
+      expectedTurnId,
+      clientUserMessageId,
+      input: [{ type: "text", text, text_elements: [] }],
+    });
+  }
+
   async startTurn(threadId: string, text: string, clientUserMessageId: string, cwd: string): Promise<{ turnId: string; raw: any }> {
     const raw = await this.request("turn/start", {
       threadId,
@@ -218,16 +242,18 @@ export class CodexRpcClient extends EventEmitter {
     return { turnId, raw };
   }
 
-  async waitForTurn(turnId: string, timeoutMs = 24 * 60 * 60 * 1000, pollMs = 750): Promise<TurnCompletedEvent> {
+  async waitForTurn(turnId: string, timeoutMs = 24 * 60 * 60 * 1000, pollMs = THREAD_SUMMARY_POLL_MS): Promise<TurnCompletedEvent> {
     const deadline = Date.now() + timeoutMs;
+    let lastSettledSummaryKey: string | null = null;
     while (Date.now() < deadline) {
       const already = this.completed.get(turnId);
       if (already) return already;
 
       // Codex may route completion notifications to the interactive TUI client
-      // instead of this controller connection. Wait briefly for the normal
-      // notification, then verify the authoritative thread snapshot so a queue
-      // cannot remain stuck on a turn that has already finished in PowerShell.
+      // instead of this controller connection. Keep notifications as the
+      // immediate path, but use the inexpensive summary as a low-frequency
+      // fallback. A potentially very large turn history is read only once for
+      // each distinct settled summary state.
       const signaled = await this.waitForTurnNotification(turnId, Math.min(Math.max(0, pollMs), Math.max(0, deadline - Date.now())));
       if (signaled) return signaled;
 
@@ -235,8 +261,18 @@ export class CodexRpcClient extends EventEmitter {
       if (!accumulator?.threadId) continue;
       try {
         const remaining = Math.max(1, deadline - Date.now());
-        const response = await this.readThread(accumulator.threadId, Math.min(30_000, remaining));
-        const thread = response?.thread ?? response?.data?.thread ?? response?.data ?? response;
+        const summaryResponse = await this.readThreadSummary(accumulator.threadId, Math.min(30_000, remaining));
+        const summary = unwrapThread(summaryResponse);
+        if (!threadSettled(summary)) {
+          lastSettledSummaryKey = null;
+          continue;
+        }
+        const summaryKey = settledSummaryKey(summary);
+        if (summaryKey === lastSettledSummaryKey) continue;
+
+        const fullResponse = await this.readThread(accumulator.threadId, Math.min(30_000, Math.max(1, deadline - Date.now())));
+        const thread = unwrapThread(fullResponse);
+        lastSettledSummaryKey = summaryKey;
         const turn = Array.isArray(thread?.turns)
           ? thread.turns.find((item: any) => String(item?.id ?? item?.turnId ?? "") === turnId)
           : null;
@@ -287,7 +323,7 @@ export class CodexRpcClient extends EventEmitter {
     return event;
   }
 
-  async waitForThreadIdle(threadId: string, timeoutMs = 24 * 60 * 60 * 1000, pollMs = 750): Promise<void> {
+  async waitForThreadIdle(threadId: string, timeoutMs = 24 * 60 * 60 * 1000, pollMs = THREAD_SUMMARY_POLL_MS): Promise<void> {
     if (!this.activeThreads.has(threadId)) return;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -296,8 +332,8 @@ export class CodexRpcClient extends EventEmitter {
       if (signaled || !this.activeThreads.has(threadId)) return;
       try {
         const remaining = Math.max(1, deadline - Date.now());
-        const response = await this.readThread(threadId, Math.min(30_000, remaining));
-        const thread = response?.thread ?? response?.data?.thread ?? response?.data ?? response;
+        const response = await this.readThreadSummary(threadId, Math.min(30_000, remaining));
+        const thread = unwrapThread(response);
         if (!threadIdle(thread)) continue;
         this.activeThreads.delete(threadId);
         return;
@@ -344,9 +380,31 @@ function turnFinished(turn: any): boolean {
   return ["completed", "failed", "interrupted", "canceled", "cancelled"].includes(status);
 }
 
+function unwrapThread(response: any): any {
+  return response?.thread ?? response?.data?.thread ?? response?.data ?? response;
+}
+
+function threadStatus(thread: any): string {
+  return String(thread?.status?.type ?? thread?.status ?? thread?.state ?? "").toLowerCase();
+}
+
+function threadSettled(thread: any): boolean {
+  return ["idle", "completed", "failed", "interrupted", "canceled", "cancelled"].includes(threadStatus(thread));
+}
+
+function settledSummaryKey(thread: any): string {
+  const revision = thread?.updatedAt
+    ?? thread?.updated_at
+    ?? thread?.recencyAt
+    ?? thread?.recency_at
+    ?? thread?.lastActivityAt
+    ?? thread?.last_activity_at
+    ?? "";
+  return `${threadStatus(thread)}:${String(revision)}`;
+}
+
 function threadIdle(thread: any): boolean {
-  const status = String(thread?.status?.type ?? thread?.status ?? thread?.state ?? "").toLowerCase();
-  if (status === "idle") return true;
+  if (threadSettled(thread)) return true;
   return Array.isArray(thread?.turns) && thread.turns.length > 0 && thread.turns.every(turnFinished);
 }
 

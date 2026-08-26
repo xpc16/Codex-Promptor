@@ -1,12 +1,14 @@
 import { EventEmitter } from "node:events";
 
+export const DEFAULT_UI_GRACE_MS = 30_000;
+
 export class UiLifecycle extends EventEmitter {
   private activeClients = 0;
   private armed = false;
   private stopped = false;
   private idleTimer: NodeJS.Timeout | null = null;
 
-  constructor(private readonly graceMs = 5_000) {
+  constructor(private readonly graceMs = DEFAULT_UI_GRACE_MS) {
     super();
   }
 
