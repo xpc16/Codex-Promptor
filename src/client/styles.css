@@ -114,6 +114,8 @@ input, textarea, select { color: var(--text); }
 .tab-completion-bell svg { width: 16px; height: 16px; overflow: visible; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .status-dot, .connection-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
 .status-dot.ready { background: var(--success); box-shadow: 0 0 7px color-mix(in srgb, var(--success) 55%, transparent); }
+/* Armed is idle but loaded: a steady ring rather than the running dot's fill. */
+.status-dot.armed { background: transparent; border: 2px solid var(--success); box-shadow: none; }
 .status-dot.error { background: var(--danger); }
 @keyframes tab-status-breathe {
   0%, 100% { transform: scale(.82); opacity: .72; box-shadow: 0 0 4px color-mix(in srgb, var(--success) 34%, transparent); }

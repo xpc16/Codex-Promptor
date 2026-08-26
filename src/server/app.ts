@@ -1109,9 +1109,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const text = String(body.text ?? "").trim();
     if (!text) return apiError(reply, 400, "PROMPT_EMPTY", "Prompt text cannot be empty.");
     try {
+      let armed = false;
       const prompt = await storage.withTabLock(tabId, async () => {
         const bundle = await storage.readTab(tabId);
         assertQueueUsable(bundle);
+        armed = bundle.runtime.runner.desiredState === "armed";
         const next = newPrompt(text, "queue");
         const beforeId = body.beforeId ? String(body.beforeId) : null;
         const afterId = body.afterId ? String(body.afterId) : null;
@@ -1124,6 +1126,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         await storage.writePrompts(tabId, bundle.prompts);
         return next;
       });
+      // An armed queue is idle but waiting to be fed: adding a prompt is the
+      // start signal, so the user does not have to add and then press start.
+      // A paused queue was stopped deliberately and must stay stopped.
+      if (armed) await runners.get(tabId).start().catch(() => undefined);
       return reply.send({ data: prompt });
     } catch (error) {
       // A refused queue is not a missing tab; only fall back to 404 once the

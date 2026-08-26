@@ -24,6 +24,13 @@ export class QueueRunner extends EventEmitter {
   private loopGeneration = 0;
   private stopping = false;
   private pauseAfterPromptId: string | null = null;
+  /**
+   * What "insert now" should restore once its one prompt is done. A queue the
+   * user had stopped goes back to stopped; a queue that was merely armed goes
+   * back to armed, because running a single prompt on request is not the user
+   * stopping the queue.
+   */
+  private stateAfterInsertNow: "paused" | "armed" = "paused";
 
   constructor(
     readonly tabId: string,
@@ -77,6 +84,17 @@ export class QueueRunner extends EventEmitter {
 
   async pause(): Promise<void> {
     this.pauseAfterPromptId = null;
+    await this.pauseRunner();
+  }
+
+  private async settleAfterInsertNow(): Promise<void> {
+    if (this.stateAfterInsertNow === "armed") {
+      await this.updateRuntime((runtime) => ({
+        ...runtime,
+        runner: { ...runtime.runner, desiredState: "armed", state: "paused", activePromptId: null, activeTurnId: null, lastTransitionAt: isoNow() },
+      }));
+      return;
+    }
     await this.pauseRunner();
   }
 
@@ -232,10 +250,10 @@ export class QueueRunner extends EventEmitter {
         if (!prompt) {
           if (this.pauseAfterPromptId) {
             this.pauseAfterPromptId = null;
-            await this.pauseRunner();
+            await this.settleAfterInsertNow();
             return;
           }
-          if (await this.pauseIfEmpty(generation)) return;
+          if (await this.armIfEmpty(generation)) return;
           continue;
         }
         const dispatched = await this.prepareDispatch(prompt.id, generation);
@@ -243,7 +261,7 @@ export class QueueRunner extends EventEmitter {
         await this.dispatch(threadId, workingDirectory, dispatched, generation);
         if (this.pauseAfterPromptId === prompt.id) {
           this.pauseAfterPromptId = null;
-          await this.pauseRunner();
+          await this.settleAfterInsertNow();
           return;
         }
       }
@@ -293,6 +311,7 @@ export class QueueRunner extends EventEmitter {
       if (targetIndex < 0 || !target) throw new Error("PROMPT_NOT_FOUND");
       if (target.status !== "pending" || (target.threadId && target.threadId !== threadId)) throw new Error("PROMPT_NOT_PENDING");
       const wasRunning = bundle.runtime.runner.desiredState === "running";
+      if (!wasRunning) this.stateAfterInsertNow = bundle.runtime.runner.desiredState === "armed" ? "armed" : "paused";
       const firstPendingIndex = bundle.prompts.prompts.findIndex((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId));
       if (firstPendingIndex >= 0 && firstPendingIndex !== targetIndex) {
         bundle.prompts.prompts.splice(targetIndex, 1);
@@ -459,7 +478,14 @@ export class QueueRunner extends EventEmitter {
     }
   }
 
-  private async pauseIfEmpty(generation: number): Promise<boolean> {
+  /**
+   * The queue ran out of work on its own. That is not the same as the user
+   * stopping it, so it goes back to armed rather than paused: the next prompt
+   * added should just run. Only an explicit pause, an interruption or a
+   * failure leaves it stopped, and each of those returns early here because
+   * they have already moved desiredState away from "running".
+   */
+  private async armIfEmpty(generation: number): Promise<boolean> {
     return this.storage.withTabLock(this.tabId, async () => {
       if (generation !== this.loopGeneration) return true;
       const bundle = await this.storage.readTab(this.tabId);
@@ -471,7 +497,7 @@ export class QueueRunner extends EventEmitter {
         revision: bundle.runtime.revision + 1,
         runner: {
           ...bundle.runtime.runner,
-          desiredState: "paused",
+          desiredState: "armed",
           state: "paused",
           activePromptId: null,
           activeTurnId: null,

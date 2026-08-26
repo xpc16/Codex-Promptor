@@ -148,7 +148,11 @@ export const RuntimeFileSchema = z.object({
   schemaVersion: z.number().default(1),
   revision: z.number().default(0),
   runner: z.object({
-    desiredState: z.enum(["paused", "running"]).default("paused"),
+    // Three states, not two. "armed" is idle like "paused", but adding a prompt
+    // starts the queue instead of only queueing it -- that difference is the
+    // whole point of separating them, and existing files default to "paused"
+    // so a conversation from before this split never starts on its own.
+    desiredState: z.enum(["paused", "armed", "running"]).default("paused"),
     state: RunnerStateSchema.default("paused"),
     activePromptId: z.string().nullable().default(null),
     activeTurnId: z.string().nullable().default(null),
@@ -228,7 +232,8 @@ export const defaultRuntime = (): RuntimeFile => RuntimeFileSchema.parse({
   schemaVersion: 1,
   revision: 0,
   runner: {
-    desiredState: "paused",
+    // A new conversation is armed: the first prompt added to it runs.
+    desiredState: "armed",
     state: "paused",
     activePromptId: null,
     activeTurnId: null,

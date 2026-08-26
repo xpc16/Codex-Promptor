@@ -67,7 +67,7 @@ describe("queue pause boundary", () => {
     }
   });
 
-  it("automatically pauses after the queue has no pending prompts", async () => {
+  it("arms itself after the queue has no pending prompts", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-queue-empty-"));
     const storage = new StorageService(root);
     try {
@@ -83,7 +83,9 @@ describe("queue pause boundary", () => {
       const runner = new QueueRunner(tab.id, storage, codex);
 
       await runner.start();
-      await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.desiredState === "paused");
+      // Running out of work is not the user stopping the queue: it goes back to
+      // armed, so the next prompt added runs without another start click.
+      await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.desiredState === "armed");
       const runtime = (await storage.readTab(tab.id)).runtime.runner;
       expect(runtime.state).toBe("paused");
       expect(idleChecks).toBe(1);
@@ -126,7 +128,7 @@ describe("queue pause boundary", () => {
       await runner.start();
       await waitUntil(async () => {
         const current = await storage.readTab(tab.id);
-        return calls.length === 1 && current.runtime.runner.desiredState === "paused";
+        return calls.length === 1 && current.runtime.runner.desiredState === "armed";
       });
       const result = await storage.readTab(tab.id);
       expect(calls).toEqual(["run here"]);
@@ -441,7 +443,10 @@ describe("insert now", () => {
     }
   });
 
-  it("runs only the selected prompt when the queue was idle and paused", async () => {
+  it.each([
+    ["paused", "paused"],
+    ["armed", "armed"],
+  ] as const)("runs only the selected prompt and restores the idle queue (%s)", async (before, after) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-insert-idle-"));
     const storage = new StorageService(root);
     try {
@@ -453,6 +458,10 @@ describe("insert now", () => {
         session: { ...current.session, state: "ready", workingDirectory: root, threadId: "thread-idle-now", sessionId: "thread-idle-now", connectedAt: isoNow() },
       }));
       const bundle = await storage.readTab(tab.id);
+      // Running one prompt on request is not the user stopping the queue, so a
+      // queue that was merely armed has to come back armed.
+      bundle.runtime.runner.desiredState = before;
+      await storage.writeRuntime(tab.id, bundle.runtime);
       const earlier = newPrompt("原先排队", "queue");
       const selected = newPrompt("只运行这一条", "queue");
       bundle.prompts.prompts.push(earlier, selected);
@@ -487,7 +496,7 @@ describe("insert now", () => {
       await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.state === "paused");
 
       const finished = await storage.readTab(tab.id);
-      expect(finished.runtime.runner.desiredState).toBe("paused");
+      expect(finished.runtime.runner.desiredState).toBe(after);
       expect(finished.prompts.prompts.find((item) => item.id === selected.id)?.status).toBe("completed");
       expect(finished.prompts.prompts.find((item) => item.id === earlier.id)?.status).toBe("pending");
       expect(finished.answers.answers).toHaveLength(1);
