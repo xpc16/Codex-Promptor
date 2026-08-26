@@ -14,3 +14,4 @@ data/trash/*
 !data/tabs/.gitkeep
 !data/backups/.gitkeep
 !data/trash/.gitkeep
+claude_code_sessions_exports.md
