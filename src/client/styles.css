@@ -63,8 +63,8 @@ input, textarea, select { color: var(--text); }
 .console-splitter:hover, .console-splitter:active, .splitter:hover, .splitter:active { background: color-mix(in srgb, var(--primary) 30%, transparent); border-color: var(--primary); }
 
 .brand { flex: none; display: flex; gap: 12px; align-items: center; padding: 0 7px 20px; }
-.brand-mark, .welcome-icon { display: grid; place-items: center; color: var(--primary); background: var(--primary-soft); border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border)); box-shadow: 0 0 22px color-mix(in srgb, var(--primary) 14%, transparent); }
-.brand-mark { width: 38px; height: 38px; border-radius: 11px; font-size: 19px; }
+.welcome-icon { display: grid; place-items: center; color: var(--primary); background: var(--primary-soft); border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border)); box-shadow: 0 0 22px color-mix(in srgb, var(--primary) 14%, transparent); }
+.brand-mark { display: block; width: 38px; height: 38px; object-fit: contain; filter: drop-shadow(0 5px 10px color-mix(in srgb, var(--primary) 18%, transparent)); }
 .brand strong { display: block; font-size: 17px; line-height: 1.15; }
 .brand span { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; }
 .sidebar-actions { flex: none; display: flex; gap: 8px; margin: 0 2px 14px; }
@@ -133,8 +133,6 @@ input, textarea, select { color: var(--text); }
 .empty-sidebar span { color: var(--faint); font-size: 12px; }
 
 .sidebar-footer { flex: none; display: grid; gap: 9px; padding: 12px 4px 0; border-top: 1px solid var(--border); }
-.footer-select { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
-.footer-select select { width: 100%; min-width: 0; padding: 8px 9px; border: 1px solid var(--border-strong); border-radius: 7px; outline: 0; background: var(--panel); font-size: 13px; }
 .footer-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .footer-bottom-row { min-width: 0; display: grid; grid-template-columns: 32px minmax(0, 1fr) 54px; align-items: center; gap: 4px; }
 .footer-compact-button { height: 32px; display: flex; align-items: center; justify-content: center; padding: 0; }
@@ -147,9 +145,14 @@ input, textarea, select { color: var(--text); }
 .service-status time { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .muted { margin-left: auto; color: var(--faint); }
 
+/* Phone-only pane strip; the media query at the bottom of this file turns it on. */
+.mobile-pane-bar { display: none; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 4px; padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px)); background: var(--sidebar); border-top: 1px solid var(--border); }
+.mobile-pane-bar button { padding: 10px 4px; border-radius: 8px; background: transparent; color: var(--muted); font-size: 13px; font-weight: 700; }
+.mobile-pane-bar button.active { background: var(--primary-soft); color: var(--primary); }
+
 .workspace { min-width: 0; height: 100vh; overflow: hidden; position: relative; }
-.tab-view { width: 100%; height: 100%; overflow: hidden; }
-.conversation-closed { position: relative; }
+.tab-view { position: absolute; inset: 0; width: 100%; height: 100%; overflow: hidden; }
+.tab-view-hidden { visibility: hidden; pointer-events: none; }
 .tab-workspace { width: 100%; height: 100%; min-height: 0; display: grid; overflow: hidden; padding: 16px; }
 .conversation-pane, .queue-pane { min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
 .conversation-pane { display: flex; flex-direction: column; gap: 14px; padding-right: 11px; }
@@ -179,12 +182,17 @@ input, textarea, select { color: var(--text); }
 .mode-switch button.active { background: var(--primary-soft); color: var(--primary); font-weight: 700; }
 .resume-input { margin-bottom: 8px; }
 .connect { width: 100%; margin-top: 9px; }
+.connect-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; margin-top: 9px; }
+.connect-row .connect { margin-top: 0; }
+.connect-row select { min-width: 122px; padding: 9px 30px 9px 11px; border: 1px solid var(--border-strong); border-radius: 9px; outline: 0; background: var(--panel-soft); font-weight: 700; }
+.connect-row select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 15%, transparent); }
 .inline-error, .runner-error { color: var(--danger); font-size: 12px; }
 .session-ready, .session-path, .session-ids, .session-ids > div { min-width: 0; }
 .session-ready { display: grid; gap: 10px; margin-top: 14px; }
 .session-path > span, .session-ids span { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
 .session-ready code { display: block; min-width: 0; padding: 8px 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel-soft); color: var(--text); font: 12px/1.55 "Cascadia Code", Consolas, monospace; overflow-wrap: anywhere; word-break: break-all; white-space: normal; }
 .session-ids { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.session-ids.single { grid-template-columns: minmax(0, 1fr); }
 .session-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .session-actions .ghost { justify-self: start; }
 .danger-action { padding: 8px 12px; border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--danger) 9%, var(--panel)); color: var(--danger); font-weight: 700; }
@@ -196,14 +204,37 @@ input, textarea, select { color: var(--text); }
 .answer-scroll { flex: 1; min-width: 0; min-height: 0; overflow-x: hidden; overflow-y: auto; padding: 12px; overscroll-behavior: contain; }
 .answer-list { min-width: 0; display: grid; gap: 11px; }
 .answer-card { min-width: 0; max-width: 100%; padding: 14px 15px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-soft); overflow-wrap: anywhere; }
+.answer-card.running { border-color: color-mix(in srgb, var(--primary) 46%, var(--border)); }
+.answer-card.interrupted, .answer-card.failed { border-color: color-mix(in srgb, var(--danger) 34%, var(--border)); }
 .answer-meta { display: flex; justify-content: space-between; color: var(--primary); font-size: 12px; font-weight: 700; }
-.answer-meta time { color: var(--faint); font-weight: 400; }
+.answer-meta-left { min-width: 0; display: flex; align-items: center; gap: 7px; }
+.answer-state { padding: 2px 6px; border-radius: 999px; background: var(--primary-soft); color: var(--primary); font-size: 10px; white-space: nowrap; }
+.answer-state.interrupted, .answer-state.failed { background: color-mix(in srgb, var(--danger) 11%, var(--panel)); color: var(--danger); }
+.answer-meta time, .answer-ended time { flex: none; color: var(--faint); font-weight: 400; white-space: nowrap; }
 .answer-prompt { min-width: 0; margin: 11px 0; padding-left: 9px; border-left: 3px solid color-mix(in srgb, var(--primary) 55%, var(--border)); color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; }
+.answer-lifecycle { display: flex; align-items: center; gap: 8px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+.answer-lifecycle.interrupted, .answer-lifecycle.failed { align-items: flex-start; flex-direction: column; gap: 3px; border-color: color-mix(in srgb, var(--danger) 30%, var(--border)); color: var(--muted); }
+.answer-lifecycle.interrupted strong, .answer-lifecycle.failed strong { color: var(--danger); }
+.answer-lifecycle.partial { margin-bottom: 9px; padding: 6px 9px; font-size: 12px; }
+.answer-ended { display: flex; justify-content: flex-end; margin-top: 10px; font-size: 12px; }
 .markdown { min-width: 0; max-width: 100%; color: var(--text); font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; word-break: break-word; }
 .markdown p { margin: 7px 0; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 { margin: 15px 0 7px; line-height: 1.35; }
+.markdown h1 { font-size: 19px; }
+.markdown h2 { font-size: 17px; }
+.markdown h3, .markdown h4 { font-size: 15px; }
+.markdown ul, .markdown ol { margin: 8px 0; padding-left: 24px; }
+.markdown li { margin: 4px 0; }
+.markdown blockquote { margin: 9px 0; padding: 3px 11px; border-left: 3px solid var(--border-strong); color: var(--muted); }
+.markdown table { width: 100%; margin: 11px 0; border-collapse: collapse; table-layout: fixed; font-size: 13px; line-height: 1.5; }
+.markdown th, .markdown td { padding: 7px 8px; border: 1px solid var(--border-strong); text-align: left; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }
+.markdown th { background: var(--panel-strong); font-weight: 750; }
+.markdown tr:nth-child(even) td { background: color-mix(in srgb, var(--panel-strong) 58%, transparent); }
 .markdown pre { max-width: 100%; overflow-x: hidden; padding: 11px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel); font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; word-break: break-word; }
 .markdown code { font-family: "Cascadia Code", Consolas, monospace; overflow-wrap: anywhere; word-break: break-word; }
-.empty-answers, .empty-prompts { padding: 24px 15px; border: 1px dashed var(--border-strong); border-radius: 10px; color: var(--muted); font-size: 13px; text-align: center; }
+.empty-answers, .queue-shell-notice { flex: none; margin-top: 10px; padding: 9px 11px; border: 1px dashed var(--border-strong); border-radius: 8px; background: var(--panel-soft); color: var(--muted); font-size: 12px; line-height: 1.6; }
+.field-hint { display: block; margin: 5px 2px 0; color: var(--faint); font-size: 12px; }
+.empty-prompts { padding: 24px 15px; border: 1px dashed var(--border-strong); border-radius: 10px; color: var(--muted); font-size: 13px; text-align: center; }
 
 .queue-card { display: flex; flex-direction: column; overflow: hidden; padding: 15px; }
 .queue-heading { flex: none; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 7px; }
@@ -217,6 +248,8 @@ input, textarea, select { color: var(--text); }
 .runner-actions { flex: none; display: flex; flex-wrap: nowrap; justify-content: flex-end; gap: 5px; }
 .runner-start-button { padding: 7px 10px; font-size: 12px; }
 .pause-button { padding: 7px 9px; border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--danger) 9%, var(--panel)); color: var(--danger); font-size: 12px; }
+.interrupt-button { padding: 7px 9px; border: 1px solid var(--danger); border-radius: 8px; background: var(--danger); color: #fff; font-size: 12px; white-space: nowrap; }
+.interrupt-button:hover:not(:disabled) { filter: brightness(.94); }
 .queue-card > .runner-error { flex: none; margin: 8px 0 0; overflow-wrap: anywhere; }
 .status-dot.running { background: var(--primary); box-shadow: 0 0 8px color-mix(in srgb, var(--primary) 55%, transparent); }
 .prompt-list { flex: 1; min-height: 0; overflow-y: auto; display: grid; align-content: start; gap: 8px; margin-top: 10px; padding-right: 3px; overscroll-behavior: contain; }
@@ -245,6 +278,9 @@ input, textarea, select { color: var(--text); }
 .delete-button:hover { color: var(--danger); }
 .link-button { color: var(--primary); font-size: 11px; }
 .link-button:hover { text-decoration: underline; }
+.prompt-edit-button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 1px solid var(--border); border-radius: 5px; background: var(--panel); color: var(--primary); font-size: 15px; line-height: 1; }
+.prompt-edit-button:hover:not(:disabled) { border-color: var(--primary); background: var(--primary-soft); }
+.insert-now-button { font-weight: 700; }
 .move-buttons { display: inline-flex; gap: 2px; }
 .move-buttons button { padding: 0 4px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel); color: var(--muted); font-size: 10px; line-height: 17px; }
 .add-prompt { flex: none; display: flex; gap: 8px; align-items: stretch; margin-top: 10px; }
@@ -266,10 +302,18 @@ input, textarea, select { color: var(--text); }
 .terminal-host { width: 100%; height: 100%; min-height: 0; }
 .terminal-host .xterm { width: 100%; height: 100%; padding: 2px; }
 .terminal-host .xterm-viewport { overscroll-behavior: contain; }
-.terminal-host.terminal-updating .xterm-cursor { visibility: hidden !important; }
+.terminal-host.terminal-updating .xterm-cursor,
+.terminal-card.runner-busy .terminal-host .xterm-cursor { visibility: hidden !important; }
+.terminal-settling-overlay { position: absolute; inset: 8px; z-index: 3; display: none; place-items: center; align-content: center; gap: 10px; pointer-events: none; color: var(--muted); font-size: 13px; }
+.terminal-body.light .terminal-settling-overlay { background: #f8fafcf2; }
+.terminal-body.dark .terminal-settling-overlay { background: #0f1722f2; }
+.terminal-host.terminal-settling + .terminal-settling-overlay { display: grid; }
+.terminal-settling-spinner { width: 19px; height: 19px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; opacity: .72; }
 .terminal-placeholder { position: absolute; inset: 8px; display: grid; place-items: center; pointer-events: none; color: var(--muted); background: color-mix(in srgb, var(--panel) 82%, transparent); font-size: 13px; }
 
 .welcome, .loading-screen, .loading-pane { width: 100%; height: 100%; display: grid; place-items: center; align-content: center; padding: 50px; color: var(--muted); text-align: center; }
+.loading-pane { gap: 10px; }
+.loading-pane strong { color: var(--text); }
 .welcome { max-width: 620px; margin: auto; }
 .welcome-icon { width: 70px; height: 70px; margin: 0 auto 23px; border-radius: 22px; font-size: 32px; }
 .welcome h1 { margin: 0 0 11px; color: var(--text); font-size: 28px; letter-spacing: -.03em; }
@@ -297,4 +341,45 @@ input, textarea, select { color: var(--text); }
   .queue-pane { padding-left: 7px; }
   .session-ids { grid-template-columns: 1fr; }
   .prompt-side { min-width: 60px; flex-wrap: wrap; }
+}
+
+/* The desktop layout puts four panes on screen at once — console, conversation,
+   prompt queue, terminal — separated by draggable splitters. None of that fits
+   a phone, so below this width the shell becomes a pager: each pane fills the
+   whole screen and the user moves between them by swiping sideways or tapping
+   the strip at the bottom.
+
+   Two details are load-bearing:
+   - Panes are stacked in a single grid cell and the inactive ones are hidden
+     with `visibility`, not `display: none`. Collapsing the terminal to zero
+     size would make its ResizeObserver renegotiate the PTY geometry on every
+     page turn, and Codex repaints its entire screen on each of those.
+   - grid-template-columns needs !important because the desktop split widths
+     are written inline from React state (consoleWidth / leftWidth). */
+@media (max-width: 640px) {
+  .app-shell {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: minmax(0, 1fr) auto;
+    height: 100vh;
+    height: 100dvh;
+  }
+  .console-splitter { display: none; }
+  .sidebar, .workspace { grid-area: 1 / 1; min-width: 0; min-height: 0; height: 100%; }
+  .sidebar { padding: 16px 12px 10px; border-right: none; }
+  .app-shell:not([data-mobile-pane="console"]) .sidebar,
+  .app-shell[data-mobile-pane="console"] .workspace { visibility: hidden; pointer-events: none; }
+
+  .tab-workspace { grid-template-columns: 1fr !important; grid-template-rows: minmax(0, 1fr); padding: 10px; }
+  .tab-workspace > .splitter { display: none; }
+  .conversation-pane, .queue-pane { grid-area: 1 / 1; padding: 0; }
+  .queue-pane { grid-template-rows: minmax(0, 1fr); }
+  .queue-card, .terminal-card { grid-area: 1 / 1; min-height: 0; }
+  .app-shell[data-mobile-pane="queue"] .conversation-pane,
+  .app-shell[data-mobile-pane="terminal"] .conversation-pane,
+  .app-shell[data-mobile-pane="conversation"] .queue-pane,
+  .app-shell[data-mobile-pane="terminal"] .queue-card,
+  .app-shell[data-mobile-pane="queue"] .terminal-card { visibility: hidden; pointer-events: none; }
+
+  .mobile-pane-bar { grid-area: 2 / 1; display: grid; }
+  .answer-scroll, .prompt-list, .tab-tree { -webkit-overflow-scrolling: touch; }
 }
