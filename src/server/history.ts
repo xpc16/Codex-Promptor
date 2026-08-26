@@ -58,6 +58,12 @@ export function extractFinalAnswer(items: any[]): FinalAnswer {
   const phaseFinal = agents.filter((item) => String(item?.phase ?? "").toLowerCase().replace(/[_-]/g, "") === "finalanswer");
   const finalText = textFromValue((phaseFinal.at(-1) ?? null)?.text ?? (phaseFinal.at(-1) ?? null)?.content ?? (phaseFinal.at(-1) ?? null)?.message);
   if (finalText) return { text: finalText, captureMode: "phase_final_answer" };
+  // A turn that never reached a clean completion (e.g. a Claude transcript
+  // with no end_turn) is tagged "partial_answer" by the importer. Surface it
+  // distinctly from a genuine final answer so the UI can mark it as such.
+  const phasePartial = agents.filter((item) => String(item?.phase ?? "").toLowerCase().replace(/[_-]/g, "") === "partialanswer");
+  const partialText = textFromValue((phasePartial.at(-1) ?? null)?.text ?? (phasePartial.at(-1) ?? null)?.content ?? (phasePartial.at(-1) ?? null)?.message);
+  if (partialText) return { text: partialText, captureMode: "fallback_partial_answer" };
   const lastAgent = agents.at(-1);
   const fallback = textFromValue(lastAgent?.text ?? lastAgent?.content ?? lastAgent?.message);
   if (fallback) return { text: fallback, captureMode: "fallback_last_agent_message" };
@@ -66,9 +72,14 @@ export function extractFinalAnswer(items: any[]): FinalAnswer {
   return planText ? { text: planText, captureMode: "fallback_plan" } : null;
 }
 
-export const turnCompleted = (turn: any): boolean => {
-  const status = String(turn?.status ?? "completed").toLowerCase();
-  return ["completed", "complete", "succeeded", "success"].includes(status);
+export const turnStatus = (turn: any): string => String(turn?.status?.type ?? turn?.status ?? turn?.state ?? "completed").toLowerCase();
+
+export const turnCompleted = (turn: any): boolean => ["completed", "complete", "succeeded", "success"].includes(turnStatus(turn));
+
+const terminalFailureStatus = (turn: any): "failed" | "interrupted" | null => {
+  const status = turnStatus(turn);
+  if (status === "failed") return "failed";
+  return ["interrupted", "canceled", "cancelled"].includes(status) ? "interrupted" : null;
 };
 
 export function protocolTime(value: unknown): string | null {
@@ -91,17 +102,124 @@ export type RecordTurnOptions = {
   clientUserMessageId?: string | null;
 };
 
+function promptWasSteeredIntoTurn(prompt: PromptRecord, turnId: string): boolean {
+  const attempts = prompt.attempts.filter((attempt) => attempt.codexTurnId === turnId);
+  return attempts.some((attempt) => attempt.delivery === "steer")
+    && !attempts.some((attempt) => attempt.delivery === "turn");
+}
+
+function combinedTurnPromptText(inputText: string | null | undefined, prompts: PromptRecord[]): string {
+  const separator = "\n\n--- 追加输入 ---\n\n";
+  const parts: string[] = [];
+  const protocolText = inputText?.trim();
+  if (protocolText) parts.push(protocolText);
+  for (const prompt of prompts) {
+    const text = prompt.text.trim();
+    if (!text || parts.some((part) => part.includes(text))) continue;
+    parts.push(text);
+  }
+  return parts.join(separator);
+}
+
+function buildAnswerMetadata(prompts: PromptRecord[], turnId: string): Record<string, unknown> {
+  return {
+    promptIds: prompts.map((prompt) => prompt.id),
+    steeredPromptIds: prompts.filter((prompt) => promptWasSteeredIntoTurn(prompt, turnId)).map((prompt) => prompt.id),
+  };
+}
+
+function applyAnswerPatch(answer: AnswerRecord, patch: Partial<AnswerRecord>): boolean {
+  let changed = false;
+  for (const [key, value] of Object.entries(patch) as Array<[keyof AnswerRecord, AnswerRecord[keyof AnswerRecord]]>) {
+    if (JSON.stringify(answer[key]) === JSON.stringify(value)) continue;
+    (answer as any)[key] = value;
+    changed = true;
+  }
+  return changed;
+}
+
+export type RecordTurnStartedOptions = {
+  threadId: string;
+  turnId: string;
+  promptId: string;
+  promptText: string;
+  startedAt: string | null;
+  clientUserMessageId: string | null;
+};
+
+/** Persist the answer card as soon as Codex accepts a queued turn. */
+export async function recordTurnStarted(storage: StorageService, tabId: string, options: RecordTurnStartedOptions): Promise<AnswerRecord> {
+  return storage.withTabLock(tabId, async () => {
+    const bundle = await storage.readTab(tabId);
+    const requested = bundle.prompts.prompts.find((prompt) => prompt.id === options.promptId);
+    if (!requested) throw new Error("PROMPT_NOT_FOUND");
+    const linked = bundle.prompts.prompts.filter((prompt) => prompt.codexTurnId === options.turnId && (!prompt.threadId || prompt.threadId === options.threadId));
+    const primary = linked.find((prompt) => !promptWasSteeredIntoTurn(prompt, options.turnId)) ?? requested;
+    const prompts = [primary, ...linked.filter((prompt) => prompt.id !== primary.id)];
+    const promptText = combinedTurnPromptText(options.promptText, prompts);
+    const metadata = buildAnswerMetadata(prompts, options.turnId);
+    let answer = bundle.answers.answers.find((item) => item.threadId === options.threadId && item.codexTurnId === options.turnId);
+    const now = isoNow();
+    if (!answer) {
+      answer = {
+        id: randomUUID(),
+        promptId: primary.id,
+        threadId: options.threadId,
+        codexTurnId: options.turnId,
+        origin: primary.origin,
+        prompt: promptText,
+        status: "running",
+        finalAnswer: "",
+        captureMode: null,
+        startedAt: options.startedAt ?? primary.startedAt,
+        completedAt: null,
+        recordedAt: now,
+        clientUserMessageId: options.clientUserMessageId ?? primary.clientUserMessageId,
+        error: null,
+        metadata,
+      };
+      bundle.answers.answers.push(answer);
+    } else if (answer.status === "running") {
+      applyAnswerPatch(answer, {
+        promptId: primary.id,
+        origin: primary.origin,
+        prompt: promptText,
+        startedAt: answer.startedAt ?? options.startedAt ?? primary.startedAt,
+        clientUserMessageId: answer.clientUserMessageId ?? options.clientUserMessageId ?? primary.clientUserMessageId,
+        metadata,
+      });
+    } else {
+      return answer;
+    }
+    bundle.answers.revision += 1;
+    bundle.answers.updatedAt = now;
+    await storage.writeAnswers(tabId, bundle.answers);
+    return answer;
+  });
+}
+
 export async function recordTurn(storage: StorageService, tabId: string, options: RecordTurnOptions): Promise<{ prompt: PromptRecord | null; answer: AnswerRecord | null }> {
   const turnId = String(options.turn?.id ?? options.turn?.turnId ?? "");
   if (!turnId) throw new Error("TURN_ID_MISSING");
   const input = extractUserInput(options.items);
-  const final = extractFinalAnswer(options.items);
+  // Interrupted/failed turns can contain commentary agent messages. Those are
+  // not final answers and must never make an unfinished queue item look done.
+  const final = turnCompleted(options.turn) ? extractFinalAnswer(options.items) : null;
+  const terminalStatus = terminalFailureStatus(options.turn);
   if (!input && !options.promptText) return { prompt: null, answer: null };
   return storage.withTabLock(tabId, async () => {
     const bundle = await storage.readTab(tabId);
-    let prompt = bundle.prompts.prompts.find((item) => item.codexTurnId === turnId && (!item.threadId || item.threadId === options.threadId))
-      ?? (options.promptId ? bundle.prompts.prompts.find((item) => item.id === options.promptId) : undefined)
-      ?? (options.clientUserMessageId ? bundle.prompts.prompts.find((item) => item.clientUserMessageId === options.clientUserMessageId) : undefined);
+    // A completion event can arrive just after the terminal switched sessions.
+    // Re-check under the tab lock so an old provider event cannot repopulate
+    // prompt/final-answer JSON after the new history was reconciled.
+    if (bundle.tab.session.threadId && bundle.tab.session.threadId !== options.threadId) {
+      return { prompt: null, answer: null };
+    }
+    const linkedPrompts = bundle.prompts.prompts.filter((item) => item.codexTurnId === turnId && (!item.threadId || item.threadId === options.threadId));
+    let prompt = (options.promptId ? bundle.prompts.prompts.find((item) => item.id === options.promptId) : undefined)
+      ?? (options.clientUserMessageId ? bundle.prompts.prompts.find((item) => item.clientUserMessageId === options.clientUserMessageId) : undefined)
+      ?? linkedPrompts.find((item) => !promptWasSteeredIntoTurn(item, turnId));
+    const createdPrompt = !prompt;
     if (!prompt) {
       prompt = newPrompt(options.promptText ?? input?.text ?? "[无文本输入]", options.origin);
       prompt.inputSnapshot = input?.snapshot;
@@ -109,7 +227,7 @@ export async function recordTurn(storage: StorageService, tabId: string, options
     } else if (!prompt.text && (options.promptText ?? input?.text)) {
       prompt.text = options.promptText ?? input?.text ?? prompt.text;
     }
-    prompt.origin = options.origin;
+    if (createdPrompt) prompt.origin = options.origin;
     prompt.threadId = options.threadId;
     prompt.codexTurnId = turnId;
     prompt.clientUserMessageId = options.clientUserMessageId ?? prompt.clientUserMessageId;
@@ -117,39 +235,126 @@ export async function recordTurn(storage: StorageService, tabId: string, options
     prompt.updatedAt = isoNow();
     if (input?.snapshot && !prompt.inputSnapshot) prompt.inputSnapshot = input.snapshot;
 
-    const completedAt = protocolTime(options.turn?.completedAt) ?? isoNow();
+    const protocolCompletedAt = protocolTime(options.turn?.completedAt);
+    const completedAt = protocolCompletedAt ?? isoNow();
+    const affectedPrompts = [prompt, ...linkedPrompts.filter((item) => item.id !== prompt.id)];
+    const answerPrompt = combinedTurnPromptText(input?.text ?? options.promptText, affectedPrompts);
+    const metadata = buildAnswerMetadata(affectedPrompts, turnId);
+    const startedAt = protocolTime(options.turn?.startedAt) ?? prompt.startedAt;
     let answer: AnswerRecord | null = null;
+    const ensureAnswer = (): AnswerRecord => {
+      const existing = bundle.answers.answers.find((item) => item.threadId === options.threadId && item.codexTurnId === turnId);
+      if (existing) return existing;
+      const created: AnswerRecord = {
+        id: randomUUID(),
+        promptId: prompt.id,
+        threadId: options.threadId,
+        codexTurnId: turnId,
+        origin: prompt.origin,
+        prompt: answerPrompt,
+        status: "running",
+        finalAnswer: "",
+        captureMode: null,
+        startedAt,
+        completedAt: null,
+        recordedAt: isoNow(),
+        clientUserMessageId: options.clientUserMessageId ?? prompt.clientUserMessageId,
+        error: null,
+        metadata,
+      };
+      bundle.answers.answers.push(created);
+      return created;
+    };
     if (final) {
-      answer = bundle.answers.answers.find((item) => item.threadId === options.threadId && item.codexTurnId === turnId) ?? null;
-      if (!answer) {
-        answer = {
-          id: randomUUID(),
-          promptId: prompt.id,
-          threadId: options.threadId,
-          codexTurnId: turnId,
-          origin: options.origin,
-          prompt: prompt.text,
-          finalAnswer: final.text,
-          captureMode: final.captureMode,
-          startedAt: protocolTime(options.turn?.startedAt) ?? prompt.startedAt,
-          completedAt,
-          recordedAt: isoNow(),
-          clientUserMessageId: options.clientUserMessageId ?? prompt.clientUserMessageId,
-          metadata: {},
-        };
-        bundle.answers.answers.push(answer);
+      answer = ensureAnswer();
+      // Codex completion snapshots can omit inputs delivered by turn/steer.
+      // Local turn linkage is therefore also authoritative for the card summary.
+      applyAnswerPatch(answer, {
+        promptId: prompt.id,
+        origin: prompt.origin,
+        prompt: answerPrompt,
+        status: "completed",
+        finalAnswer: final.text,
+        captureMode: final.captureMode,
+        startedAt: startedAt ?? answer.startedAt,
+        completedAt,
+        clientUserMessageId: options.clientUserMessageId ?? prompt.clientUserMessageId,
+        error: null,
+        metadata,
+      });
+      for (const linked of affectedPrompts) {
+        linked.threadId = options.threadId;
+        linked.codexTurnId = turnId;
+        linked.status = "completed";
+        linked.completedAt = completedAt;
+        linked.error = null;
+        linked.updatedAt = isoNow();
+        for (const attempt of linked.attempts.filter((item) => item.codexTurnId === turnId)) {
+          attempt.status = "completed";
+          attempt.completedAt = completedAt;
+          attempt.error = null;
+        }
       }
-      prompt.status = "completed";
-      prompt.completedAt = completedAt;
-      prompt.error = null;
-      const attempt = prompt.attempts.find((item) => item.codexTurnId === turnId);
-      if (attempt) {
-        attempt.status = "completed";
-        attempt.completedAt = completedAt;
+    } else if (terminalStatus) {
+      const status = terminalStatus;
+      const error = status === "interrupted"
+        ? { code: "TURN_INTERRUPTED", message: "Agent turn was interrupted before a final answer was produced." }
+        : { code: "TURN_FAILED", message: "Agent turn failed before a final answer was produced." };
+      answer = ensureAnswer();
+      applyAnswerPatch(answer, {
+        promptId: prompt.id,
+        origin: prompt.origin,
+        prompt: answerPrompt,
+        status,
+        finalAnswer: "",
+        captureMode: null,
+        startedAt: startedAt ?? answer.startedAt,
+        completedAt,
+        clientUserMessageId: options.clientUserMessageId ?? prompt.clientUserMessageId,
+        error,
+        metadata,
+      });
+      for (const linked of affectedPrompts) {
+        linked.threadId = options.threadId;
+        linked.codexTurnId = turnId;
+        linked.status = status;
+        linked.completedAt = completedAt;
+        linked.error = error;
+        linked.updatedAt = isoNow();
+        for (const attempt of linked.attempts.filter((item) => item.codexTurnId === turnId
+          || (options.clientUserMessageId && item.clientUserMessageId === options.clientUserMessageId))) {
+          attempt.status = status;
+          attempt.completedAt = completedAt;
+          attempt.error = error;
+        }
       }
     } else if (options.origin === "queue") {
-      prompt.status = "failed";
-      prompt.error = { code: "NO_FINAL_ANSWER", message: "Turn completed without a final answer." };
+      const error = { code: "NO_FINAL_ANSWER", message: "Turn completed without a final answer." };
+      answer = ensureAnswer();
+      applyAnswerPatch(answer, {
+        promptId: prompt.id,
+        origin: prompt.origin,
+        prompt: answerPrompt,
+        status: "failed",
+        finalAnswer: "",
+        captureMode: null,
+        startedAt: startedAt ?? answer.startedAt,
+        completedAt,
+        clientUserMessageId: options.clientUserMessageId ?? prompt.clientUserMessageId,
+        error,
+        metadata,
+      });
+      for (const linked of affectedPrompts) {
+        linked.status = "failed";
+        linked.completedAt = completedAt;
+        linked.error = error;
+        linked.updatedAt = isoNow();
+        for (const attempt of linked.attempts.filter((item) => item.codexTurnId === turnId)) {
+          attempt.status = "failed";
+          attempt.completedAt = completedAt;
+          attempt.error = error;
+        }
+      }
     }
     bundle.prompts.revision += 1;
     bundle.prompts.updatedAt = isoNow();
@@ -179,7 +384,7 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
     let promptChanges = bundle.prompts.prompts.length - deduplicatedPrompts.length;
     let answerChanges = 0;
     const historyPrompts: PromptRecord[] = [];
-    const completedTurnIds = new Set<string>();
+    const recordedAnswerTurnIds = new Set<string>();
     bundle.prompts.prompts = deduplicatedPrompts;
 
     // Prompt files created before thread ownership was recorded can be repaired
@@ -201,17 +406,136 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
     }
 
     for (const turn of turns) {
-      if (!turnCompleted(turn)) { report.ignored += 1; continue; }
       const items = Array.isArray(turn?.items) ? turn.items : [];
+      const turnId = String(turn.id ?? turn.turnId ?? "");
+      if (!turnId) { report.ignored += 1; continue; }
+      const clientId = findClientUserMessageId(items);
+      const linkedTurnPrompts = bundle.prompts.prompts.filter((item) => item.codexTurnId === turnId && (!item.threadId || item.threadId === threadId));
+      if (!turnCompleted(turn)) {
+        const terminalStatus = terminalFailureStatus(turn);
+        if (!terminalStatus) {
+          const runningAnswer = bundle.answers.answers.find((answer) => answer.threadId === threadId && answer.codexTurnId === turnId && answer.status === "running");
+          if (runningAnswer && linkedTurnPrompts.some((prompt) => prompt.status === "running" || prompt.status === "dispatching")) recordedAnswerTurnIds.add(turnId);
+          report.ignored += 1;
+          continue;
+        }
+        const prompt = linkedTurnPrompts.find((item) => !promptWasSteeredIntoTurn(item, turnId))
+          ?? linkedTurnPrompts[0]
+          ?? (clientId ? bundle.prompts.prompts.find((item) => item.clientUserMessageId === clientId && (!item.threadId || item.threadId === threadId)) : undefined);
+        // Do not import arbitrary incomplete manual history. A local queue record
+        // must already identify the interrupted/failed turn.
+        if (!prompt) { report.ignored += 1; continue; }
+        const input = extractUserInput(items);
+        // An interrupted/failed turn can still carry a partial agent message
+        // (e.g. Claude's last text before a missing end_turn). Keep it so the
+        // UI can show what was generated instead of an empty answer card.
+        const partial = extractFinalAnswer(items);
+        const existingAnswer = bundle.answers.answers.find((answer) => answer.threadId === threadId && answer.codexTurnId === turnId);
+        const completedAt = protocolTime(turn.completedAt) ?? prompt.completedAt ?? existingAnswer?.completedAt ?? isoNow();
+        const error = terminalStatus === "interrupted"
+          ? { code: "TURN_INTERRUPTED", message: "Agent turn was interrupted before a final answer was produced." }
+          : { code: "TURN_FAILED", message: "Agent turn failed before a final answer was produced." };
+        let promptChanged = false;
+        const setPrompt = <K extends keyof PromptRecord>(key: K, value: PromptRecord[K]) => {
+          if (JSON.stringify(prompt[key]) === JSON.stringify(value)) return;
+          prompt[key] = value;
+          promptChanged = true;
+        };
+        setPrompt("threadId", threadId);
+        setPrompt("codexTurnId", turnId);
+        if (clientId) setPrompt("clientUserMessageId", clientId);
+        if (input?.snapshot) setPrompt("inputSnapshot", input.snapshot);
+        if (!prompt.text && input?.text) setPrompt("text", input.text);
+        setPrompt("startedAt", protocolTime(turn.startedAt) ?? prompt.startedAt);
+        setPrompt("completedAt", completedAt);
+        setPrompt("status", terminalStatus);
+        setPrompt("error", error);
+        for (const attempt of prompt.attempts) {
+          const matchesTurn = attempt.codexTurnId === turnId;
+          const matchesClient = Boolean(clientId) && attempt.clientUserMessageId === clientId;
+          if (!matchesTurn && !matchesClient) continue;
+          if (attempt.status !== terminalStatus || attempt.completedAt !== completedAt || attempt.codexTurnId !== turnId || JSON.stringify(attempt.error) !== JSON.stringify(error)) {
+            attempt.status = terminalStatus;
+            attempt.completedAt = completedAt;
+            attempt.codexTurnId = turnId;
+            attempt.error = error;
+            promptChanged = true;
+          }
+        }
+        if (promptChanged) {
+          prompt.updatedAt = isoNow();
+          promptChanges += 1;
+          report.repaired += 1;
+        } else {
+          report.skipped += 1;
+        }
+        historyPrompts.push(prompt);
+        for (const linked of linkedTurnPrompts.filter((item) => item.id !== prompt.id)) {
+          let linkedChanged = false;
+          const setLinked = <K extends keyof PromptRecord>(key: K, value: PromptRecord[K]) => {
+            if (JSON.stringify(linked[key]) === JSON.stringify(value)) return;
+            linked[key] = value;
+            linkedChanged = true;
+          };
+          setLinked("threadId", threadId);
+          setLinked("status", terminalStatus);
+          setLinked("completedAt", completedAt);
+          setLinked("error", error);
+          for (const attempt of linked.attempts.filter((item) => item.codexTurnId === turnId)) {
+            if (attempt.status === terminalStatus && attempt.completedAt === completedAt && JSON.stringify(attempt.error) === JSON.stringify(error)) continue;
+            attempt.status = terminalStatus;
+            attempt.completedAt = completedAt;
+            attempt.error = error;
+            linkedChanged = true;
+          }
+          if (linkedChanged) { linked.updatedAt = isoNow(); promptChanges += 1; report.repaired += 1; }
+          historyPrompts.push(linked);
+        }
+        const answerPrompts = [prompt, ...linkedTurnPrompts.filter((item) => item.id !== prompt.id)];
+        const answerPatch: Partial<AnswerRecord> = {
+          promptId: prompt.id,
+          origin: prompt.origin,
+          prompt: combinedTurnPromptText(input?.text, answerPrompts),
+          status: terminalStatus,
+          finalAnswer: partial?.text ?? "",
+          captureMode: partial?.captureMode ?? null,
+          startedAt: protocolTime(turn.startedAt) ?? prompt.startedAt,
+          completedAt,
+          clientUserMessageId: clientId ?? prompt.clientUserMessageId,
+          error,
+          metadata: buildAnswerMetadata(answerPrompts, turnId),
+        };
+        if (!existingAnswer) {
+          bundle.answers.answers.push({
+            id: randomUUID(),
+            promptId: prompt.id,
+            threadId,
+            codexTurnId: turnId,
+            origin: prompt.origin,
+            prompt: answerPatch.prompt ?? prompt.text,
+            status: terminalStatus,
+            finalAnswer: answerPatch.finalAnswer ?? "",
+            captureMode: answerPatch.captureMode ?? null,
+            startedAt: answerPatch.startedAt ?? null,
+            completedAt,
+            recordedAt: isoNow(),
+            clientUserMessageId: answerPatch.clientUserMessageId ?? null,
+            error,
+            metadata: answerPatch.metadata ?? {},
+          });
+          answerChanges += 1;
+        } else if (applyAnswerPatch(existingAnswer, answerPatch)) {
+          answerChanges += 1;
+        }
+        recordedAnswerTurnIds.add(turnId);
+        continue;
+      }
       const input = extractUserInput(items);
       const final = extractFinalAnswer(items);
       if (!input || !final) { report.ignored += 1; continue; }
-      const turnId = String(turn.id ?? turn.turnId ?? "");
-      if (!turnId) { report.ignored += 1; continue; }
-      completedTurnIds.add(turnId);
+      recordedAnswerTurnIds.add(turnId);
       const existingAnswer = bundle.answers.answers.find((answer) => answer.threadId === threadId && answer.codexTurnId === turnId);
-      const existingPrompt = bundle.prompts.prompts.find((prompt) => prompt.codexTurnId === turnId && (!prompt.threadId || prompt.threadId === threadId));
-      const clientId = findClientUserMessageId(items);
+      const existingPrompt = linkedTurnPrompts.find((prompt) => !promptWasSteeredIntoTurn(prompt, turnId));
       // Historic turns commonly have no client id. Never compare a missing id:
       // doing so reused the first null-id prompt for every turn and then pushed
       // that same object into the list repeatedly.
@@ -256,8 +580,36 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       }
       if (createdPrompt) bundle.prompts.prompts.push(prompt);
       historyPrompts.push(prompt);
+      for (const linked of linkedTurnPrompts.filter((item) => item.id !== prompt.id)) {
+        let linkedChanged = false;
+        const setLinked = <K extends keyof PromptRecord>(key: K, value: PromptRecord[K]) => {
+          if (JSON.stringify(linked[key]) === JSON.stringify(value)) return;
+          linked[key] = value;
+          linkedChanged = true;
+        };
+        setLinked("threadId", threadId);
+        setLinked("status", "completed");
+        setLinked("completedAt", turnCompletedAt);
+        setLinked("error", null);
+        for (const attempt of linked.attempts.filter((item) => item.codexTurnId === turnId)) {
+          const completedAt = turnCompletedAt ?? attempt.completedAt ?? isoNow();
+          if (attempt.status === "completed" && attempt.completedAt === completedAt && attempt.error === null) continue;
+          attempt.status = "completed";
+          attempt.completedAt = completedAt;
+          attempt.error = null;
+          linkedChanged = true;
+        }
+        if (linkedChanged) { linked.updatedAt = isoNow(); promptChanges += 1; report.repaired += 1; }
+        historyPrompts.push(linked);
+      }
 
       let repairedAnswer = false;
+      const answerPrompts = [prompt, ...linkedTurnPrompts.filter((item) => item.id !== prompt.id)];
+      const answerPrompt = combinedTurnPromptText(input.text, answerPrompts);
+      const answerMetadata = {
+        promptIds: answerPrompts.map((item) => item.id),
+        steeredPromptIds: linkedTurnPrompts.filter((item) => promptWasSteeredIntoTurn(item, turnId)).map((item) => item.id),
+      };
       if (!existingAnswer) {
         bundle.answers.answers.push({
           id: randomUUID(),
@@ -265,14 +617,16 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
           threadId,
           codexTurnId: turnId,
           origin: prompt.origin === "queue" ? "queue" : "imported",
-          prompt: prompt.text,
+          prompt: answerPrompt,
+          status: "completed",
           finalAnswer: final.text,
           captureMode: final.captureMode,
           startedAt: protocolTime(turn.startedAt),
           completedAt: protocolTime(turn.completedAt),
           recordedAt: isoNow(),
           clientUserMessageId: clientId,
-          metadata: {},
+          error: null,
+          metadata: answerMetadata,
         });
         answerChanges += 1;
         report.imported += 1;
@@ -280,12 +634,15 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
         const answerPatch: Partial<AnswerRecord> = {
           promptId: prompt.id,
           ...(prompt.origin === "queue" ? { origin: "queue" as const } : {}),
-          prompt: prompt.text,
+          prompt: answerPrompt,
+          status: "completed",
           finalAnswer: final.text,
           captureMode: final.captureMode,
           startedAt: protocolTime(turn.startedAt),
           completedAt: protocolTime(turn.completedAt),
           clientUserMessageId: clientId,
+          error: null,
+          metadata: answerMetadata,
         };
         for (const [key, value] of Object.entries(answerPatch) as Array<[keyof AnswerRecord, AnswerRecord[keyof AnswerRecord]]>) {
           if (JSON.stringify(existingAnswer[key]) === JSON.stringify(value)) continue;
@@ -301,8 +658,12 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
     // reproducible from Codex and must not leak into the currently selected tab.
     const seenAnswerTurns = new Set<string>();
     const syncedAnswers = bundle.answers.answers.filter((answer) => {
+      const linkedLifecyclePrompt = bundle.prompts.prompts.find((prompt) => prompt.threadId === threadId
+        && prompt.codexTurnId === answer.codexTurnId
+        && prompt.status === answer.status);
+      const keepLocalLifecycle = answer.status !== "completed" && Boolean(linkedLifecyclePrompt);
       const keep = answer.threadId === threadId
-        && completedTurnIds.has(answer.codexTurnId)
+        && (recordedAnswerTurnIds.has(answer.codexTurnId) || keepLocalLifecycle)
         && !seenAnswerTurns.has(answer.codexTurnId);
       if (keep) seenAnswerTurns.add(answer.codexTurnId);
       else answerChanges += 1;
@@ -315,7 +676,15 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
     // their existing order so closing and reopening cannot jump the queue.
     const historyPromptIds = new Set(historyPrompts.map((prompt) => prompt.id));
     const remainder = bundle.prompts.prompts.filter((prompt) => !historyPromptIds.has(prompt.id));
-    const completedRemainder = remainder.filter((prompt) => prompt.threadId === threadId && prompt.status === "completed");
+    // Imported history is reproducible from the provider transcript. If a
+    // newer parser no longer recognizes an imported turn (for example a
+    // Claude system task notification that was previously mistaken for a
+    // human prompt), remove that stale record on the next sync. Keep locally
+    // recorded queue/manual completions because the provider transcript can
+    // lag briefly behind the durable local lifecycle record.
+    const completedRemainder = remainder.filter((prompt) => prompt.threadId === threadId
+      && prompt.status === "completed"
+      && prompt.origin !== "imported");
     const currentNonPending = remainder.filter((prompt) => prompt.threadId === threadId && prompt.status !== "completed" && prompt.status !== "pending");
     const queuedPending = remainder.filter((prompt) => prompt.status === "pending" && (!prompt.threadId || prompt.threadId === threadId));
     const orderedPrompts = [
