@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexRpcClient, waitForThreadLoaded } from "./codex.js";
 
 describe("remote TUI attach", () => {
@@ -113,6 +116,73 @@ describe("turn completion recovery", () => {
     await expect(rpc.waitForThreadIdle("thread-idle", 1_000, 0)).resolves.toBeUndefined();
     expect(rpc.activeTurnIds("thread-idle")).toEqual([]);
     expect(rpc.readThreadSummary).toHaveBeenCalledWith("thread-idle", expect.any(Number));
+    expect(rpc.readThread).not.toHaveBeenCalled();
+  });
+});
+
+describe("settling a turn from the rollout", () => {
+  const codexHome = process.env.CODEX_HOME;
+  const roots: string[] = [];
+  afterEach(async () => {
+    if (codexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = codexHome;
+    await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  const writeRollout = async (threadId: string, lines: string[]): Promise<void> => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-home-"));
+    roots.push(root);
+    process.env.CODEX_HOME = root;
+    const directory = path.join(root, "sessions", "2026", "08", "27");
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, `rollout-2026-08-27T00-00-00-${threadId}.jsonl`), lines.join("\n"), "utf8");
+  };
+
+  const event = (type: string, turnId: string, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ timestamp: "2026-08-27T14:46:53.402Z", type: "event_msg", payload: { type, turn_id: turnId, ...extra } });
+
+  it("finds the completion on disk instead of asking for the whole conversation", async () => {
+    await writeRollout("thread-rollout", [
+      event("task_started", "turn-rollout", { started_at: 1787840018 }),
+      event("item_completed", "turn-rollout", { item: { type: "UserMessage", content: [{ type: "text", text: "队列提示" }], client_id: "codex-promptor-9" } }),
+      event("task_complete", "turn-rollout", { last_agent_message: "已完成部署" }),
+    ]);
+
+    const rpc = new CodexRpcClient();
+    (rpc as any).turns.set("turn-rollout", {
+      threadId: "thread-rollout", turnId: "turn-rollout",
+      turn: { id: "turn-rollout", status: "inProgress" }, items: [], startedAt: null,
+    });
+    rpc.readThreadSummary = vi.fn().mockResolvedValue({ thread: { id: "thread-rollout", status: { type: "idle" }, updatedAt: "settled" } });
+    rpc.readThread = vi.fn();
+
+    const completed = await rpc.waitForTurn("turn-rollout", 2_000, 0);
+
+    expect(completed.turn).toMatchObject({ id: "turn-rollout", status: "completed" });
+    expect(completed.items).toContainEqual(expect.objectContaining({ phase: "final_answer", text: "已完成部署" }));
+    // A thread/read here would carry the entire conversation over the socket to
+    // settle one turn -- and past a point could not be received at all, leaving
+    // the queue waiting on a completion it had no way left to look up.
+    expect(rpc.readThread).not.toHaveBeenCalled();
+  });
+
+  it("keeps waiting while the rollout shows the turn still running", async () => {
+    await writeRollout("thread-running", [
+      event("task_started", "turn-running", { started_at: 1787840018 }),
+      event("item_completed", "turn-running", { item: { type: "UserMessage", content: [{ type: "text", text: "还在跑" }] } }),
+    ]);
+
+    const rpc = new CodexRpcClient();
+    (rpc as any).turns.set("turn-running", {
+      threadId: "thread-running", turnId: "turn-running",
+      turn: { id: "turn-running", status: "inProgress" }, items: [], startedAt: null,
+    });
+    rpc.readThreadSummary = vi.fn().mockResolvedValue({ thread: { id: "thread-running", status: { type: "idle" }, updatedAt: "settled" } });
+    rpc.readThread = vi.fn();
+
+    // The projection calling the thread idle does not finish a turn the
+    // append-only record says is still in flight.
+    await expect(rpc.waitForTurn("turn-running", 120, 0)).rejects.toThrow("TURN_TIMEOUT");
     expect(rpc.readThread).not.toHaveBeenCalled();
   });
 });

@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 import net from "node:net";
 import WebSocket from "ws";
 import type { AppServerOwnership } from "../shared/schemas.js";
+import { readCodexRolloutThread } from "./codex-history.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -399,8 +400,7 @@ export class CodexRpcClient extends EventEmitter {
         // above all one that fails by closing the connection -- must not be
         // repeated on every poll until the thread reaches a new settled state.
         lastSettledSummaryKey = summaryKey;
-        const fullResponse = await this.readThread(accumulator.threadId, Math.min(30_000, Math.max(1, deadline - Date.now())));
-        const thread = unwrapThread(fullResponse);
+        const thread = await this.readSettledTurns(accumulator.threadId, Math.max(1, deadline - Date.now()));
         const turn = Array.isArray(thread?.turns)
           ? thread.turns.find((item: any) => String(item?.id ?? item?.turnId ?? "") === turnId)
           : null;
@@ -439,6 +439,24 @@ export class CodexRpcClient extends EventEmitter {
       const completedAfterSubscribe = this.completed.get(turnId);
       if (completedAfterSubscribe) { cleanup(); resolve(completedAfterSubscribe); }
     });
+  }
+
+  /**
+   * The thread's turns, taken from the rollout whenever there is one.
+   *
+   * Settling a single turn through `thread/read` means receiving the entire
+   * conversation in one frame: tens of megabytes on a thread that has run for
+   * weeks, and past a point too large to receive or to be worth parsing at
+   * all -- at which point a queue prompt would wait for a completion that
+   * could no longer be looked up. The rollout is the append-only record the
+   * App Server's own projection is built from, so it is both cheaper to read
+   * and never behind. The API is asked only for a thread that has not been
+   * written to disk yet, which is the one case the file cannot answer.
+   */
+  private async readSettledTurns(threadId: string, remainingMs: number): Promise<any> {
+    const fromRollout = await readCodexRolloutThread(threadId).catch(() => null);
+    if (fromRollout) return fromRollout;
+    return unwrapThread(await this.readThread(threadId, Math.min(30_000, remainingMs)));
   }
 
   private rememberCompletedTurn(event: TurnCompletedEvent): TurnCompletedEvent {

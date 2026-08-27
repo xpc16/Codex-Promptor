@@ -217,6 +217,14 @@ export function mergeRolloutTurns(thread: any, rolloutTurns: CodexRolloutTurn[])
   return { ...thread, turns: [...(Array.isArray(thread?.turns) ? thread.turns : []), ...missing] };
 }
 
+/** A thread's turns as its rollout records them, or null when no rollout has been written yet. */
+export async function readCodexRolloutThread(threadId: string, hintedPath: string | null = null): Promise<CodexRolloutThread | null> {
+  if (!threadId) return null;
+  const file = await locateCodexRollout(threadId, hintedPath);
+  if (!file) return null;
+  return readCodexRollout(file, threadId);
+}
+
 /**
  * Best effort by design: a rollout that cannot be found or read must never
  * break a sync that the App Server alone can already satisfy.
