@@ -83,6 +83,27 @@ describe("turn completion recovery", () => {
     expect(rpc.readThread).toHaveBeenCalledTimes(1);
   });
 
+  it("does not retry a full history read that failed while the summary is unchanged", async () => {
+    const rpc = new CodexRpcClient();
+    (rpc as any).turns.set("turn-unreadable", {
+      threadId: "thread-unreadable",
+      turnId: "turn-unreadable",
+      turn: { id: "turn-unreadable", status: "inProgress" },
+      items: [],
+      startedAt: null,
+    });
+    rpc.readThreadSummary = vi.fn().mockResolvedValue({
+      thread: { id: "thread-unreadable", status: { type: "idle" }, updatedAt: "settled" },
+    });
+    // Standing in for the read that overflows the frame limit: retrying it on
+    // every poll is what turned one unreadable thread into a repeating failure.
+    rpc.readThread = vi.fn().mockRejectedValue(new Error("CODEX_THREAD_TOO_LARGE:thread-unreadable"));
+
+    await expect(rpc.waitForTurn("turn-unreadable", 120, 0)).rejects.toThrow("TURN_TIMEOUT");
+    expect(rpc.readThread).toHaveBeenCalledTimes(1);
+    expect((rpc.readThreadSummary as any).mock.calls.length).toBeGreaterThan(1);
+  });
+
   it("clears a stale active-thread marker from an idle thread summary", async () => {
     const rpc = new CodexRpcClient();
     (rpc as any).activeThreads.add("thread-idle");

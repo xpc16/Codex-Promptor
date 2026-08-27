@@ -38,6 +38,29 @@ type TurnAccumulator = {
 
 const THREAD_SUMMARY_POLL_MS = 5_000;
 
+/**
+ * Ceiling for a single app-server response.
+ *
+ * `thread/read` has no pagination: `includeTurns: true` returns the whole
+ * rollout in one frame, so this response is bounded only by how long the
+ * conversation ran, and rollouts above 200MB exist. Accepting one would mean a
+ * buffer that size, a string that size, and the parsed object graph on top of
+ * both -- all to extract a single turn -- so the limit is stated here rather
+ * than inherited from `ws`, which applies the same 100MB by default and tears
+ * the connection down with an unattributed RangeError when it is passed.
+ * Raise it with CODEX_PROMPTOR_CODEX_MAX_FRAME_MB if a large thread matters
+ * more than the memory that reading it costs.
+ */
+const MAX_RPC_FRAME_MB = boundedFrameLimit(process.env.CODEX_PROMPTOR_CODEX_MAX_FRAME_MB);
+/** The `ws` error code for a frame that declares more bytes than `maxPayload` allows. */
+const WS_OVERSIZED_FRAME = "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH";
+
+function boundedFrameLimit(raw: string | undefined): number {
+  const megabytes = Number(raw);
+  if (!Number.isFinite(megabytes)) return 100;
+  return Math.min(512, Math.max(1, Math.trunc(megabytes)));
+}
+
 export class CodexRpcClient extends EventEmitter {
   private socket: WebSocket | null = null;
   private nextId = 1;
@@ -46,6 +69,22 @@ export class CodexRpcClient extends EventEmitter {
   private readonly completed = new Map<string, TurnCompletedEvent>();
   private readonly activeThreads = new Set<string>();
   private connectPromise: Promise<void> | null = null;
+  /**
+   * Threads whose history does not fit in a frame. Asking again would only
+   * kill the connection again, so the full read is abandoned for the rest of
+   * this process and the turn is carried by streamed items instead.
+   */
+  private readonly oversizedThreads = new Set<string>();
+  /** When the socket last died of an oversized frame, so the read that caused it can be identified. */
+  private overflowedAt = 0;
+
+  constructor() {
+    super();
+    // EventEmitter turns an unobserved `error` event into a thrown exception.
+    // A failed upstream socket has to fail the calls that depend on it, not
+    // stop a service that is also hosting terminals for other providers.
+    this.on("error", () => undefined);
+  }
 
   get connected(): boolean { return this.socket?.readyState === WebSocket.OPEN; }
 
@@ -53,9 +92,15 @@ export class CodexRpcClient extends EventEmitter {
     if (this.connected) return;
     if (this.connectPromise) return this.connectPromise;
     this.connectPromise = new Promise<void>((resolve, reject) => {
-      const socket = new WebSocket(url);
+      const socket = new WebSocket(url, { maxPayload: MAX_RPC_FRAME_MB * 1024 * 1024 });
       this.socket = socket;
       let settled = false;
+      // An oversized frame is a connection-level failure in the WebSocket
+      // protocol rather than a failed request, so the only way to blame the
+      // request that caused it is to note when it happened.
+      const noteOverflow = (error: Error) => {
+        if ((error as { code?: string }).code === WS_OVERSIZED_FRAME) this.overflowedAt = Date.now();
+      };
       const fail = (error: Error) => {
         if (settled) return;
         settled = true;
@@ -64,6 +109,7 @@ export class CodexRpcClient extends EventEmitter {
         reject(error);
       };
       const onSocketError = (error: Error) => {
+        noteOverflow(error);
         if (!settled) fail(error);
         else this.emit("error", error);
       };
@@ -76,7 +122,7 @@ export class CodexRpcClient extends EventEmitter {
           this.notify("initialized", {});
           settled = true;
           socket.removeListener("error", onSocketError);
-          socket.on("error", (error) => this.emit("error", error));
+          socket.on("error", (error) => { noteOverflow(error); this.emit("error", error); });
           resolve();
         } catch (error) {
           fail(error instanceof Error ? error : new Error(String(error)));
@@ -188,7 +234,20 @@ export class CodexRpcClient extends EventEmitter {
   }
 
   async readThread(threadId: string, timeoutMs = 30_000): Promise<any> {
-    return this.request("thread/read", { threadId, includeTurns: true }, timeoutMs);
+    if (this.oversizedThreads.has(threadId)) throw new Error(`CODEX_THREAD_TOO_LARGE:${threadId}`);
+    const startedAt = Date.now();
+    try {
+      return await this.request("thread/read", { threadId, includeTurns: true }, timeoutMs);
+    } catch (error) {
+      // The frame limit closes the socket instead of failing one request, so
+      // this read comes back as a disconnect. Recognising it here is what
+      // stops the next poll from asking for the same oversized history.
+      if (this.overflowedAt >= startedAt) {
+        this.oversizedThreads.add(threadId);
+        throw new Error(`CODEX_THREAD_TOO_LARGE:${threadId}`);
+      }
+      throw error;
+    }
   }
 
   async readThreadSummary(threadId: string, timeoutMs = 30_000): Promise<any> {
@@ -270,9 +329,12 @@ export class CodexRpcClient extends EventEmitter {
         const summaryKey = settledSummaryKey(summary);
         if (summaryKey === lastSettledSummaryKey) continue;
 
+        // Recorded before the read rather than after it: a read that fails --
+        // above all one that fails by closing the connection -- must not be
+        // repeated on every poll until the thread reaches a new settled state.
+        lastSettledSummaryKey = summaryKey;
         const fullResponse = await this.readThread(accumulator.threadId, Math.min(30_000, Math.max(1, deadline - Date.now())));
         const thread = unwrapThread(fullResponse);
-        lastSettledSummaryKey = summaryKey;
         const turn = Array.isArray(thread?.turns)
           ? thread.turns.find((item: any) => String(item?.id ?? item?.turnId ?? "") === turnId)
           : null;
@@ -450,6 +512,17 @@ export class AppServerManager extends EventEmitter {
   private ownershipInfo: AppServerOwnership | null = null;
   private _status: CodexManagerStatus = { state: "stopped", url: null, error: null };
 
+  constructor() {
+    super();
+    // A dropped RPC socket leaves the child process listening but unreachable.
+    // Without this the manager goes on reporting "ready" while every call
+    // fails against a socket that is gone, and nothing ever restarts it.
+    this.rpc.on("disconnected", () => {
+      if (this.intentionalStop || this.stopPromise || this._status.state !== "ready") return;
+      void this.discardAfterDisconnect();
+    });
+  }
+
   get status(): CodexManagerStatus { return { ...this._status }; }
   get remoteUrl(): string | null { return this.url; }
   get ownership(): AppServerOwnership | null { return this.ownershipInfo ? { ...this.ownershipInfo } : null; }
@@ -537,6 +610,15 @@ export class AppServerManager extends EventEmitter {
     this.port = null;
     this.url = null;
     this.setStatus({ state: "stopped", url: null, error: null });
+  }
+
+  /** Retire a server that can no longer be reached, so the next ensureReady starts a fresh one. */
+  private async discardAfterDisconnect(): Promise<void> {
+    const child = this.process;
+    this.process = null;
+    this.ownershipInfo = null;
+    this.setStatus({ state: "error", url: this.url, error: "CODEX_APP_SERVER_DISCONNECTED" });
+    if (child?.pid) await terminateProcessTree(child.pid).catch(() => undefined);
   }
 
   private setStatus(status: CodexManagerStatus): void {
