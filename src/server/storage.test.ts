@@ -69,4 +69,38 @@ describe("bounded tab history", () => {
     expect(page).toMatchObject({ start: 0, total: 2 });
     expect(page.records.map((prompt) => prompt.text)).toEqual(["current"]);
   });
+
+  it("reads finished prompts in the order they finished, not the order they were queued", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-storage-"));
+    temporaryRoots.push(root);
+    const storage = new StorageService(root);
+    const tab = await storage.createTab("order");
+    await storage.updateTab(tab.id, (current) => ({
+      ...current,
+      session: { ...current.session, provider: "codex", state: "ready", threadId: "thread", sessionId: "thread" },
+      updatedAt: isoNow(),
+    }));
+    const bundle = await storage.readTab(tab.id);
+    // Queued first but retried, so it finished last -- the case that made the
+    // stored order the wrong thing to read the history in.
+    const settled = (text: string, completedAt: string) => ({ ...newPrompt(text), threadId: "thread", status: "completed" as const, completedAt });
+    const queued = { ...newPrompt("still queued"), threadId: "thread" };
+
+    bundle.prompts.prompts = [
+      settled("retried", "2026-08-27T12:05:00.000Z"),
+      settled("second", "2026-08-27T12:01:00.000Z"),
+      settled("third", "2026-08-27T12:02:00.000Z"),
+      queued,
+    ];
+    bundle.prompts.revision += 1;
+    bundle.prompts.updatedAt = isoNow();
+    await storage.writePrompts(tab.id, bundle.prompts);
+
+    const window = await storage.readTabWindow(tab.id, 10, 10);
+    expect(window.prompts.prompts.map((prompt) => prompt.text))
+      .toEqual(["second", "third", "retried", "still queued"]);
+    // The stored file is untouched: this is a reading order, not a rewrite.
+    expect((await storage.readTab(tab.id)).prompts.prompts.map((prompt) => prompt.text))
+      .toEqual(["retried", "second", "third", "still queued"]);
+  });
 });

@@ -20,6 +20,16 @@ export function workspaceSplit(tabId: string, fallback: number): PaneSizeSpec {
   return { key: `${KEY_PREFIX}split.${tabId}`, fallback, min: 24, max: 76 };
 }
 
+/**
+ * How much of the conversation column the session card takes.
+ *
+ * Unset until the reader drags it, so a conversation that needs three lines of
+ * session detail still gets three lines rather than a third of the column.
+ */
+export function conversationSplit(tabId: string): PaneSizeSpec {
+  return { key: `${KEY_PREFIX}session.${tabId}`, fallback: 38, min: 12, max: 80 };
+}
+
 export function clampPaneSize(value: number, spec: PaneSizeSpec): number {
   if (!Number.isFinite(value)) return spec.fallback;
   return Math.max(spec.min, Math.min(spec.max, value));
@@ -31,14 +41,19 @@ export function browserPaneStore(): PaneStore | null {
   catch { return null; }
 }
 
-export function readPaneSize(spec: PaneSizeSpec, store: PaneStore | null = browserPaneStore()): number {
-  if (!store) return spec.fallback;
+/** null when this browser has never been told, so a caller can keep its own default. */
+export function readStoredPaneSize(spec: PaneSizeSpec, store: PaneStore | null = browserPaneStore()): number | null {
+  if (!store) return null;
   try {
     const raw = store.getItem(spec.key);
-    if (raw === null) return spec.fallback;
+    if (raw === null) return null;
     const value = Number(raw);
-    return Number.isFinite(value) ? clampPaneSize(value, spec) : spec.fallback;
-  } catch { return spec.fallback; }
+    return Number.isFinite(value) ? clampPaneSize(value, spec) : null;
+  } catch { return null; }
+}
+
+export function readPaneSize(spec: PaneSizeSpec, store: PaneStore | null = browserPaneStore()): number {
+  return readStoredPaneSize(spec, store) ?? spec.fallback;
 }
 
 export function writePaneSize(spec: PaneSizeSpec, value: number, store: PaneStore | null = browserPaneStore()): void {

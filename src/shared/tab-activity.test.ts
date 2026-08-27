@@ -4,6 +4,7 @@ import {
   completionNoticeExpiresAt,
   latestQueueCompletion,
   promptIsExecuting,
+  runnerIsWorking,
   tabVisualState,
   type TabActivitySummary,
 } from "./tab-activity.js";
@@ -38,5 +39,23 @@ describe("tab activity", () => {
 
     expect(latestQueueCompletion([older, manual, newer])).toBe(newer.completedAt);
     expect(completionNoticeExpiresAt(newer.completedAt)).toBe(Date.parse(newer.completedAt) + 30_000);
+  });
+});
+
+describe("what counts as the agent working", () => {
+  it("keeps reading as working while the queue is set to stop after this turn", () => {
+    // "pausing" is a decision about the *next* prompt; the current one is
+    // still running, so the indicator must not go dark yet.
+    expect(runnerIsWorking("pausing")).toBe(true);
+    expect(runnerIsWorking("dispatching")).toBe(true);
+    expect(runnerIsWorking("running")).toBe(true);
+  });
+
+  it("does not count idle or failed states as working", () => {
+    expect(runnerIsWorking("paused")).toBe(false);
+    expect(runnerIsWorking("waiting_for_prompt")).toBe(false);
+    expect(runnerIsWorking("waiting_for_thread")).toBe(false);
+    expect(runnerIsWorking("starting")).toBe(false);
+    expect(runnerIsWorking("error")).toBe(false);
   });
 });

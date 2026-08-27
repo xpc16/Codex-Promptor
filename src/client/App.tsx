@@ -13,7 +13,7 @@ import {
 import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta, TabRecordPage } from "../shared/schemas.js";
 import type { TerminalScreenFrame, TerminalTransportMode, TerminalTransportPreference } from "../shared/terminal-protocol.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
-import { completionNoticeExpiresAt, latestQueueCompletion, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
+import { completionNoticeExpiresAt, latestQueueCompletion, runnerIsWorking, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
 import { EARLIER_ANSWER_PAGE, EARLIER_PROMPT_PAGE, INITIAL_ANSWER_WINDOW, INITIAL_PROMPT_WINDOW } from "../shared/tab-window.js";
 import ReactMarkdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
@@ -27,11 +27,13 @@ import { MOBILE_PANES, type MobilePane } from "./mobile-pane.js";
 import { dialogSurvivesIndex, nextSelectedTabId, shouldAdoptIndexRevision } from "./index-sync.js";
 import { applyTabMessage } from "./tab-bundle-delta.js";
 import { forgetCachedTab, readCachedTab, rememberTab, retainCachedTabs, windowLimits } from "./tab-cache.js";
-import { CONSOLE_WIDTH, readPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
+import { CONSOLE_WIDTH, conversationSplit, readPaneSize, readStoredPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
+import { isAtBottom, isNearTop } from "./scroll-anchor.js";
 import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
 import { autoSizedHeight, readTextareaMetrics } from "./textarea-autosize.js";
 import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenState } from "./terminal-projection.js";
 import { readTerminalTransportPreference, resolveTerminalTransportPreference, writeTerminalTransportPreference } from "./terminal-preference.js";
+import { createConnectionAlarm, reconnectDelay } from "./socket-retry.js";
 import { forgetCachedTerminal, readCachedProjection, readCachedRawTerminal, rememberProjection, rememberRawTerminal, retainCachedTerminals } from "./terminal-cache.js";
 import {
   createI18n,
@@ -63,6 +65,22 @@ async function api<T = any>(url: string, init: RequestInit = {}): Promise<T> {
 }
 
 function jsonBody(value: unknown): RequestInit { return { method: "POST", body: JSON.stringify(value) }; }
+
+/**
+ * Sockets this screen closed on purpose -- leaving a tab, switching transport,
+ * unmounting. A WebSocket reports an error for any abnormal close, including
+ * one we asked for, and that error arrives a tick later: long enough for the
+ * reader to have switched back and for the "is this tab still active" guard to
+ * read true again. Marking the socket is the only account of intent that
+ * survives that gap.
+ */
+const deliberateCloses = new WeakSet<WebSocket>();
+
+function closeSocketQuietly(socket: WebSocket | null): void {
+  if (!socket) return;
+  deliberateCloses.add(socket);
+  try { socket.close(); } catch { /* already gone */ }
+}
 
 
 let promptCompletionAudioContext: AudioContext | null = null;
@@ -624,6 +642,9 @@ function Welcome({ onCreate }: { onCreate: () => void }) {
 
 function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: number, hasEarlier = false, onLoadEarlier?: () => Promise<number>) {
   const [visibleCount, setVisibleCount] = useState(pageSize);
+  // Whether the reader is following the tail. Recorded as they scroll, because
+  // by the time the layout effect below runs the list has already grown.
+  const following = useRef(true);
   // Scrolling to the top is the usual way back through history, but an opening
   // window of a few short records may not overflow its pane at all, leaving
   // nothing to scroll. The reveal is therefore also exposed as a control.
@@ -659,7 +680,10 @@ function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: num
   }, [hasEarlier, items.length, onLoadEarlier, pageSize, visibleCount]);
 
   const onScroll = useCallback(() => {
-    if ((scrollRef.current?.scrollTop ?? Number.POSITIVE_INFINITY) <= 48) void revealEarlier();
+    const element = scrollRef.current;
+    if (!element) return;
+    following.current = isAtBottom(element);
+    if (isNearTop(element)) void revealEarlier();
   }, [revealEarlier]);
 
   useLayoutEffect(() => {
@@ -669,7 +693,7 @@ function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: num
     if (anchor) {
       element.scrollTop = anchor.top + (element.scrollHeight - anchor.height);
       prependAnchor.current = null;
-    } else {
+    } else if (following.current) {
       element.scrollTop = element.scrollHeight;
     }
   }, [contentKey, visibleCount]);
@@ -701,6 +725,11 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
   const [leftWidth, setLeftWidth] = useState(() => readPaneSize(splitSpec));
   const dragging = useRef(false);
   const workspace = useRef<HTMLDivElement>(null);
+  // How tall the session card is, in this browser only. Null until dragged, so
+  // an untouched conversation keeps sizing the card to its own content.
+  const sessionSpec = useMemo(() => conversationSplit(tab.id), [tab.id]);
+  const [sessionHeight, setSessionHeight] = useState<number | null>(() => readStoredPaneSize(sessionSpec));
+  const conversation = useRef<HTMLElement>(null);
   const [reopening, setReopening] = useState(false);
   const loadSequence = useRef(0);
   const initialBundleApplied = useRef(Boolean(cached));
@@ -823,6 +852,27 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
     return () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
   }, [active, leftWidth, splitSpec]);
+  // Pointer events rather than mouse: this divider is worth having on a phone,
+  // where the conversation column is the whole screen.
+  const dragSessionHeight = (event: PointerEvent<HTMLDivElement>) => {
+    const pane = conversation.current;
+    if (!pane) return;
+    const rect = pane.getBoundingClientRect();
+    if (rect.height <= 0) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    let latest = sessionHeight ?? 38;
+    const move = (moveEvent: globalThis.PointerEvent) => {
+      latest = Math.max(12, Math.min(80, ((moveEvent.clientY - rect.top) / rect.height) * 100));
+      setSessionHeight(latest);
+    };
+    const release = () => {
+      window.removeEventListener("pointermove", move);
+      writePaneSize(sessionSpec, latest);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", release, { once: true });
+    window.addEventListener("pointercancel", release, { once: true });
+  };
   if (!bundle) return <div className={`tab-view ${active ? "" : "tab-view-hidden"}`} aria-hidden={!active}><div className="loading-pane">{loadError ? <><strong>{t("conversation.loadFailed")}</strong><span>{i18n.errorText(loadError)}</span><button className="ghost" onClick={() => void load()}>{t("action.retry")}</button></> : <><div className="spinner" />{t("conversation.loading")}</>}</div></div>;
   const closed = bundle.tab.session.state === "closed";
   const runnable = bundle.tab.session.state === "ready" && Boolean(bundle.tab.session.threadId);
@@ -836,7 +886,7 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
   const threadId = bundle.tab.session.threadId;
   const answers = threadId ? bundle.answers.answers.filter((answer) => answer.threadId === threadId) : [];
   return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspace} style={{ gridTemplateColumns: `${leftWidth}fr 7px ${100 - leftWidth}fr` }}>
-    <section className="conversation-pane">{active && <><SessionPanel bundle={bundle} reopening={reopening} onReopen={reopen} onBundle={applyBundle} onError={onError} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
+    <section className="conversation-pane" ref={conversation}>{active && <><SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} onReopen={reopen} onBundle={applyBundle} onError={onError} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
     <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) dragging.current = true; }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
     <section className="queue-pane">{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} terminalPreference={terminalPreference} projectionSupported={projectionSupported} onTerminalPreferenceChange={onTerminalPreferenceChange} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
   </div></div>;
@@ -846,7 +896,7 @@ function orderedTabIds(tabs: TabMeta[], groupId: string | null): string[] {
   return tabs.filter((tab) => tab.groupId === groupId).sort((a, b) => a.order - b.order).map((tab) => tab.id);
 }
 
-function SessionPanel({ bundle, reopening, onReopen, onBundle, onError }: { bundle: TabBundle; reopening: boolean; onReopen: () => Promise<void>; onBundle: (bundle: TabBundle) => void; onError: (error: unknown) => void }) {
+function SessionPanel({ bundle, height, reopening, onReopen, onBundle, onError }: { bundle: TabBundle; height: number | null; reopening: boolean; onReopen: () => Promise<void>; onBundle: (bundle: TabBundle) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   const [cwd, setCwd] = useState(bundle.tab.session.workingDirectory ?? "");
@@ -893,7 +943,7 @@ function SessionPanel({ bundle, reopening, onReopen, onBundle, onError }: { bund
     : connected
       ? t(session.provider === "claude" ? "session.connectedHelp.claude" : session.provider === "cursor" ? "session.connectedHelp.cursor" : session.provider === "shell" ? "session.connectedHelp.shell" : "session.connectedHelp.codex")
       : t("session.setupHelp");
-  return <div className="session-card">
+  return <div className="session-card" style={height === null ? undefined : { height: `${height}%`, maxHeight: "none" }}>
     <div className="section-title"><span className="section-icon">◌</span><div><strong>{sessionTitle}</strong><small>{sessionHelp}</small></div></div>
     {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t("session.workingDirectory")}</span><code>{session.workingDirectory}</code></div>{session.provider !== "shell" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <button className="danger-action" disabled={busy} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>}</div></div> : <>
       <label className="field-label">{t("session.localPath")}</label><div className="path-row"><input value={cwd} title={cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t("session.pathExample")} /><button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button></div>{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}
@@ -1003,7 +1053,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   };
   const runnerState = runnerLabel(i18n, runtime);
   const completedCount = bundle.window?.prompts.completed ?? prompts.filter((item) => item.status === "completed").length;
-  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "running" ? "running" : runtime.runner.state === "error" ? "error" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "start"} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
+  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : runnerIsWorking(runtime.runner.state) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "start"} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
     <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t("queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}
@@ -1053,7 +1103,7 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
   const editor = useRef<HTMLTextAreaElement>(null);
   useAutoSizedTextarea(editor, text, editing);
   useEffect(() => { setText(prompt.text); setEditing(false); }, [prompt.text, prompt.status]);
-  const beginEdit = () => { if (!editable) return; setEditing(true); requestAnimationFrame(() => { editor.current?.focus(); editor.current?.select(); }); };
+  const beginEdit = () => { if (!editable) return; setEditing(true); requestAnimationFrame(() => { editor.current?.focus({ preventScroll: true }); editor.current?.select(); }); };
   const save = async () => {
     if (!editable) return;
     if (!text.trim()) { onError(new PromptorApiError("PROMPT_EMPTY", t("queue.promptEmpty"), 400, false)); return; }
@@ -1127,6 +1177,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, termin
     let terminalWriteQueue = Promise.resolve();
     let longTerminal = false;
     let connectedOnce = false;
+    const alarm = createConnectionAlarm();
     const projectionMode = transportMode === "projection";
     // Reconnecting with no cursor makes the server resend the whole scroll
     // buffer. What this page already received is still good, so the cursor and
@@ -1391,7 +1442,8 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, termin
       const ws = new WebSocket(`${protocol}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ""}`);
       socket.current = ws;
       ws.onopen = () => {
-        if (disposed || closedRef.current || !activeRef.current) { ws.close(); return; }
+        if (disposed || closedRef.current || !activeRef.current) { closeSocketQuietly(ws); return; }
+        alarm.noteSuccess();
         setConnected(true);
         const reconnecting = connectedOnce;
         if (!projectionMode && reconnecting) resizeScheduler.invalidate();
@@ -1430,13 +1482,18 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, termin
           }
         } catch { /* ignore malformed terminal frames */ }
       };
-      ws.onerror = () => { if (!closedRef.current && activeRef.current) callbacks.current.onError({ code: "TERMINAL_WEBSOCKET_FAILED", message: "Terminal WebSocket connection failed" }); };
+      // Errors are counted, not announced. The close handler below decides
+      // whether the reader needs to know, because only it can tell a drop that
+      // reconnects from an outage that does not.
+      ws.onerror = () => { /* handled on close */ };
       ws.onclose = () => {
         if (socket.current !== ws) return;
         socket.current = null;
         if (disposed) return;
         setConnected(false);
-        if (!closedRef.current && activeRef.current) reconnectTimer = window.setTimeout(scheduleConnect, 750);
+        if (closedRef.current || !activeRef.current || deliberateCloses.has(ws)) return;
+        if (alarm.noteFailure()) callbacks.current.onError({ code: "TERMINAL_WEBSOCKET_FAILED", message: t("terminal.connectionLost") });
+        reconnectTimer = window.setTimeout(scheduleConnect, reconnectDelay(alarm.failures()));
       };
     };
     const scheduleConnect = () => {
@@ -1476,12 +1533,12 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, termin
       terminalWriteSequence += 1;
       observer.disconnect();
       inputDisposable.dispose(); foregroundQuery.dispose(); backgroundQuery.dispose(); colorSchemeQuery.dispose(); cursorBlinkOn.dispose(); cursorBlinkOff.dispose();
-      socket.current?.close(); term.dispose(); terminal.current = null; socket.current = null;
+      closeSocketQuietly(socket.current); term.dispose(); terminal.current = null; socket.current = null;
     };
   }, [tabId, transportMode]);
   useEffect(() => {
     if (!active) {
-      socket.current?.close();
+      closeSocketQuietly(socket.current);
       setConnected(false);
       terminal.current?.blur();
       return;
@@ -1502,7 +1559,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, termin
   useEffect(() => {
     closedRef.current = closed;
     if (closed) {
-      socket.current?.close();
+      closeSocketQuietly(socket.current);
       setConnected(false);
     } else reconnect.current?.();
   }, [closed]);

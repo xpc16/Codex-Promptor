@@ -11,11 +11,23 @@ export type TabActivitySummary = {
 
 export type TabVisualState = "closed" | "idle" | "running" | "error" | "neutral";
 
+/**
+ * States in which the agent is on a turn right now.
+ *
+ * "pausing" belongs here: it means the queue will stop *after* the current
+ * turn, so the agent is still working and the indicator must still read as
+ * working. What the pause changed is whether the queue keeps rolling, and
+ * that is a separate indicator.
+ */
+const WORKING_RUNNER_STATES: ReadonlySet<RuntimeFile["runner"]["state"]> = new Set(["dispatching", "running", "pausing"]);
+
+export function runnerIsWorking(state: RuntimeFile["runner"]["state"]): boolean {
+  return WORKING_RUNNER_STATES.has(state);
+}
+
 export function promptIsExecuting(activity: TabActivitySummary | undefined): boolean {
   if (!activity?.activePromptId) return false;
-  return activity.runnerState === "dispatching"
-    || activity.runnerState === "running"
-    || activity.runnerState === "pausing";
+  return runnerIsWorking(activity.runnerState);
 }
 
 export function tabVisualState(sessionState: Session["state"], activity: TabActivitySummary | undefined): TabVisualState {

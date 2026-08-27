@@ -25,6 +25,7 @@ import {
   defaultSession,
 } from "../shared/schemas.js";
 import { latestQueueCompletion, type TabActivitySummary } from "../shared/tab-activity.js";
+import { sortSettledByCompletion } from "../shared/prompt-order.js";
 import { buildRecordDelta, type AnswerDelta, type PromptDelta } from "../shared/tab-delta.js";
 import {
   EARLIER_ANSWER_PAGE,
@@ -411,11 +412,15 @@ function currentPromptRecords(tab: TabMeta, records: readonly PromptRecord[], an
   if (tab.session.provider === "shell") return [];
   const threadId = tab.session.threadId;
   const answerPromptIds = new Set(answers.map((answer) => answer.promptId));
-  return records
+  const visible = records
     .filter((prompt) => Boolean(threadId) && prompt.threadId === threadId
       || (!prompt.threadId && answerPromptIds.has(prompt.id))
       || (prompt.status === "pending" && !prompt.threadId))
     .map(withoutTransportBallast);
+  // Read order, not storage order: retries and queue-jumping mean a prompt can
+  // finish well out of the sequence it was added in. Applied here so the reads
+  // and the broadcast deltas all agree on one order.
+  return sortSettledByCompletion(visible);
 }
 
 /**
