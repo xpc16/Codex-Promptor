@@ -1,5 +1,5 @@
 import type { AnswerRecord, RuntimeFile, TabBundle, TabMeta } from "../shared/schemas.js";
-import { applyRecordDelta, type AnswerDelta, type PromptDelta } from "../shared/tab-delta.js";
+import { applyRecordDelta, moveIsApplicable, type AnswerDelta, type PromptDelta } from "../shared/tab-delta.js";
 
 export type TabMessageResult = { bundle: TabBundle; changed: boolean; needsSnapshot: boolean };
 
@@ -45,6 +45,8 @@ export function applyTabMessage(bundle: TabBundle, message: any): TabMessageResu
     const delta = message.delta as PromptDelta;
     if (delta.revision <= bundle.prompts.revision) return unchanged(bundle);
     if (delta.revision > bundle.prompts.revision + 1) return missing(bundle);
+    // A move whose anchor row is not loaded here cannot be placed by guessing.
+    if (!moveIsApplicable(bundle.prompts.prompts, delta.move)) return missing(bundle);
     const prompts = applyRecordDelta(bundle.prompts.prompts, delta);
     let completed = bundle.window?.prompts.completed ?? prompts.filter((prompt) => prompt.status === "completed").length;
     if (bundle.window && delta.completed === undefined) {

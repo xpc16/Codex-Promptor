@@ -266,6 +266,11 @@ export class StorageService {
     return recordPage(records, before, limit, EARLIER_ANSWER_PAGE, bundle.answers.revision, bundle.answers.updatedAt);
   }
 
+  /** The runtime file on its own -- what a queue control changes, and all it needs to report. */
+  async readRuntime(tabId: string): Promise<RuntimeFile> {
+    return this.readFile(this.runtimePath(tabId), (value) => RuntimeFileSchema.parse(value));
+  }
+
   async readTabActivity(tabId: string): Promise<TabActivitySummary> {
     const [prompts, runtime] = await Promise.all([
       this.readFile(this.promptPath(tabId), (value) => PromptFileSchema.parse(value)),
@@ -293,7 +298,7 @@ export class StorageService {
     notify(this.tabListeners, (listener) => listener(value.id, value));
   }
 
-  async writePrompts(tabId: string, prompts: PromptFile): Promise<void> {
+  async writePrompts(tabId: string, prompts: PromptFile): Promise<PromptDelta> {
     const value = PromptFileSchema.parse(prompts);
     const [previous, tab, answers] = await Promise.all([
       this.readFile(this.promptPath(tabId), (raw) => PromptFileSchema.parse(raw)).catch(() => null),
@@ -313,9 +318,12 @@ export class StorageService {
       completed: nextRecords.filter((prompt) => prompt.status === "completed").length,
     };
     notify(this.promptListeners, (listener) => listener(tabId, delta));
+    // Returned so a route can echo the same delta it just broadcast: the
+    // caller then needs nothing back but the handful of records that changed.
+    return delta;
   }
 
-  async writeAnswers(tabId: string, answers: AnswerFile): Promise<void> {
+  async writeAnswers(tabId: string, answers: AnswerFile): Promise<AnswerDelta> {
     const value = AnswerFileSchema.parse(answers);
     const [previous, tab] = await Promise.all([
       this.readFile(this.answerPath(tabId), (raw) => AnswerFileSchema.parse(raw)).catch(() => null),
@@ -330,6 +338,7 @@ export class StorageService {
       : value.answers;
     const delta = buildRecordDelta(previousRecords, nextRecords, value.revision, value.updatedAt) as AnswerDelta;
     notify(this.answerListeners, (listener) => listener(tabId, delta));
+    return delta;
   }
 
   async writeRuntime(tabId: string, runtime: RuntimeFile): Promise<void> {

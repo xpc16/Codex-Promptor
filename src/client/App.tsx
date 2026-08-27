@@ -831,6 +831,22 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
       return 0;
     }
   }, [keepBundle, load, onBundleChanged, onError, tab.id]);
+  /**
+   * What a queue mutation reports back.
+   *
+   * These routes used to answer with the whole conversation and the screen
+   * threw it away and reloaded anyway -- three transfers for one edited row.
+   * Now they return the delta they just broadcast, and it goes through the
+   * same realtime path: whichever copy lands second is a no-op, because the
+   * delta is guarded by revision. Only a response carrying neither falls back
+   * to a reload.
+   */
+  const applyServerEcho = useCallback((echo?: unknown) => {
+    const data = echo as { delta?: unknown; runtime?: unknown } | null | undefined;
+    if (data?.delta) applyRealtimeMessage({ type: "prompts.changed", delta: data.delta });
+    else if (data?.runtime) applyRealtimeMessage({ type: "runtime.changed", runner: data.runtime });
+    else void load();
+  }, [applyRealtimeMessage, load]);
   useEffect(() => { void load(); }, [load, refreshNonce]);
   useEffect(() => {
     const move = (event: MouseEvent) => { if (!active || !dragging.current) return; const rect = workspace.current?.getBoundingClientRect(); if (!rect) return; setLeftWidth(Math.max(24, Math.min(76, ((event.clientX - rect.left) / rect.width) * 100))); };
@@ -853,7 +869,7 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
   return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspace} style={{ gridTemplateColumns: `${leftWidth}fr 7px ${100 - leftWidth}fr` }}>
     <section className="conversation-pane">{active && <><SessionPanel bundle={bundle} reopening={reopening} onReopen={reopen} onBundle={applyBundle} onError={onError} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
     <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) dragging.current = true; }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
-    <section className="queue-pane">{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={() => void load()} onError={onError} />}<TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} terminalPreference={terminalPreference} projectionSupported={projectionSupported} onTerminalPreferenceChange={onTerminalPreferenceChange} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
+    <section className="queue-pane">{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} terminalPreference={terminalPreference} projectionSupported={projectionSupported} onTerminalPreferenceChange={onTerminalPreferenceChange} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
   </div></div>;
 }
 
@@ -948,7 +964,7 @@ function AnswerHistory({ answers, total, hasEarlier, onLoadEarlier, emptyKey }: 
   })}</div>}</div></div>;
 }
 
-function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runnable, onChanged, onError }: { bundle: TabBundle; total: number; hasEarlier: boolean; onLoadEarlier: () => Promise<number>; disabled: boolean; runnable: boolean; onChanged: () => void; onError: (error: unknown) => void }) {
+function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runnable, onChanged, onError }: { bundle: TabBundle; total: number; hasEarlier: boolean; onLoadEarlier: () => Promise<number>; disabled: boolean; runnable: boolean; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   // The composer holds unsaved work, so it is restored from this browser rather
@@ -988,8 +1004,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     if (runnerControlsDisabled || runnerAction) return;
     setRunnerAction(action);
     try {
-      await api(`/api/tabs/${bundle.tab.id}/runner/${action}`, jsonBody({}));
-      onChanged();
+      onChanged(await api(`/api/tabs/${bundle.tab.id}/runner/${action}`, jsonBody({})));
     } catch (reason) {
       onError(reason);
     } finally {
@@ -1002,16 +1017,18 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     setAdding(true);
     // Only drop the draft once the prompt is safely on the list; a failed add
     // must leave the text exactly where the user can retry it.
-    try { await api(`/api/tabs/${bundle.tab.id}/prompts`, jsonBody({ text })); setNewText(""); clearPromptDraft(tabId); onChanged(); }
+    try { const echo = await api(`/api/tabs/${bundle.tab.id}/prompts`, jsonBody({ text })); setNewText(""); clearPromptDraft(tabId); onChanged(echo); }
     catch (reason) { onError(reason); }
     finally { setAdding(false); }
   };
+  // The move is checked here so an impossible drag never leaves the screen,
+  // but only the two ids are sent: the server owns the order and recomputes it
+  // with this same function, so a queue of any length costs one small request.
   const reorder = async (sourceId: string, targetId: string) => {
     if (disabled || !sourceId || sourceId === targetId || reorderInFlight.current) return;
-    const ids = reorderPromptIds(prompts.filter((item) => item.status === "pending").map((item) => item.id), sourceId, targetId);
-    if (!ids) return;
+    if (!reorderPromptIds(prompts.filter((item) => item.status === "pending").map((item) => item.id), sourceId, targetId)) return;
     reorderInFlight.current = true;
-    try { await api(`/api/tabs/${bundle.tab.id}/prompts/order`, { method: "PUT", body: JSON.stringify({ promptIds: ids }) }); onChanged(); }
+    try { onChanged(await api(`/api/tabs/${bundle.tab.id}/prompts/order`, { method: "PUT", body: JSON.stringify({ sourceId, targetId }) })); }
     catch (reason) { onError(reason); }
     finally { reorderInFlight.current = false; nativeDragSource.current = null; }
   };
@@ -1026,7 +1043,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   </div>;
 }
 
-function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, onNativeDragEnter, canMoveUp, canMoveDown, onMove, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragEnter: (targetId: string) => void; canMoveUp: boolean; canMoveDown: boolean; onMove: (direction: -1 | 1) => void; onChanged: () => void; onError: (error: unknown) => void }) {
+function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, onNativeDragEnter, canMoveUp, canMoveDown, onMove, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragEnter: (targetId: string) => void; canMoveUp: boolean; canMoveDown: boolean; onMove: (direction: -1 | 1) => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   const editable = !locked && !["completed", "running", "dispatching"].includes(prompt.status);
@@ -1040,16 +1057,16 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
     if (!editable) return;
     if (!text.trim()) { onError(new PromptorApiError("PROMPT_EMPTY", t("queue.promptEmpty"), 400, false)); return; }
     if (text.trim() === prompt.text) { setEditing(false); return; }
-    try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "PATCH", body: JSON.stringify({ text }) }); setEditing(false); onChanged(); }
+    try { const echo = await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "PATCH", body: JSON.stringify({ text }) }); setEditing(false); onChanged(echo); }
     catch (reason) { onError(reason); }
   };
-  const remove = async () => { try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "DELETE" }); onChanged(); } catch (reason) { onError(reason); } };
-  const retry = async () => { try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}/retry`, jsonBody({})); onChanged(); } catch (reason) { onError(reason); } };
-  const skip = async () => { try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}/skip`, jsonBody({})); onChanged(); } catch (reason) { onError(reason); } };
+  const remove = async () => { try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "DELETE" })); } catch (reason) { onError(reason); } };
+  const retry = async () => { try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/retry`, jsonBody({}))); } catch (reason) { onError(reason); } };
+  const skip = async () => { try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/skip`, jsonBody({}))); } catch (reason) { onError(reason); } };
   const insertNow = async () => {
     if (locked || insertingNow || prompt.status !== "pending") return;
     setInsertingNow(true);
-    try { await api(`/api/tabs/${tabId}/prompts/${prompt.id}/insert-now`, jsonBody({})); onChanged(); }
+    try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/insert-now`, jsonBody({}))); }
     catch (reason) { onError(reason); }
     finally { setInsertingNow(false); }
   };

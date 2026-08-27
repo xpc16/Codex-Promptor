@@ -7,6 +7,8 @@ import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
 import { AgentProviderSchema, type AgentProvider, type AnswerRecord, type Group, type IndexFile, IndexFileSchema, isoNow, newPrompt, PromptFileSchema, RuntimeFileSchema, type RuntimeFile, type TabBundle, type TabMeta } from "../shared/schemas.js";
 import type { TabActivitySummary } from "../shared/tab-activity.js";
+import type { PromptDelta } from "../shared/tab-delta.js";
+import { reorderPromptIds } from "../shared/prompt-order.js";
 import {
   EARLIER_ANSWER_PAGE,
   EARLIER_PROMPT_PAGE,
@@ -1319,6 +1321,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     if (!text) return apiError(reply, 400, "PROMPT_EMPTY", "Prompt text cannot be empty.");
     try {
       let armed = false;
+      let delta: PromptDelta | null = null;
       const prompt = await storage.withTabLock(tabId, async () => {
         const bundle = await storage.readTab(tabId);
         assertQueueUsable(bundle);
@@ -1332,14 +1335,14 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         bundle.prompts.prompts.splice(index, 0, next);
         bundle.prompts.revision += 1;
         bundle.prompts.updatedAt = isoNow();
-        await storage.writePrompts(tabId, bundle.prompts);
+        delta = await storage.writePrompts(tabId, bundle.prompts);
         return next;
       });
       // An armed queue is idle but waiting to be fed: adding a prompt is the
       // start signal, so the user does not have to add and then press start.
       // A paused queue was stopped deliberately and must stay stopped.
       if (armed) await runners.get(tabId).start().catch(() => undefined);
-      return reply.send({ data: prompt });
+      return reply.send({ data: { prompt, delta } });
     } catch (error) {
       // A refused queue is not a missing tab; only fall back to 404 once the
       // guard has been ruled out.
@@ -1353,7 +1356,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const promptId = String((request.params as any).promptId);
     const body = (request.body ?? {}) as any;
     try {
-      const prompt = await storage.withTabLock(tabId, async () => {
+      const { prompt, delta } = await storage.withTabLock(tabId, async () => {
         const bundle = await storage.readTab(tabId);
         assertQueueUsable(bundle);
         const prompt = bundle.prompts.prompts.find((item) => item.id === promptId);
@@ -1367,10 +1370,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         prompt.updatedAt = isoNow();
         bundle.prompts.revision += 1;
         bundle.prompts.updatedAt = isoNow();
-        await storage.writePrompts(tabId, bundle.prompts);
-        return prompt;
+        return { prompt, delta: await storage.writePrompts(tabId, bundle.prompts) };
       });
-      return reply.send({ data: prompt });
+      return reply.send({ data: { prompt, delta } });
     } catch (error) { const message = error instanceof Error ? error.message : String(error); return apiError(reply, message.includes("对话已关闭") ? 423 : 400, message.includes("对话已关闭") ? "CONVERSATION_CLOSED" : "PROMPT_UPDATE_FAILED", message); }
   });
 
@@ -1378,7 +1380,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const tabId = String((request.params as any).tabId);
     const promptId = String((request.params as any).promptId);
     try {
-      await storage.withTabLock(tabId, async () => {
+      const delta = await storage.withTabLock(tabId, async () => {
         const bundle = await storage.readTab(tabId);
         assertQueueUsable(bundle);
         const prompt = bundle.prompts.prompts.find((item) => item.id === promptId);
@@ -1387,48 +1389,62 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         bundle.prompts.prompts = bundle.prompts.prompts.filter((item) => item.id !== promptId);
         bundle.prompts.revision += 1;
         bundle.prompts.updatedAt = isoNow();
-        await storage.writePrompts(tabId, bundle.prompts);
+        return storage.writePrompts(tabId, bundle.prompts);
       });
-      return reply.send({ data: { deleted: true } });
+      return reply.send({ data: { deleted: true, delta } });
     } catch (error) { const message = error instanceof Error ? error.message : String(error); return apiError(reply, message.includes("对话已关闭") ? 423 : 400, message.includes("对话已关闭") ? "CONVERSATION_CLOSED" : "PROMPT_DELETE_FAILED", message); }
   });
 
+  /**
+   * A drag names the row that moved and the row it landed on. The server holds
+   * the authoritative order and derives the new one with the same function the
+   * dragging screen used, so nobody ships a list of every queued id -- two ids
+   * describe the move whether the queue holds three prompts or three hundred.
+   * (`promptIds` stays accepted for a browser tab left open across an upgrade.)
+   */
   app.put("/api/tabs/:tabId/prompts/order", async (request, reply) => {
     const tabId = String((request.params as any).tabId);
-    const ids = Array.isArray((request.body as any)?.promptIds) ? (request.body as any).promptIds.map(String) : [];
+    const body = (request.body ?? {}) as any;
+    const sourceId = body.sourceId ? String(body.sourceId) : null;
+    const targetId = body.targetId ? String(body.targetId) : null;
+    const sentIds = Array.isArray(body.promptIds) ? body.promptIds.map(String) : null;
     try {
-      const prompts = await storage.withTabLock(tabId, async () => {
+      const delta = await storage.withTabLock(tabId, async () => {
         const bundle = await storage.readTab(tabId);
         assertQueueUsable(bundle);
         const threadId = bundle.tab.session.threadId;
         const isReorderable = (item: (typeof bundle.prompts.prompts)[number]) => item.status === "pending"
           && (!item.threadId || item.threadId === threadId);
         const pending = bundle.prompts.prompts.filter(isReorderable);
-        if (ids.length !== pending.length || new Set(ids).size !== ids.length || ids.some((id: string) => !pending.some((item) => item.id === id))) throw new Error("PROMPT_ORDER_INVALID");
+        const pendingIds = pending.map((item) => item.id);
+        const nextIds = sourceId && targetId ? reorderPromptIds(pendingIds, sourceId, targetId) : sentIds;
+        if (!nextIds
+          || nextIds.length !== pending.length
+          || new Set(nextIds).size !== nextIds.length
+          || nextIds.some((id: string) => !pendingIds.includes(id))) throw new Error("PROMPT_ORDER_INVALID");
         const byId = new Map(pending.map((item) => [item.id, item]));
         let cursor = 0;
-        bundle.prompts.prompts = bundle.prompts.prompts.map((item) => isReorderable(item) ? byId.get(ids[cursor++])! : item);
+        bundle.prompts.prompts = bundle.prompts.prompts.map((item) => isReorderable(item) ? byId.get(nextIds[cursor++])! : item);
         bundle.prompts.revision += 1;
         bundle.prompts.updatedAt = isoNow();
-        await storage.writePrompts(tabId, bundle.prompts);
-        return bundle.prompts;
+        return storage.writePrompts(tabId, bundle.prompts);
       });
-      return reply.send({ data: prompts });
+      return reply.send({ data: { delta } });
     } catch (error) { const message = error instanceof Error ? error.message : String(error); return apiError(reply, message.includes("对话已关闭") ? 423 : 400, message.includes("对话已关闭") ? "CONVERSATION_CLOSED" : "PROMPT_ORDER_INVALID", message); }
   });
 
-  app.post("/api/tabs/:tabId/runner/start", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); await runners.get(tabId).start(); return reply.send({ data: await storage.readTab(tabId) }); } catch (error) { return apiError(reply, 400, "RUNNER_START_FAILED", error instanceof Error ? error.message : String(error)); } });
-  app.post("/api/tabs/:tabId/runner/pause", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); await runners.get(tabId).pause(); return reply.send({ data: await storage.readTab(tabId) }); } catch (error) { return apiError(reply, 400, "RUNNER_PAUSE_FAILED", error instanceof Error ? error.message : String(error)); } });
-  app.post("/api/tabs/:tabId/runner/interrupt", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); await runners.get(tabId).interruptCurrent(); return reply.send({ data: await storage.readTab(tabId) }); } catch (error) { return apiError(reply, 400, "RUNNER_INTERRUPT_FAILED", error instanceof Error ? error.message : String(error)); } });
+  app.post("/api/tabs/:tabId/runner/start", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); await runners.get(tabId).start(); return reply.send({ data: { runtime: await storage.readRuntime(tabId) } }); } catch (error) { return apiError(reply, 400, "RUNNER_START_FAILED", error instanceof Error ? error.message : String(error)); } });
+  app.post("/api/tabs/:tabId/runner/pause", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); await runners.get(tabId).pause(); return reply.send({ data: { runtime: await storage.readRuntime(tabId) } }); } catch (error) { return apiError(reply, 400, "RUNNER_PAUSE_FAILED", error instanceof Error ? error.message : String(error)); } });
+  app.post("/api/tabs/:tabId/runner/interrupt", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); await runners.get(tabId).interruptCurrent(); return reply.send({ data: { runtime: await storage.readRuntime(tabId) } }); } catch (error) { return apiError(reply, 400, "RUNNER_INTERRUPT_FAILED", error instanceof Error ? error.message : String(error)); } });
   app.patch("/api/tabs/:tabId/runner/config", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); const value = (request.body as any)?.onFailure; if (value !== "pause" && value !== "continue") throw new Error("onFailure must be pause or continue"); const runtime = await runners.get(tabId).configure(value); return reply.send({ data: runtime }); } catch (error) { return apiError(reply, 400, "RUNNER_CONFIG_INVALID", error instanceof Error ? error.message : String(error)); } });
-  app.post("/api/tabs/:tabId/prompts/:promptId/retry", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); await runners.get(tabId).retry(String((request.params as any).promptId)); return reply.send({ data: await storage.readTab(tabId) }); } catch (error) { return apiError(reply, 400, "PROMPT_RETRY_FAILED", error instanceof Error ? error.message : String(error)); } });
-  app.post("/api/tabs/:tabId/prompts/:promptId/skip", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); await runners.get(tabId).skip(String((request.params as any).promptId)); return reply.send({ data: await storage.readTab(tabId) }); } catch (error) { return apiError(reply, 400, "PROMPT_SKIP_FAILED", error instanceof Error ? error.message : String(error)); } });
+  app.post("/api/tabs/:tabId/prompts/:promptId/retry", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); await runners.get(tabId).retry(String((request.params as any).promptId)); return reply.send({ data: { runtime: await storage.readRuntime(tabId) } }); } catch (error) { return apiError(reply, 400, "PROMPT_RETRY_FAILED", error instanceof Error ? error.message : String(error)); } });
+  app.post("/api/tabs/:tabId/prompts/:promptId/skip", async (request, reply) => { try { const tabId = String((request.params as any).tabId); assertQueueUsable(await storage.readTab(tabId)); await runners.get(tabId).skip(String((request.params as any).promptId)); return reply.send({ data: { runtime: await storage.readRuntime(tabId) } }); } catch (error) { return apiError(reply, 400, "PROMPT_SKIP_FAILED", error instanceof Error ? error.message : String(error)); } });
   app.post("/api/tabs/:tabId/prompts/:promptId/insert-now", async (request, reply) => {
     try {
       const tabId = String((request.params as any).tabId);
       assertQueueUsable(await storage.readTab(tabId));
       const result = await runners.get(tabId).insertNow(String((request.params as any).promptId));
-      return reply.send({ data: result });
+      return reply.send({ data: { ...result, runtime: await storage.readRuntime(tabId) } });
     } catch (error) {
       return apiError(reply, 400, "PROMPT_INSERT_NOW_FAILED", error instanceof Error ? error.message : String(error));
     }

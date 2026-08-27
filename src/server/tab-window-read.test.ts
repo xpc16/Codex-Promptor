@@ -99,6 +99,13 @@ describe("bounded conversation reads", () => {
     headers: { "x-codex-promptor-token": app.promptor.token, ...headers },
   });
 
+  const put = (url: string, payload: unknown) => app.inject({
+    method: "PUT",
+    url,
+    headers: { "x-codex-promptor-token": app.promptor.token },
+    payload: payload as never,
+  });
+
   it("opens a conversation on the last few answers and reports the rest as pageable", async () => {
     const response = await get(`/api/tabs/${tab.id}`);
     expect(response.statusCode).toBe(200);
@@ -157,5 +164,42 @@ describe("bounded conversation reads", () => {
     const response = await get(`/api/tabs/${tab.id}`, { "if-none-match": etag });
     expect(response.statusCode).toBe(200);
     expect(response.json().data.prompts.revision).toBe(prompts.revision + 1);
+  });
+
+  it("reorders from two ids and answers with the move, not the queue", async () => {
+    const before = (await get(`/api/tabs/${tab.id}`)).json().data.prompts.prompts as PromptRecord[];
+    const pending = before.filter((prompt) => prompt.status === "pending").map((prompt) => prompt.id);
+
+    const response = await put(`/api/tabs/${tab.id}/prompts/order`, { sourceId: pending[0], targetId: pending[3] });
+
+    expect(response.statusCode).toBe(200);
+    const { delta } = response.json().data;
+    expect(delta.move).toEqual({ id: pending[0], beforeId: pending[4] });
+    expect(delta.upserts).toEqual([]);
+    expect(delta.order).toBeUndefined();
+    // The point of the exercise: the answer names two rows, not every row.
+    expect(response.rawPayload.length).toBeLessThan(400);
+
+    const after = (await get(`/api/tabs/${tab.id}`)).json().data.prompts.prompts as PromptRecord[];
+    expect(after.filter((prompt) => prompt.status === "pending").map((prompt) => prompt.id).slice(0, 4))
+      .toEqual([pending[1], pending[2], pending[3], pending[0]]);
+  });
+
+  it("refuses a move naming a row that is not reorderable", async () => {
+    const response = await put(`/api/tabs/${tab.id}/prompts/order`, { sourceId: "p0", targetId: "p61" });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error.code).toBe("PROMPT_ORDER_INVALID");
+  });
+
+  it("still accepts the full list a browser left open across the upgrade sends", async () => {
+    const before = (await get(`/api/tabs/${tab.id}`)).json().data.prompts.prompts as PromptRecord[];
+    const pending = before.filter((prompt) => prompt.status === "pending").map((prompt) => prompt.id);
+    const rotated = [...pending.slice(1), pending[0]];
+
+    const response = await put(`/api/tabs/${tab.id}/prompts/order`, { promptIds: rotated });
+
+    expect(response.statusCode).toBe(200);
+    const after = (await get(`/api/tabs/${tab.id}`)).json().data.prompts.prompts as PromptRecord[];
+    expect(after.filter((prompt) => prompt.status === "pending").map((prompt) => prompt.id)).toEqual(rotated);
   });
 });

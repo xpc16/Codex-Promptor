@@ -46,6 +46,11 @@ describe("runner controls", () => {
 
     expect(response.statusCode).toBe(200);
     expect(interruptCurrent).toHaveBeenCalledTimes(1);
-    expect(response.json().data.tab.id).toBe(tab.id);
+    // A queue control changes the runtime and nothing else, so that is all it
+    // reports -- not a copy of the conversation the caller is already showing.
+    const data = response.json().data;
+    expect(data.runtime.runner).toBeDefined();
+    expect(data.prompts).toBeUndefined();
+    expect(data.answers).toBeUndefined();
   });
 });
