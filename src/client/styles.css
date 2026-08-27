@@ -280,7 +280,7 @@ input, textarea, select { color: var(--text); }
    line for a one-line prompt, up to three, then the box scrolls inside itself.
    No max-height here -- the cap depends on the padding, which differs between
    the resting and editing states, and the measurement already accounts for it. */
-.prompt-row textarea { width: 100%; resize: none; overflow-y: auto; overscroll-behavior: contain; padding: 1px 0; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 13px; line-height: 1.5; }
+.prompt-row textarea { width: 100%; resize: none; overflow-y: auto; overscroll-behavior-y: auto; padding: 1px 0; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 13px; line-height: 1.5; }
 .prompt-row textarea[readonly]:not(:disabled) { cursor: default; }
 .prompt-row textarea.editing { padding: 5px 7px; border: 1px solid var(--primary); border-radius: 6px; background: var(--panel); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 12%, transparent); }
 .prompt-row textarea:disabled { color: var(--muted); }

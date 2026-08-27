@@ -9,6 +9,7 @@ import {
   type FormEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent,
+  type WheelEvent as ReactWheelEvent,
 } from "react";
 import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta, TabRecordPage } from "../shared/schemas.js";
 import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-link.js";
@@ -27,7 +28,7 @@ import { dialogSurvivesIndex, nextSelectedTabId, shouldAdoptIndexRevision } from
 import { applyTabMessage } from "./tab-bundle-delta.js";
 import { forgetCachedTab, readCachedTab, rememberTab, retainCachedTabs, windowLimits } from "./tab-cache.js";
 import { CONSOLE_WIDTH, conversationSplit, readPaneSize, readStoredPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
-import { isAtBottom, isNearTop } from "./scroll-anchor.js";
+import { isAtBottom, isNearTop, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
 import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
 import { autoSizedHeight, readTextareaMetrics } from "./textarea-autosize.js";
 import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenState } from "./terminal-projection.js";
@@ -1107,6 +1108,25 @@ function useAutoSizedTextarea(ref: { current: HTMLTextAreaElement | null }, text
   }, [ref, resize]);
 }
 
+/**
+ * A long prompt owns the wheel only while its three-line textarea can move in
+ * that direction. At either edge, move the queue list explicitly so disabled
+ * and read-only textareas behave the same across Chromium versions.
+ */
+function handoffPromptTextareaWheel(event: ReactWheelEvent<HTMLDivElement>) {
+  if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+  const target = event.target instanceof Element ? event.target.closest("textarea") : null;
+  if (!(target instanceof HTMLTextAreaElement) || !event.currentTarget.contains(target)) return;
+  if (!shouldHandoffWheel(target, event.deltaY)) return;
+  const promptList = event.currentTarget.closest<HTMLElement>(".prompt-list");
+  if (!promptList) return;
+  const lineHeight = Number.parseFloat(getComputedStyle(target).lineHeight);
+  const delta = wheelDeltaPixels(event.deltaY, event.deltaMode, lineHeight, promptList.clientHeight);
+  event.preventDefault();
+  event.stopPropagation();
+  promptList.scrollTop += delta;
+}
+
 function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, onNativeDragEnter, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragEnter: (targetId: string) => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
@@ -1148,7 +1168,7 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", release, { once: true });
   };
   const nativeDragStart = (event: DragEvent<HTMLDivElement>) => { if ((event.target as HTMLElement).closest("textarea, button")) { event.preventDefault(); return; } event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", prompt.id); onNativeDragStart(prompt.id); };
-  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button>}{pendingStatus && <button className="link-button insert-now-button" disabled={locked || insertingNow || editing} title={t("queue.insertNowHelp")} onClick={() => void insertNow()}>{t(insertingNow ? "queue.insertingNow" : "queue.insertNow")}</button>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
+  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button>}{pendingStatus && <button className="link-button insert-now-button" disabled={locked || insertingNow || editing} title={t("queue.insertNowHelp")} onClick={() => void insertNow()}>{t(insertingNow ? "queue.insertingNow" : "queue.insertNow")}</button>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
 function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, terminalPreference, projectionSupported, onTerminalPreferenceChange, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; terminalPreference: TerminalTransportPreference; projectionSupported: boolean; onTerminalPreferenceChange: (value: TerminalTransportPreference) => void; onBundle: (bundle: TabBundle) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {
