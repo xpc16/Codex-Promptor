@@ -4,7 +4,7 @@ export default defineConfig({
   root: process.cwd(),
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
     // Several server suites boot a real Fastify app and wait on real timers
     // with ~5s deadlines. Letting one file per core run at once (16 here)
     // starved those waits, so they failed at the deadline rather than on an
