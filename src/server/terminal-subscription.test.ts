@@ -75,6 +75,32 @@ describe("terminal WebSocket subscription isolation", () => {
     expect(Buffer.from(second.dataBase64, "base64").toString("utf8")).toBe("onetwo");
   });
 
+  it("resends only what a returning viewer is missing", async () => {
+    const tab = await app.promptor.storage.createTab("resume");
+    const scrollback = "x".repeat(200_000);
+    // What the browser kept from its last visit: the generation and how far it
+    // had read. Reconnecting without that made the server resend all of this.
+    vi.spyOn(app.promptor.pty, "snapshot").mockImplementation((_tabId, cursor) => cursor?.nextOffset === scrollback.length
+      ? { generation: "generation-1", startOffset: scrollback.length, endOffset: scrollback.length + 4, reset: false, dataBase64: Buffer.from("tail", "utf8").toString("base64") }
+      : { generation: "generation-1", startOffset: 0, endOffset: scrollback.length, reset: true, dataBase64: Buffer.from(scrollback, "utf8").toString("base64") });
+
+    const cold = await connect(url, sockets);
+    const coldMessages = collect(cold);
+    cold.send(JSON.stringify({ type: "subscribe", tabIds: [tab.id], snapshots: false, terminals: { [tab.id]: { mode: "raw", generation: null, nextOffset: null } } }));
+    await eventually(() => coldMessages.some((message) => message.type === "terminal.output"));
+    const full = coldMessages.find((message) => message.type === "terminal.output");
+    expect(full).toMatchObject({ reset: true });
+    expect(Buffer.from(full.dataBase64, "base64").length).toBe(scrollback.length);
+
+    const warm = await connect(url, sockets);
+    const warmMessages = collect(warm);
+    warm.send(JSON.stringify({ type: "subscribe", tabIds: [tab.id], snapshots: false, terminals: { [tab.id]: { mode: "raw", generation: "generation-1", nextOffset: scrollback.length } } }));
+    await eventually(() => warmMessages.some((message) => message.type === "terminal.output"));
+    const resumed = warmMessages.find((message) => message.type === "terminal.output");
+    expect(resumed).toMatchObject({ reset: false, startOffset: scrollback.length });
+    expect(Buffer.from(resumed.dataBase64, "base64").toString("utf8")).toBe("tail");
+  });
+
   it("requires a terminal subscription before input and exposes content-free metrics", async () => {
     const tab = await app.promptor.storage.createTab("input");
     const write = vi.spyOn(app.promptor.pty, "write");

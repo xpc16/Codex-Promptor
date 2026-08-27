@@ -32,6 +32,7 @@ import { CONSOLE_WIDTH, readPaneSize, workspaceSplit, writePaneSize } from "./pa
 import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
 import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenState } from "./terminal-projection.js";
 import { readTerminalTransportPreference, resolveTerminalTransportPreference, writeTerminalTransportPreference } from "./terminal-preference.js";
+import { forgetCachedTerminal, readCachedProjection, readCachedRawTerminal, rememberProjection, rememberRawTerminal, retainCachedTerminals } from "./terminal-cache.js";
 import {
   createI18n,
   I18nContext,
@@ -233,6 +234,7 @@ export function App() {
     // conversation has to be dropped here or it would keep its bytes for the
     // life of the page.
     retainCachedTabs(validIds);
+    retainCachedTerminals(validIds);
     setRetainedTabIds((current) => {
       const next = retainRecentTabIds(current, selectedId, validIds);
       return next.length === current.length && next.every((tabId, index) => tabId === current[index]) ? current : next;
@@ -402,7 +404,7 @@ export function App() {
   const confirmDelete = async () => {
     if (!dialog || (dialog.kind !== "delete-tab" && dialog.kind !== "delete-group")) return;
     try {
-      if (dialog.kind === "delete-tab") { await api(`/api/tabs/${dialog.tabId}`, { method: "DELETE" }); forgetCachedTab(dialog.tabId); }
+      if (dialog.kind === "delete-tab") { await api(`/api/tabs/${dialog.tabId}`, { method: "DELETE" }); forgetCachedTab(dialog.tabId); forgetCachedTerminal(dialog.tabId); }
       else await api(`/api/groups/${dialog.groupId}`, { method: "DELETE" });
       setDialog(null);
       await refresh();
@@ -1127,8 +1129,14 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, termin
     let longTerminal = false;
     let connectedOnce = false;
     const projectionMode = transportMode === "projection";
-    const cursor: { generation: string | null; nextOffset: number | null } = { generation: null, nextOffset: null };
-    let projectionState: ProjectionScreenState | null = null;
+    // Reconnecting with no cursor makes the server resend the whole scroll
+    // buffer. What this page already received is still good, so the cursor and
+    // the bytes are restored first and the socket asks only for the remainder.
+    const remembered = transportMode === "projection" ? null : readCachedRawTerminal(tabId);
+    const cursor: { generation: string | null; nextOffset: number | null } = remembered
+      ? { generation: remembered.generation, nextOffset: remembered.nextOffset }
+      : { generation: null, nextOffset: null };
+    let projectionState: ProjectionScreenState | null = transportMode === "projection" ? readCachedProjection(tabId) : null;
     let projectionRenderPending = 0;
     let rawLeaseWritable = true;
     const pendingProjectionInput: string[] = [];
@@ -1349,6 +1357,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, termin
       const overlap = Math.max(0, cursor.nextOffset! - startOffset);
       const fresh = bytes.subarray(Math.min(overlap, bytes.length));
       cursor.nextOffset = endOffset;
+      rememberRawTerminal(tabId, generation, endOffset, fresh, Boolean(message.reset) || updateSequence !== null);
       if (fresh.length) {
         if (host.current?.classList.contains("terminal-settling")) {
           if (settlingQuietTimer !== null) { window.clearTimeout(settlingQuietTimer); settlingQuietTimer = null; }
@@ -1373,6 +1382,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, termin
       const reset = message.full;
       if (reset) terminalWriteEpoch += 1;
       projectionState = result.state;
+      rememberProjection(tabId, result.state);
       const sequence = beginTerminalUpdate();
       setHasOutput(true);
       queueProjectionWrite(result.state, sequence, terminalWriteEpoch, reset);
@@ -1443,6 +1453,15 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, termin
       });
     };
     reconnect.current = scheduleConnect;
+    // Repaint from memory immediately: the reader sees the terminal they left
+    // rather than a blank pane waiting on a socket, and nothing is refetched.
+    if (remembered?.data.length) {
+      setHasOutput(true);
+      queueTerminalWrite(remembered.data, beginTerminalUpdate(), terminalWriteEpoch);
+    } else if (projectionState) {
+      setHasOutput(true);
+      queueProjectionWrite(projectionState, beginTerminalUpdate(), terminalWriteEpoch, true);
+    }
     if (!closedRef.current && activeRef.current) scheduleConnect();
     return () => {
       disposed = true;
