@@ -5,7 +5,7 @@ import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest }
 import fastifyCompress from "@fastify/compress";
 import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
-import { AgentProviderSchema, type AgentProvider, type AnswerRecord, type Group, type IndexFile, IndexFileSchema, isoNow, newPrompt, PromptFileSchema, RuntimeFileSchema, type RuntimeFile, type TabBundle, type TabMeta } from "../shared/schemas.js";
+import { AgentProviderSchema, type AgentProvider, type AnswerRecord, CommonPromptFileSchema, type Group, type IndexFile, IndexFileSchema, isoNow, MAX_AUXILIARY_FILE_BYTES, MAX_COMMON_PROMPTS, MAX_TIMER_REQUEST_BYTES, newPrompt, PromptFileSchema, RuntimeFileSchema, type RuntimeFile, type TabBundle, type TabMeta } from "../shared/schemas.js";
 import { settledDesiredState, type TabActivitySummary } from "../shared/tab-activity.js";
 import type { PromptDelta } from "../shared/tab-delta.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
@@ -26,10 +26,11 @@ import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documen
 import { readCodexThreadForHistory } from "./codex-history.js";
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
-import { entityTag, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
+import { entityTag, ifMatchSatisfied, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
 import { CLAUDE_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
 import { RunnerManager } from "./queue.js";
 import { StorageService } from "./storage.js";
+import { TimerService, TimerServiceError } from "./timer-service.js";
 import {
   BoundedWebSocketSender,
   decodeTerminalInput,
@@ -100,6 +101,7 @@ export type PromptorApp = FastifyInstance & {
     cursor: CursorCliPool;
     pty: PtyManager;
     runners: RunnerManager;
+    timers: TimerService;
     ui: UiLifecycle;
     traffic: TerminalTrafficMeter;
     documents: DocumentService;
@@ -293,7 +295,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     if (event.type === "error") emit(event.tabId, { type: "error", error: event.data });
     if (event.type === "answer") {
       const answer = event.data as AnswerRecord | undefined;
-      if (answer?.origin === "queue" && answer.status === "completed") {
+      if ((answer?.origin === "queue" || answer?.origin === "timer") && answer.status === "completed") {
         emit(event.tabId, {
           type: "answer.activity",
           answerId: answer.id,
@@ -304,6 +306,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       }
     }
   });
+  const timers = new TimerService(storage, (tabId) => runners.get(tabId), (key, active) => ui.setBackgroundHold(key, active));
 
   const scheduleThreadSwitch = (tabId: string, manager: AppServerManager, selection: TuiThreadSelection): Promise<void> => {
     const previous = threadSwitches.get(tabId) ?? Promise.resolve();
@@ -765,7 +768,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       .then((results) => ({
         restored: results.filter((item) => item.result.ok).map((item) => item.tabId),
         failed: results.flatMap((item) => item.result.ok ? [] : [{ tabId: item.tabId, code: item.result.code, message: item.result.message }]),
-      }));
+      }))
+      .then(async (summary) => {
+        await timers.start();
+        return summary;
+      });
     return restoreOpenSessionsPromise;
   };
 
@@ -785,11 +792,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   trafficPruneTimer?.unref?.();
   if (trafficLoggingEnabled) void trafficLog.prune();
 
-  app.promptor = { storage, codex, claude, cursor, pty, runners, ui, traffic, documents, token, restoreOpenSessions, close: async () => {
+  app.promptor = { storage, codex, claude, cursor, pty, runners, timers, ui, traffic, documents, token, restoreOpenSessions, close: async () => {
     if (trafficFlushTimer) clearInterval(trafficFlushTimer);
     if (trafficPruneTimer) clearInterval(trafficPruneTimer);
     // Seal the minute in progress so a restart does not lose it.
     await trafficLog.append(ledger.drain(Date.now() + 60_000)).catch(() => undefined);
+    await timers.stop();
     ui.stop();
     rawBatcher.close(false);
     projectionScheduler.close();
@@ -944,6 +952,84 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   });
 
   app.get("/api/health", async (_request, reply) => reply.send({ data: { ok: true, codex: codex.status, claude: await claudeVersion, cursor: await cursorVersion } }));
+
+  app.get("/api/common-prompts", async (request, reply) => {
+    try { return sendRevalidatable(request, reply, await storage.readCommonPrompts()); }
+    catch (error) { return sendAuxiliaryError(reply, error, "COMMON_PROMPTS_READ_FAILED"); }
+  });
+
+  app.put("/api/common-prompts", { bodyLimit: MAX_AUXILIARY_FILE_BYTES }, async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    try {
+      const result = await storage.withCommonPromptLock(async () => {
+        const current = await storage.readCommonPrompts();
+        assertWritePrecondition(request.headers["if-match"], entityTag(JSON.stringify({ data: current })));
+        const rawItems = Array.isArray((request.body as any)?.items) ? (request.body as any).items : null;
+        if (!rawItems) throw new AuxiliaryRequestError(422, "INVALID_COMMON_PROMPTS", "items must be an array.");
+        if (rawItems.length > MAX_COMMON_PROMPTS) throw new AuxiliaryRequestError(422, "COMMON_PROMPT_LIMIT_REACHED", "Too many common prompts.");
+        const ids = new Set<string>();
+        const items = rawItems.map((raw: any) => {
+          const id = typeof raw?.id === "string" && raw.id ? raw.id : randomUUID();
+          if (ids.has(id)) throw new AuxiliaryRequestError(422, "DUPLICATE_COMMON_PROMPT_ID", "Common prompt ids must be unique.");
+          ids.add(id);
+          const title = String(raw?.title ?? "").trim();
+          const text = String(raw?.text ?? "");
+          if (!text.trim()) throw new AuxiliaryRequestError(422, "INVALID_COMMON_PROMPT", "Common prompt text cannot be blank.");
+          return { id, title, text };
+        });
+        const file = CommonPromptFileSchema.parse({ schemaVersion: 1, updatedAt: isoNow(), items });
+        await storage.writeCommonPrompts(file);
+        return file;
+      });
+      const etag = entityTag(JSON.stringify({ data: result }));
+      return reply.header("ETag", etag).send({ data: result });
+    } catch (error) { return sendAuxiliaryError(reply, error, "COMMON_PROMPTS_WRITE_FAILED"); }
+  });
+
+  app.get("/api/tabs/:tabId/timers", async (request, reply) => {
+    const tabId = String((request.params as any).tabId);
+    try {
+      const { file } = await timers.getTimers(tabId);
+      return sendRevalidatable(request, reply, file);
+    } catch (error) { return sendTimerError(reply, error); }
+  });
+
+  app.post("/api/tabs/:tabId/timers", { bodyLimit: MAX_TIMER_REQUEST_BYTES }, async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    try {
+      const result = await timers.createTimer(String((request.params as any).tabId), request.body, request.headers["if-match"]);
+      return reply.header("ETag", result.etag).send({ data: { timer: result.timer, file: result.file } });
+    } catch (error) { return sendTimerError(reply, error); }
+  });
+
+  app.put("/api/tabs/:tabId/timers/:timerId", { bodyLimit: MAX_TIMER_REQUEST_BYTES }, async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    try {
+      const params = request.params as any;
+      const result = await timers.updateTimer(String(params.tabId), String(params.timerId), request.body, request.headers["if-match"]);
+      return reply.header("ETag", result.etag).send({ data: { timer: result.timer, file: result.file } });
+    } catch (error) { return sendTimerError(reply, error); }
+  });
+
+  app.delete("/api/tabs/:tabId/timers/:timerId", async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    try {
+      const params = request.params as any;
+      const result = await timers.deleteTimer(String(params.tabId), String(params.timerId), request.headers["if-match"]);
+      return reply.header("ETag", result.etag).code(204).send();
+    } catch (error) { return sendTimerError(reply, error); }
+  });
+
+  app.post("/api/tabs/:tabId/timers/:timerId/run-now", async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    const key = request.headers["idempotency-key"];
+    if (typeof key !== "string" || !UUID_RE.test(key)) return apiError(reply, 400, "INVALID_IDEMPOTENCY_KEY", "Send a UUID Idempotency-Key header.");
+    try {
+      const params = request.params as any;
+      const result = await timers.runNow(String(params.tabId), String(params.timerId), key);
+      return reply.header("ETag", result.etag).code(202).send({ data: { timer: result.timer, promptIds: result.promptIds, file: result.file } });
+    } catch (error) { return sendTimerError(reply, error); }
+  });
 
   app.post("/api/documents/open", { bodyLimit: 12 * 1024 }, async (request, reply) => {
     reply.header("Cache-Control", "no-store");
@@ -1181,7 +1267,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     await cursor.stop(tabId);
     await claude.stop(tabId);
     await stopAppServer(storage, codex, tabId);
-    try { await storage.deleteTab(tabId); } catch (error) { return apiError(reply, 404, "TAB_NOT_FOUND", error instanceof Error ? error.message : String(error)); }
+    await timers.detachTab(tabId);
+    try { await storage.deleteTab(tabId); }
+    catch (error) {
+      await timers.reattachTab(tabId).catch(() => undefined);
+      return apiError(reply, 404, "TAB_NOT_FOUND", error instanceof Error ? error.message : String(error));
+    }
     return reply.send({ data: { deleted: true } });
   });
 
@@ -2176,6 +2267,35 @@ export async function recoverTerminalRuntime(storage: StorageService): Promise<n
     });
   }
   return recovered;
+}
+
+class AuxiliaryRequestError extends Error {
+  constructor(readonly statusCode: number, readonly code: string, message: string) {
+    super(message);
+  }
+}
+
+function assertWritePrecondition(header: string | string[] | undefined, etag: string): void {
+  if (header === undefined) throw new AuxiliaryRequestError(428, "PRECONDITION_REQUIRED", "Send If-Match from the latest response.");
+  if (!ifMatchSatisfied(header, etag)) throw new AuxiliaryRequestError(412, "PRECONDITION_FAILED", "The list changed elsewhere. Refresh and retry.");
+}
+
+function sendTimerError(reply: FastifyReply, error: unknown) {
+  reply.header("Cache-Control", "no-store");
+  if (error instanceof TimerServiceError) return apiError(reply, error.statusCode, error.code, error.message);
+  return sendAuxiliaryError(reply, error, "TIMER_OPERATION_FAILED");
+}
+
+function sendAuxiliaryError(reply: FastifyReply, error: unknown, fallbackCode: string) {
+  reply.header("Cache-Control", "no-store");
+  if (error instanceof AuxiliaryRequestError) return apiError(reply, error.statusCode, error.code, error.message);
+  const code = (error as NodeJS.ErrnoException)?.code;
+  if (code === "PROMPT_TEXT_TOO_LARGE" || code === "AUXILIARY_FILE_TOO_LARGE" || code === "FST_ERR_CTP_BODY_TOO_LARGE") {
+    return apiError(reply, 413, code, "The request is too large.");
+  }
+  if ((error as any)?.name === "ZodError") return apiError(reply, 422, "INVALID_AUXILIARY_DATA", error instanceof Error ? error.message : "Invalid data.");
+  const missing = code === "ENOENT";
+  return apiError(reply, missing ? 404 : 503, missing ? "TAB_NOT_FOUND" : fallbackCode, error instanceof Error ? error.message : String(error), !missing);
 }
 
 function apiError(reply: FastifyReply, statusCode: number, code: string, message: string, retryable = false) {

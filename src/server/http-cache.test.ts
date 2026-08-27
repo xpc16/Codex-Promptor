@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { entityTag, ifNoneMatchSatisfied } from "./http-cache.js";
+import { entityTag, ifMatchSatisfied, ifNoneMatchSatisfied } from "./http-cache.js";
 
 describe("entity tags", () => {
   it("is stable for the same body and different for a changed one", () => {
@@ -33,5 +33,22 @@ describe("if-none-match", () => {
   it("matches the wildcard and misses an unrelated tag", () => {
     expect(ifNoneMatchSatisfied("*", tag)).toBe(true);
     expect(ifNoneMatchSatisfied("\"stale\"", tag)).toBe(false);
+  });
+});
+
+describe("if-match", () => {
+  const tag = entityTag("body");
+
+  it("does not match a missing or stale precondition", () => {
+    expect(ifMatchSatisfied(undefined, tag)).toBe(false);
+    expect(ifMatchSatisfied("\"stale\"", tag)).toBe(false);
+  });
+
+  it("matches exact, listed, weak, encoded and wildcard tags", () => {
+    expect(ifMatchSatisfied(tag, tag)).toBe(true);
+    expect(ifMatchSatisfied(`\"stale\", ${tag}`, tag)).toBe(true);
+    expect(ifMatchSatisfied(`W/${tag}`, tag)).toBe(true);
+    expect(ifMatchSatisfied(`${tag.slice(0, -1)}-br\"`, tag)).toBe(true);
+    expect(ifMatchSatisfied("*", tag)).toBe(true);
   });
 });

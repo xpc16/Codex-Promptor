@@ -328,7 +328,7 @@ export async function recordTurn(storage: StorageService, tabId: string, options
           attempt.error = error;
         }
       }
-    } else if (options.origin === "queue") {
+    } else if (options.origin === "queue" || options.origin === "timer") {
       const error = { code: "NO_FINAL_ANSWER", message: "Turn completed without a final answer." };
       answer = ensureAnswer();
       applyAnswerPatch(answer, {
@@ -616,7 +616,7 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
           promptId: prompt.id,
           threadId,
           codexTurnId: turnId,
-          origin: prompt.origin === "queue" ? "queue" : "imported",
+          origin: prompt.origin === "queue" || prompt.origin === "timer" ? prompt.origin : "imported",
           prompt: answerPrompt,
           status: "completed",
           finalAnswer: final.text,
@@ -633,7 +633,7 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       } else {
         const answerPatch: Partial<AnswerRecord> = {
           promptId: prompt.id,
-          ...(prompt.origin === "queue" ? { origin: "queue" as const } : {}),
+          ...(prompt.origin === "queue" || prompt.origin === "timer" ? { origin: prompt.origin } : {}),
           prompt: answerPrompt,
           status: "completed",
           finalAnswer: final.text,

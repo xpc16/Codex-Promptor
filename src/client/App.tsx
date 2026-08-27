@@ -2,9 +2,11 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  lazy,
   useMemo,
   useRef,
   useState,
+  Suspense,
   type DragEvent,
   type FormEvent,
   type MouseEvent as ReactMouseEvent,
@@ -49,6 +51,10 @@ import {
 import { api, jsonBody, promptorToken as token } from "./api-client.js";
 import { SafeMarkdown } from "./safe-markdown.js";
 import { DocumentView, useDocumentViewer, type DocumentOpenIntent } from "./document-viewer.js";
+import { insertCommonPrompt, type DraftSelection } from "./prompt-insertion.js";
+
+const TimerDialog = lazy(async () => ({ default: (await import("./timer-dialog.js")).TimerDialog }));
+const CommonPromptDialog = lazy(async () => ({ default: (await import("./common-prompt-dialog.js")).CommonPromptDialog }));
 
 /**
  * Sockets this screen closed on purpose -- leaving a tab, switching transport,
@@ -256,7 +262,7 @@ export function App() {
               lastQueueCompletedAt: current[tabId]?.lastQueueCompletedAt ?? null,
             },
           }));
-        } else if ((message.type === "answer.activity" || message.type === "answer.added") && tabId && (message.origin === "queue" || message.answer?.origin === "queue") && (message.status === "completed" || message.answer?.status === "completed")) {
+        } else if ((message.type === "answer.activity" || message.type === "answer.added") && tabId && (["queue", "timer"].includes(message.origin) || ["queue", "timer"].includes(message.answer?.origin)) && (message.status === "completed" || message.answer?.status === "completed")) {
           const completedAt = String(message.completedAt ?? message.answer?.completedAt ?? message.answer?.recordedAt ?? "");
           setActivities((current) => ({
             ...current,
@@ -986,7 +992,7 @@ function AnswerHistory({ answers, total, hasEarlier, onLoadEarlier, onDocumentLi
     const isRunning = answer.status === "running";
     const isPartial = !isRunning && (answer.captureMode === "fallback_partial_answer" || (answer.status !== "completed" && Boolean(answer.finalAnswer)));
     return <article className={`answer-card ${answer.status}`} key={answer.id}>
-      <div className="answer-meta"><span className="answer-meta-left"><span>{t(answer.origin === "imported" ? "answers.imported" : answer.origin === "manual" ? "answers.manual" : "answers.queue")}</span><b className={`answer-state ${answer.status}`}>{statusLabel}</b></span><time>{t("answers.startedAt")} {i18n.formatTime(answer.startedAt)}</time></div>
+      <div className="answer-meta"><span className="answer-meta-left"><span>{t(answer.origin === "imported" ? "answers.imported" : answer.origin === "manual" ? "answers.manual" : answer.origin === "timer" ? "answers.timer" : "answers.queue")}</span><b className={`answer-state ${answer.status}`}>{statusLabel}</b></span><time>{t("answers.startedAt")} {i18n.formatTime(answer.startedAt)}</time></div>
       <div className="answer-prompt">{answer.prompt}</div>
       {answer.finalAnswer ? <>
         {isRunning && <div className="answer-lifecycle running"><span className="status-dot running" />{t("answers.waitingFinal")}</div>}
@@ -1006,7 +1012,14 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   // or the tab falling out of the retained set).
   const tabId = bundle.tab.id;
   const [newText, setNewText] = useState(() => readPromptDraft(tabId));
-  const editDraft = (text: string) => { setNewText(text); writePromptDraft(tabId, text); };
+  const draftVersion = useRef(0);
+  const composer = useRef<HTMLTextAreaElement>(null);
+  const commonSelection = useRef<DraftSelection | null>(null);
+  const [timerOpen, setTimerOpen] = useState(false);
+  const [timerMounted, setTimerMounted] = useState(false);
+  const [commonOpen, setCommonOpen] = useState(false);
+  const [commonMounted, setCommonMounted] = useState(false);
+  const editDraft = (text: string) => { draftVersion.current += 1; setNewText(text); writePromptDraft(tabId, text); };
   const [adding, setAdding] = useState(false);
   const [runnerAction, setRunnerAction] = useState<"start" | "pause" | "interrupt" | null>(null);
   const nativeDragSource = useRef<string | null>(null);
@@ -1068,12 +1081,37 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   };
   const runnerState = runnerLabel(i18n, runtime);
   const completedCount = bundle.window?.prompts.completed ?? prompts.filter((item) => item.status === "completed").length;
+  const openCommonPrompts = () => {
+    const element = composer.current;
+    commonSelection.current = {
+      start: element?.selectionStart ?? newText.length,
+      end: element?.selectionEnd ?? newText.length,
+      version: draftVersion.current,
+    };
+    setCommonMounted(true);
+    setCommonOpen(true);
+  };
+  const insertFromLibrary = (text: string) => {
+    const inserted = insertCommonPrompt(newText, text, commonSelection.current, draftVersion.current);
+    draftVersion.current += 1;
+    setNewText(inserted.value);
+    writePromptDraft(tabId, inserted.value);
+    setCommonOpen(false);
+    requestAnimationFrame(() => { composer.current?.focus(); composer.current?.setSelectionRange(inserted.cursor, inserted.cursor); });
+  };
   return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : runnerIsWorking(runtime.runner.state) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "start"} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
     <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t("queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}
-    <div className="add-prompt"><textarea disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
+    <div className="add-prompt"><textarea ref={composer} disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><div className="compose-tools"><button className="compose-tool" title={t("queue.timers")} aria-label={t("queue.timers")} onClick={() => { setTimerMounted(true); setTimerOpen(true); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3 4 6M17 3l3 3M5.5 11a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm6.5-3v3.5l2.2 1.4M8 19l-1.5 2M16 19l1.5 2" /></svg></button><button className="compose-tool" title={t("queue.commonPrompts")} aria-label={t("queue.commonPrompts")} onClick={openCommonPrompts}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></svg></button></div><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
+    {timerMounted && <Suspense fallback={timerOpen ? <LazyDialogFallback label={t("queue.timers")} /> : null}><TimerDialog open={timerOpen} tabId={tabId} sessionReady={runnable && !isShell} currentThreadId={bundle.tab.session.threadId} provider={bundle.tab.session.provider} onClose={() => setTimerOpen(false)} onError={onError} /></Suspense>}
+    {commonMounted && <Suspense fallback={commonOpen ? <LazyDialogFallback label={t("queue.commonPrompts")} /> : null}><CommonPromptDialog open={commonOpen} canInsert={!disabled && !isShell} onClose={() => setCommonOpen(false)} onInsert={insertFromLibrary} onError={onError} /></Suspense>}
   </div>;
+}
+
+function LazyDialogFallback({ label }: { label: string }) {
+  const { t } = useI18n();
+  return <div className="modal-overlay" role="status"><div className="modal-shell lazy-dialog"><div className="spinner" /><strong>{label}</strong><span>{t("action.processing")}</span></div></div>;
 }
 
 /**

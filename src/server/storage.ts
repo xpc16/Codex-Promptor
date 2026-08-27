@@ -5,9 +5,13 @@ import writeFileAtomic from "write-file-atomic";
 import {
   AnswerFileSchema,
   type AnswerFile,
+  CommonPromptFileSchema,
+  type CommonPromptFile,
+  defaultCommonPromptFile,
   defaultAnswerFile,
   defaultPromptFile,
   defaultRuntime,
+  defaultTimerFile,
   IndexFileSchema,
   isoNow,
   type IndexFile,
@@ -22,6 +26,10 @@ import {
   type TabRecordPage,
   type TabMeta,
   TabMetaSchema,
+  TimerFileSchema,
+  type TimerFile,
+  MAX_AUXILIARY_FILE_BYTES,
+  MAX_PROMPT_TEXT_BYTES,
   defaultSession,
 } from "../shared/schemas.js";
 import { latestQueueCompletion, type TabActivitySummary } from "../shared/tab-activity.js";
@@ -131,6 +139,8 @@ export class StorageService {
   promptPath(tabId: string): string { return path.join(this.tabDir(tabId), "prompt-list.json"); }
   answerPath(tabId: string): string { return path.join(this.tabDir(tabId), "final-answers.json"); }
   runtimePath(tabId: string): string { return path.join(this.tabDir(tabId), "runtime.json"); }
+  timerPath(tabId: string): string { return path.join(this.tabDir(tabId), "timers.json"); }
+  commonPromptPath(): string { return path.join(this.dataDir, "common-prompts.json"); }
 
   private async readFile<T>(filePath: string, parse: (value: unknown) => T): Promise<T> {
     const contents = await fs.readFile(filePath, "utf8");
@@ -140,6 +150,14 @@ export class StorageService {
   private async writeFile(filePath: string, value: unknown): Promise<void> {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await writeFileAtomicWithRetry(filePath, json(value));
+  }
+
+  private async readAuxiliaryFile<T>(filePath: string, parse: (value: unknown) => T): Promise<T> {
+    const contents = await fs.readFile(filePath, "utf8");
+    if (Buffer.byteLength(contents, "utf8") > MAX_AUXILIARY_FILE_BYTES) {
+      throw Object.assign(new Error("AUXILIARY_FILE_TOO_LARGE"), { code: "AUXILIARY_FILE_TOO_LARGE" });
+    }
+    return parse(JSON.parse(contents));
   }
 
   async readIndex(): Promise<IndexFile> {
@@ -270,6 +288,50 @@ export class StorageService {
   /** The runtime file on its own -- what a queue control changes, and all it needs to report. */
   async readRuntime(tabId: string): Promise<RuntimeFile> {
     return this.readFile(this.runtimePath(tabId), (value) => RuntimeFileSchema.parse(value));
+  }
+
+  /** Read the queue without loading answers, runtime or terminal metadata. */
+  async readPromptsOnly(tabId: string): Promise<PromptFile> {
+    return this.readFile(this.promptPath(tabId), (value) => PromptFileSchema.parse(value));
+  }
+
+  /** Missing optional files are virtual stable empty files; malformed files still fail loudly. */
+  async readTimers(tabId: string): Promise<TimerFile> {
+    try {
+      return await this.readAuxiliaryFile(this.timerPath(tabId), (value) => TimerFileSchema.parse(value));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return defaultTimerFile();
+      throw error;
+    }
+  }
+
+  async hasTimerFile(tabId: string): Promise<boolean> {
+    try { await fs.access(this.timerPath(tabId)); return true; } catch { return false; }
+  }
+
+  async writeTimers(tabId: string, timers: TimerFile): Promise<void> {
+    const value = TimerFileSchema.parse(timers);
+    assertAuxiliaryFileWithinLimits(value, value.timers.flatMap((timer) => timer.prompts.map((prompt) => prompt.text)));
+    await this.writeFile(this.timerPath(tabId), value);
+  }
+
+  async readCommonPrompts(): Promise<CommonPromptFile> {
+    try {
+      return await this.readAuxiliaryFile(this.commonPromptPath(), (value) => CommonPromptFileSchema.parse(value));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return defaultCommonPromptFile();
+      throw error;
+    }
+  }
+
+  async writeCommonPrompts(file: CommonPromptFile): Promise<void> {
+    const value = CommonPromptFileSchema.parse(file);
+    assertAuxiliaryFileWithinLimits(value, value.items.map((item) => item.text));
+    await this.writeFile(this.commonPromptPath(), value);
+  }
+
+  async withCommonPromptLock<T>(task: () => Promise<T>): Promise<T> {
+    return this.mutex.run("common-prompts", task);
   }
 
   async readTabActivity(tabId: string): Promise<TabActivitySummary> {
@@ -483,5 +545,14 @@ async function renameDirectoryWithRetry(source: string, target: string): Promise
       if ((error?.code !== "EPERM" && error?.code !== "EBUSY") || attempt === 5) throw error;
       await new Promise((resolve) => setTimeout(resolve, 80 * (attempt + 1)));
     }
+  }
+}
+
+function assertAuxiliaryFileWithinLimits(value: unknown, promptTexts: readonly string[]): void {
+  if (promptTexts.some((text) => Buffer.byteLength(text, "utf8") > MAX_PROMPT_TEXT_BYTES)) {
+    throw Object.assign(new Error("PROMPT_TEXT_TOO_LARGE"), { code: "PROMPT_TEXT_TOO_LARGE" });
+  }
+  if (Buffer.byteLength(json(value), "utf8") > MAX_AUXILIARY_FILE_BYTES) {
+    throw Object.assign(new Error("AUXILIARY_FILE_TOO_LARGE"), { code: "AUXILIARY_FILE_TOO_LARGE" });
   }
 }

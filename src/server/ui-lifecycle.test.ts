@@ -64,4 +64,53 @@ describe("UI lifecycle", () => {
     vi.runAllTimers();
     expect(idle).not.toHaveBeenCalled();
   });
+
+  it("keeps the process alive while background work holds it", () => {
+    vi.useFakeTimers();
+    const lifecycle = new UiLifecycle(5_000);
+    const idle = vi.fn();
+    lifecycle.on("idle", idle);
+
+    lifecycle.connect();
+    lifecycle.setBackgroundHold("timers", true);
+    lifecycle.disconnect();
+    vi.advanceTimersByTime(20_000);
+
+    expect(lifecycle.backgroundHoldCount).toBe(1);
+    expect(idle).not.toHaveBeenCalled();
+  });
+
+  it("starts a fresh grace period after the last hold is released", () => {
+    vi.useFakeTimers();
+    const lifecycle = new UiLifecycle(5_000);
+    const idle = vi.fn();
+    lifecycle.on("idle", idle);
+
+    lifecycle.connect();
+    lifecycle.setBackgroundHold("timers", true);
+    lifecycle.disconnect();
+    lifecycle.setBackgroundHold("timers", false);
+    vi.advanceTimersByTime(4_999);
+    expect(idle).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(idle).toHaveBeenCalledOnce();
+  });
+
+  it("waits for every independent background hold", () => {
+    vi.useFakeTimers();
+    const lifecycle = new UiLifecycle(1);
+    const idle = vi.fn();
+    lifecycle.on("idle", idle);
+
+    lifecycle.connect();
+    lifecycle.setBackgroundHold("one", true);
+    lifecycle.setBackgroundHold("two", true);
+    lifecycle.disconnect();
+    lifecycle.setBackgroundHold("one", false);
+    vi.runAllTimers();
+    expect(idle).not.toHaveBeenCalled();
+    lifecycle.setBackgroundHold("two", false);
+    vi.runAllTimers();
+    expect(idle).toHaveBeenCalledOnce();
+  });
 });

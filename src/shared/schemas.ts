@@ -8,7 +8,7 @@ const makeId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.
 export const AgentProviderSchema = z.enum(["codex", "claude", "cursor", "shell"]);
 export type AgentProvider = z.infer<typeof AgentProviderSchema>;
 
-export const OriginSchema = z.enum(["queue", "manual", "imported"]);
+export const OriginSchema = z.enum(["queue", "manual", "imported", "timer"]);
 export type Origin = z.infer<typeof OriginSchema>;
 
 export const PromptStatusSchema = z.enum([
@@ -49,6 +49,9 @@ export const PromptSchema = z.object({
   clientUserMessageId: z.string().nullable(),
   attempts: z.array(AttemptSchema),
   inputSnapshot: z.array(z.unknown()).optional(),
+  timerId: z.string().optional(),
+  timerOccurrenceId: z.string().optional(),
+  timerAutoRun: z.boolean().optional(),
   error: z.object({ code: z.string(), message: z.string() }).nullable(),
 });
 export type PromptRecord = z.infer<typeof PromptSchema>;
@@ -207,6 +210,97 @@ export const IndexFileSchema = z.object({
   }).default({ consoleWidth: 300, theme: "light", locale: "zh-CN", ungroupedCollapsed: false }),
 });
 export type IndexFile = z.infer<typeof IndexFileSchema>;
+
+export const MAX_TIMERS_PER_TAB = 50;
+export const MAX_TIMER_PROMPTS = 20;
+export const MAX_COMMON_PROMPTS = 200;
+export const MAX_PROMPT_TEXT_BYTES = 128 * 1024;
+export const MAX_TIMER_REQUEST_BYTES = 512 * 1024;
+export const MAX_AUXILIARY_FILE_BYTES = 1024 * 1024;
+
+const TimerPromptTemplateSchema = z.object({
+  id: z.string().min(1),
+  text: z.string().min(1),
+});
+export type TimerPromptTemplate = z.infer<typeof TimerPromptTemplateSchema>;
+
+export const OnceScheduleSchema = z.object({
+  kind: z.literal("once"),
+  localDateTime: z.string(),
+});
+
+export const WeeklyScheduleSchema = z.object({
+  kind: z.literal("weekly"),
+  daysOfWeek: z.array(z.number().int().min(1).max(7)).min(1).max(7),
+  localTime: z.string(),
+  startDate: z.string().nullable(),
+  endDate: z.string().nullable(),
+});
+
+export const IntervalScheduleSchema = z.object({
+  kind: z.literal("interval"),
+  every: z.number().int().positive(),
+  unit: z.enum(["hours", "days"]),
+  anchorAt: z.string(),
+  endAt: z.string().nullable(),
+});
+
+export const TimerScheduleSchema = z.discriminatedUnion("kind", [
+  OnceScheduleSchema,
+  WeeklyScheduleSchema,
+  IntervalScheduleSchema,
+]);
+export type TimerSchedule = z.infer<typeof TimerScheduleSchema>;
+
+export const TimerLastTriggerSchema = z.object({
+  occurrenceId: z.string(),
+  source: z.enum(["scheduled", "manual"]),
+  scheduledFor: z.string(),
+  triggeredAt: z.string(),
+  status: z.enum(["queued", "coalesced", "blocked"]),
+  code: z.string().nullable(),
+});
+export type TimerLastTrigger = z.infer<typeof TimerLastTriggerSchema>;
+
+export const TimerSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1).max(120),
+  threadId: z.string().min(1),
+  enabled: z.boolean(),
+  timeZone: z.string().min(1),
+  externalQueuePolicy: z.enum(["priority", "after_running_queue"]),
+  schedule: TimerScheduleSchema,
+  prompts: z.array(TimerPromptTemplateSchema).min(1).max(MAX_TIMER_PROMPTS),
+  nextRunAt: z.string().nullable(),
+  lastTrigger: TimerLastTriggerSchema.nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type Timer = z.infer<typeof TimerSchema>;
+
+export const TimerFileSchema = z.object({
+  schemaVersion: z.literal(1).default(1),
+  updatedAt: z.string().nullable().default(null),
+  timers: z.array(TimerSchema).max(MAX_TIMERS_PER_TAB).default([]),
+});
+export type TimerFile = z.infer<typeof TimerFileSchema>;
+
+export const CommonPromptSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1).max(120),
+  text: z.string().min(1),
+});
+export type CommonPrompt = z.infer<typeof CommonPromptSchema>;
+
+export const CommonPromptFileSchema = z.object({
+  schemaVersion: z.literal(1).default(1),
+  updatedAt: z.string().nullable().default(null),
+  items: z.array(CommonPromptSchema).max(MAX_COMMON_PROMPTS).default([]),
+});
+export type CommonPromptFile = z.infer<typeof CommonPromptFileSchema>;
+
+export const defaultTimerFile = (): TimerFile => ({ schemaVersion: 1, updatedAt: null, timers: [] });
+export const defaultCommonPromptFile = (): CommonPromptFile => ({ schemaVersion: 1, updatedAt: null, items: [] });
 
 export type TabBundle = {
   tab: TabMeta;

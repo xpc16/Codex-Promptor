@@ -125,6 +125,9 @@ describe("queue pause boundary", () => {
       } as unknown as AppServerManager;
       const runner = new QueueRunner(tab.id, storage, codex);
 
+      // This test is about thread filtering. Keep the queue rolling past the
+      // deliberately injected provider failure so it can reach its empty arm.
+      await runner.configure("continue");
       await runner.start();
       await waitUntil(async () => {
         const current = await storage.readTab(tab.id);

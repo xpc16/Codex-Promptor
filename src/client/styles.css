@@ -301,6 +301,69 @@ input, textarea, select { color: var(--text); }
 .insert-now-button { font-weight: 700; }
 .add-prompt { flex: none; display: flex; gap: 8px; align-items: stretch; margin-top: 10px; }
 .add-prompt textarea { min-height: 50px; max-height: 110px; resize: vertical; }
+.compose-tools { display: grid; grid-template-rows: 1fr 1fr; gap: 5px; }
+.compose-tool { width: 34px; min-height: 0; display: grid; place-items: center; padding: 4px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--panel-soft); color: var(--muted); }
+.compose-tool:hover { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); }
+.compose-tool svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.compose-tool svg circle { fill: currentColor; stroke: none; }
+
+.modal-overlay { position: fixed; inset: 0; z-index: 220; display: grid; place-items: center; padding: 18px; background: rgba(22, 30, 44, .48); backdrop-filter: blur(3px); }
+.modal-shell { width: min(720px, 100%); max-height: calc(100dvh - 36px); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 14px; background: var(--panel); box-shadow: 0 28px 90px rgba(13, 23, 40, .32); outline: 0; }
+.modal-shell.wide { width: min(1080px, 100%); height: min(760px, calc(100dvh - 36px)); }
+.modal-shell.lazy-dialog { width: 230px; min-height: 150px; display: grid; place-items: center; align-content: center; gap: 9px; color: var(--muted); }
+.modal-shell-heading { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 15px 18px; border-bottom: 1px solid var(--border); }
+.modal-shell-heading h2 { margin: 0; font-size: 19px; }
+.modal-close { width: 34px; height: 34px; border-radius: 8px; background: var(--panel-soft); color: var(--muted); font-size: 24px; line-height: 1; }
+.modal-close:hover { background: var(--panel-strong); color: var(--text); }
+.modal-shell-body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: 14px; }
+.modal-empty { display: grid; min-height: 110px; place-items: center; padding: 18px; color: var(--muted); text-align: center; }
+.modal-actions { flex: none; display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.modal-actions.split { justify-content: space-between; align-items: center; }
+.modal-actions.split > span { display: flex; flex-wrap: wrap; gap: 8px; }
+.modal-shell input, .modal-shell textarea, .modal-shell select { width: 100%; min-width: 0; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 8px; outline: 0; background: var(--panel-soft); color: var(--text); }
+.modal-shell input:focus, .modal-shell textarea:focus, .modal-shell select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 15%, transparent); }
+.modal-shell label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 650; }
+
+.library-toolbar, .timer-toolbar { flex: none; display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.library-toolbar input { flex: 1; }
+.timer-toolbar span { margin-left: auto; color: var(--muted); font-size: 12px; }
+.library-layout, .timer-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(190px, 28%) minmax(0, 1fr); overflow: hidden; border: 1px solid var(--border); border-radius: 10px; }
+.library-list, .timer-list { min-height: 0; overflow: auto; padding: 7px; border-right: 1px solid var(--border); background: var(--panel-soft); overscroll-behavior: contain; }
+.library-item, .timer-item { width: 100%; display: grid; gap: 5px; padding: 10px; border: 1px solid transparent; border-radius: 8px; background: transparent; text-align: left; }
+.library-item:hover, .timer-item:hover { background: var(--panel); }
+.library-item.active, .timer-item.active { border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); background: var(--primary-soft); }
+.library-item strong, .timer-item strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.library-item span, .timer-item small { min-width: 0; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.library-editor, .timer-editor { min-width: 0; min-height: 0; overflow: auto; padding: 14px; overscroll-behavior: contain; }
+.library-editor { display: flex; flex-direction: column; }
+.library-editor label.grow { flex: 1; min-height: 180px; margin-top: 12px; }
+.library-editor label.grow textarea { height: 100%; min-height: 180px; resize: none; font-family: inherit; line-height: 1.55; }
+
+.timer-item > span { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.timer-item em { color: var(--notice); font-size: 10px; font-style: normal; }
+.timer-editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.timer-editor-grid .span-2 { grid-column: 1 / -1; }
+.toggle-field { display: flex !important; grid-auto-flow: column; grid-template-columns: auto 1fr; align-items: center; justify-content: start; }
+.toggle-field input { width: 17px; }
+.timer-rule { margin: 14px 0 0; padding: 10px; border: 1px solid var(--border); border-radius: 9px; }
+.timer-rule legend { padding: 0 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
+.timer-rule .mode-switch { margin: 0 0 10px; }
+.weekly-fields, .interval-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.weekday-picker { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; }
+.weekday-picker button { padding: 7px 2px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft); color: var(--muted); }
+.weekday-picker button.active { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); font-weight: 800; }
+.timer-binding { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; padding: 9px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); font-size: 12px; }
+.timer-binding span { min-width: 0; }
+.timer-binding code { color: var(--text); overflow-wrap: anywhere; }
+.timer-prompts-heading { display: flex; align-items: center; gap: 9px; margin-top: 14px; }
+.timer-prompts-heading span { color: var(--muted); font-size: 11px; }
+.timer-prompts-heading button { margin-left: auto; }
+.timer-prompts { display: grid; gap: 7px; margin-top: 8px; }
+.timer-prompt { display: grid; grid-template-columns: 17px 20px minmax(0, 1fr) auto 22px; align-items: center; gap: 5px; }
+.timer-prompt textarea { min-height: 58px; max-height: 150px; resize: vertical; line-height: 1.45; }
+.drag-handle { color: var(--faint); cursor: grab; }
+.template-index { color: var(--muted); font-size: 11px; text-align: center; }
+.ghost.compact { padding: 6px 8px; }
 
 .terminal-card { display: flex; flex-direction: column; overflow: hidden; }
 .terminal-heading { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 13px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 13px; }
@@ -401,6 +464,18 @@ input, textarea, select { color: var(--text); }
      pane bar off-screen. */
   html, body, #root { height: 100dvh; overscroll-behavior: none; }
   body { position: fixed; inset: 0; }
+  .modal-overlay { padding: 0; }
+  .modal-shell, .modal-shell.wide { width: 100%; height: 100dvh; max-height: none; border: 0; border-radius: 0; }
+  .modal-shell-body { padding: 10px; }
+  .library-toolbar, .timer-toolbar { flex-wrap: wrap; }
+  .library-toolbar input { flex-basis: 100%; }
+  .timer-toolbar span { width: 100%; margin-left: 0; }
+  .library-layout, .timer-layout { grid-template-columns: 1fr; grid-template-rows: minmax(110px, 30%) minmax(0, 1fr); }
+  .library-list, .timer-list { border-right: 0; border-bottom: 1px solid var(--border); }
+  .timer-editor-grid, .weekly-fields, .interval-fields { grid-template-columns: 1fr; }
+  .timer-prompt { grid-template-columns: 14px 18px minmax(0, 1fr) 22px; }
+  .timer-prompt .ghost.compact { grid-column: 3; justify-self: start; }
+  .modal-actions.split { align-items: flex-start; gap: 10px; }
   .app-shell {
     grid-template-columns: 1fr !important;
     grid-template-rows: minmax(0, 1fr) auto;

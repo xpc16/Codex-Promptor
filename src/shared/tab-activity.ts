@@ -55,7 +55,7 @@ export function tabVisualState(sessionState: Session["state"], activity: TabActi
 export function latestQueueCompletion(prompts: PromptRecord[]): string | null {
   let latest: { value: string; epoch: number } | null = null;
   for (const prompt of prompts) {
-    if (prompt.origin !== "queue" || prompt.status !== "completed" || !prompt.completedAt) continue;
+    if ((prompt.origin !== "queue" && prompt.origin !== "timer") || prompt.status !== "completed" || !prompt.completedAt) continue;
     const epoch = Date.parse(prompt.completedAt);
     if (!Number.isFinite(epoch) || (latest && epoch <= latest.epoch)) continue;
     latest = { value: prompt.completedAt, epoch };

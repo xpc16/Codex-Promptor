@@ -35,6 +35,24 @@ export function ifNoneMatchSatisfied(header: string | string[] | undefined, etag
   return false;
 }
 
+/**
+ * Whether a conditional write still targets the representation the caller
+ * edited. The route distinguishes an absent header (428) from a stale value
+ * (412); this helper intentionally answers only the matching question.
+ */
+export function ifMatchSatisfied(header: string | string[] | undefined, etag: string): boolean {
+  if (header === undefined) return false;
+  const raw = Array.isArray(header) ? header.join(",") : header;
+  const current = normalizeTag(etag);
+  for (const candidate of raw.split(",")) {
+    const value = candidate.trim();
+    if (!value) continue;
+    if (value === "*") return true;
+    if (normalizeTag(value) === current) return true;
+  }
+  return false;
+}
+
 function normalizeTag(value: string): string {
   const withoutWeakness = value.startsWith("W/") ? value.slice(2) : value;
   const unquoted = withoutWeakness.startsWith("\"") && withoutWeakness.endsWith("\"") && withoutWeakness.length >= 2

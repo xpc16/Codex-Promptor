@@ -23,22 +23,15 @@ export class QueueRunner extends EventEmitter {
   private loopPromise: Promise<void> | null = null;
   private loopGeneration = 0;
   private stopping = false;
-  /**
-   * The prompt an "insert now" is running on its own, on a queue that was not
-   * rolling. While this is set the loop runs exactly that prompt and then
-   * stops -- and it does so without ever writing desiredState, because running
-   * one prompt on request says nothing about whether the queue keeps rolling.
-   * The badge goes on reading what the user set it to, and there is no saved
-   * value to restore afterwards because nothing was overwritten.
-   */
-  private pauseAfterPromptId: string | null = null;
+  /** Pending prompts temporarily allowed to run without changing desiredState. */
+  private readonly oneShotPromptIds = new Set<string>();
 
   /**
    * Whether the loop should keep going. Two independent reasons: the queue is
    * set to roll, or a single requested prompt has not finished yet.
    */
   private keepsRunning(runtime: RuntimeFile): boolean {
-    return runtime.runner.desiredState === "running" || this.pauseAfterPromptId !== null;
+    return runtime.runner.desiredState === "running" || this.oneShotPromptIds.size > 0;
   }
 
   constructor(
@@ -55,8 +48,18 @@ export class QueueRunner extends EventEmitter {
   }
 
   async start(): Promise<void> {
-    this.pauseAfterPromptId = null;
+    await this.clearOneShotIntent();
     await this.activate();
+  }
+
+  /**
+   * Register a crash-recoverable timer batch and wake the existing loop. The
+   * promise covers registration only; callers never wait for provider turns.
+   */
+  async runOneShotBatch(promptIds: readonly string[]): Promise<void> {
+    for (const id of promptIds) if (id) this.oneShotPromptIds.add(id);
+    if (this.oneShotPromptIds.size === 0 || this.stopping) return;
+    this.launchLoop();
   }
 
   private async activate(): Promise<void> {
@@ -92,7 +95,7 @@ export class QueueRunner extends EventEmitter {
   }
 
   async pause(): Promise<void> {
-    this.pauseAfterPromptId = null;
+    await this.clearOneShotIntent();
     await this.pauseRunner();
   }
 
@@ -100,7 +103,7 @@ export class QueueRunner extends EventEmitter {
    * The requested prompt is done. Only the transient run state is cleared --
    * desiredState was never touched, so there is nothing to put back.
    */
-  private async settleAfterInsertNow(): Promise<void> {
+  private async settleAfterOneShot(): Promise<void> {
     await this.setRunnerState("paused");
   }
 
@@ -250,13 +253,15 @@ export class QueueRunner extends EventEmitter {
         if (generation !== this.loopGeneration) return;
         const fresh = await this.storage.readTab(this.tabId);
         if (!this.keepsRunning(fresh.runtime)) { await this.setRunnerState("paused"); return; }
-        const prompt = this.pauseAfterPromptId
-          ? fresh.prompts.prompts.find((item) => item.id === this.pauseAfterPromptId && item.status === "pending" && (!item.threadId || item.threadId === threadId))
-          : fresh.prompts.prompts.find((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId));
+        const prompt = fresh.runtime.runner.desiredState === "running"
+          ? fresh.prompts.prompts.find((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId))
+          : fresh.prompts.prompts.find((item) => this.oneShotPromptIds.has(item.id)
+            && item.status === "pending"
+            && (!item.threadId || item.threadId === threadId));
         if (!prompt) {
-          if (this.pauseAfterPromptId) {
-            this.pauseAfterPromptId = null;
-            await this.settleAfterInsertNow();
+          if (this.oneShotPromptIds.size > 0) await this.discardUnavailableOneShots(threadId);
+          if (fresh.runtime.runner.desiredState !== "running") {
+            await this.settleAfterOneShot();
             return;
           }
           if (await this.armIfEmpty(generation)) return;
@@ -264,11 +269,13 @@ export class QueueRunner extends EventEmitter {
         }
         const dispatched = await this.prepareDispatch(prompt.id, generation);
         if (!dispatched) continue;
-        await this.dispatch(threadId, workingDirectory, dispatched, generation);
-        if (this.pauseAfterPromptId === prompt.id) {
-          this.pauseAfterPromptId = null;
-          await this.settleAfterInsertNow();
-          return;
+        const failed = await this.dispatch(threadId, workingDirectory, dispatched, generation);
+        if (failed) {
+          const after = await this.storage.readRuntime(this.tabId);
+          if (after.queueConfig.onFailure === "pause") {
+            await this.pauseAfterFailure();
+            return;
+          }
         }
       }
     } catch (error) {
@@ -290,7 +297,7 @@ export class QueueRunner extends EventEmitter {
         && (!item.threadId || item.threadId === threadId));
       if (!prompt) return null;
       const clientUserMessageId = `codex-promptor-${randomUUID()}`;
-      const attempt = newAttempt("queue");
+      const attempt = newAttempt(prompt.origin);
       attempt.status = "dispatching";
       attempt.startedAt = isoNow();
       attempt.clientUserMessageId = clientUserMessageId;
@@ -300,10 +307,12 @@ export class QueueRunner extends EventEmitter {
       prompt.startedAt = attempt.startedAt;
       prompt.clientUserMessageId = clientUserMessageId;
       prompt.error = null;
+      delete prompt.timerAutoRun;
       prompt.updatedAt = isoNow();
       bundle.prompts.revision += 1;
       bundle.prompts.updatedAt = isoNow();
       await this.storage.writePrompts(this.tabId, bundle.prompts);
+      this.oneShotPromptIds.delete(prompt.id);
       return { prompt, clientUserMessageId };
     });
   }
@@ -337,7 +346,7 @@ export class QueueRunner extends EventEmitter {
     // Idle: drive the loop directly for this one prompt. Going through
     // activate() would write desiredState "running", which is what used to
     // make a stopped queue read as rolling for the length of the turn.
-    this.pauseAfterPromptId = promptId;
+    this.oneShotPromptIds.add(promptId);
     this.stopping = false;
     this.launchLoop();
     return { mode: "started", turnId: null };
@@ -358,7 +367,7 @@ export class QueueRunner extends EventEmitter {
         clientUserMessageId: prompt.clientUserMessageId,
       };
       const startedAt = isoNow();
-      const attempt = newAttempt("queue");
+      const attempt = newAttempt(prompt.origin);
       attempt.delivery = "steer";
       attempt.status = "dispatching";
       attempt.startedAt = startedAt;
@@ -371,10 +380,12 @@ export class QueueRunner extends EventEmitter {
       prompt.codexTurnId = turnId;
       prompt.clientUserMessageId = clientUserMessageId;
       prompt.error = null;
+      delete prompt.timerAutoRun;
       prompt.updatedAt = startedAt;
       bundle.prompts.revision += 1;
       bundle.prompts.updatedAt = startedAt;
       await this.storage.writePrompts(this.tabId, bundle.prompts);
+      this.oneShotPromptIds.delete(prompt.id);
       return { text: prompt.text, startedAt, attemptId: attempt.attemptId, previous };
     });
     try {
@@ -425,7 +436,7 @@ export class QueueRunner extends EventEmitter {
     this.emit("answer", answer);
   }
 
-  private async dispatch(threadId: string, cwd: string, dispatched: { prompt: PromptRecord; clientUserMessageId: string }, generation: number): Promise<void> {
+  private async dispatch(threadId: string, cwd: string, dispatched: { prompt: PromptRecord; clientUserMessageId: string }, generation: number): Promise<boolean> {
     await this.setRunnerState("dispatching", dispatched.prompt.id, null);
     let turnId = "";
     try {
@@ -450,7 +461,7 @@ export class QueueRunner extends EventEmitter {
       if (generation !== this.loopGeneration) {
         try { await this.agent().rpc.interruptTurn(threadId, turnId); } catch { /* the detached turn may already be settling */ }
         await this.finalizeInterruptedTurn(threadId, turnId);
-        return;
+        return false;
       }
       await this.setRunnerState("running", dispatched.prompt.id, turnId);
       const completed = await this.agent().rpc.waitForTurn(turnId);
@@ -458,7 +469,7 @@ export class QueueRunner extends EventEmitter {
         threadId,
         turn: completed.turn,
         items: completed.items,
-        origin: "queue",
+        origin: dispatched.prompt.origin,
         promptId: dispatched.prompt.id,
         promptText: dispatched.prompt.text,
         clientUserMessageId: dispatched.clientUserMessageId,
@@ -478,18 +489,20 @@ export class QueueRunner extends EventEmitter {
       }
       if (resultRecord.answer) this.emit("answer", resultRecord.answer);
       await this.clearActive(completionError, dispatched.prompt.id, turnId);
+      return completionError !== null;
     } catch (error) {
       if (turnId) {
         const current = await this.storage.readTab(this.tabId).catch(() => null);
         const prompt = current?.prompts.prompts.find((item) => item.id === dispatched.prompt.id);
         if (prompt?.status === "interrupted") {
           await this.clearActive(null, dispatched.prompt.id, turnId);
-          return;
+          return false;
         }
       }
       const message = error instanceof Error ? error.message : String(error);
       await this.markFailure(dispatched.prompt.id, dispatched.clientUserMessageId, turnId ? "TURN_FAILED" : "TURN_START_FAILED", message, turnId || null);
       await this.clearActive({ code: turnId ? "TURN_FAILED" : "TURN_START_FAILED", message }, dispatched.prompt.id, turnId || null);
+      return true;
     }
   }
 
@@ -713,12 +726,89 @@ export class QueueRunner extends EventEmitter {
   }
 
   private async failRunner(code: string, message: string): Promise<void> {
-    this.pauseAfterPromptId = null;
+    await this.clearOneShotIntent();
     await this.updateRuntime((runtime) => ({
       ...runtime,
       runner: { ...runtime.runner, desiredState: "paused", state: "error", lastError: { code, message }, activePromptId: null, activeTurnId: null, lastTransitionAt: isoNow() },
     }));
     this.emit("error", { code, message });
+  }
+
+  private async clearOneShotIntent(): Promise<void> {
+    this.oneShotPromptIds.clear();
+    await this.storage.withTabLock(this.tabId, async () => {
+      const bundle = await this.storage.readTab(this.tabId);
+      let changed = false;
+      for (const prompt of bundle.prompts.prompts) {
+        if (prompt.timerAutoRun !== true) continue;
+        delete prompt.timerAutoRun;
+        prompt.updatedAt = isoNow();
+        changed = true;
+      }
+      if (!changed) return;
+      bundle.prompts.revision += 1;
+      bundle.prompts.updatedAt = isoNow();
+      await this.storage.writePrompts(this.tabId, bundle.prompts);
+    });
+  }
+
+  private async discardUnavailableOneShots(threadId: string): Promise<void> {
+    const unavailable = new Set(this.oneShotPromptIds);
+    await this.storage.withTabLock(this.tabId, async () => {
+      const bundle = await this.storage.readTab(this.tabId);
+      let changed = false;
+      for (const prompt of bundle.prompts.prompts) {
+        if (!unavailable.has(prompt.id)) continue;
+        const eligible = prompt.status === "pending" && (!prompt.threadId || prompt.threadId === threadId);
+        if (eligible) {
+          unavailable.delete(prompt.id);
+          continue;
+        }
+        if (prompt.timerAutoRun === true) {
+          delete prompt.timerAutoRun;
+          prompt.updatedAt = isoNow();
+          changed = true;
+        }
+      }
+      for (const id of unavailable) this.oneShotPromptIds.delete(id);
+      if (!changed) return;
+      bundle.prompts.revision += 1;
+      bundle.prompts.updatedAt = isoNow();
+      await this.storage.writePrompts(this.tabId, bundle.prompts);
+    });
+  }
+
+  private async pauseAfterFailure(): Promise<void> {
+    this.oneShotPromptIds.clear();
+    await this.storage.withTabLock(this.tabId, async () => {
+      const bundle = await this.storage.readTab(this.tabId);
+      let promptsChanged = false;
+      for (const prompt of bundle.prompts.prompts) {
+        if (prompt.timerAutoRun !== true) continue;
+        delete prompt.timerAutoRun;
+        prompt.updatedAt = isoNow();
+        promptsChanged = true;
+      }
+      if (promptsChanged) {
+        bundle.prompts.revision += 1;
+        bundle.prompts.updatedAt = isoNow();
+        await this.storage.writePrompts(this.tabId, bundle.prompts);
+      }
+      const runtime: RuntimeFile = {
+        ...bundle.runtime,
+        revision: bundle.runtime.revision + 1,
+        runner: {
+          ...bundle.runtime.runner,
+          desiredState: "paused",
+          state: "error",
+          activePromptId: null,
+          activeTurnId: null,
+          lastTransitionAt: isoNow(),
+        },
+      };
+      await this.storage.writeRuntime(this.tabId, runtime);
+      this.emit("runtime", runtime);
+    });
   }
 
   private async updateRuntime(mutator: (runtime: RuntimeFile) => RuntimeFile): Promise<RuntimeFile> {
