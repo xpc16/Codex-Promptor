@@ -23,14 +23,23 @@ export class QueueRunner extends EventEmitter {
   private loopPromise: Promise<void> | null = null;
   private loopGeneration = 0;
   private stopping = false;
-  private pauseAfterPromptId: string | null = null;
   /**
-   * What "insert now" should restore once its one prompt is done. A queue the
-   * user had stopped goes back to stopped; a queue that was merely armed goes
-   * back to armed, because running a single prompt on request is not the user
-   * stopping the queue.
+   * The prompt an "insert now" is running on its own, on a queue that was not
+   * rolling. While this is set the loop runs exactly that prompt and then
+   * stops -- and it does so without ever writing desiredState, because running
+   * one prompt on request says nothing about whether the queue keeps rolling.
+   * The badge goes on reading what the user set it to, and there is no saved
+   * value to restore afterwards because nothing was overwritten.
    */
-  private stateAfterInsertNow: "paused" | "armed" = "paused";
+  private pauseAfterPromptId: string | null = null;
+
+  /**
+   * Whether the loop should keep going. Two independent reasons: the queue is
+   * set to roll, or a single requested prompt has not finished yet.
+   */
+  private keepsRunning(runtime: RuntimeFile): boolean {
+    return runtime.runner.desiredState === "running" || this.pauseAfterPromptId !== null;
+  }
 
   constructor(
     readonly tabId: string,
@@ -76,7 +85,7 @@ export class QueueRunner extends EventEmitter {
       if (this.stopping) return;
       try {
         const current = await this.storage.readTab(this.tabId);
-        if (current.runtime.runner.desiredState === "running") this.launchLoop();
+        if (this.keepsRunning(current.runtime)) this.launchLoop();
       } catch { /* a deleted tab must not restart its runner */ }
     });
     this.loopPromise = loop;
@@ -87,15 +96,12 @@ export class QueueRunner extends EventEmitter {
     await this.pauseRunner();
   }
 
+  /**
+   * The requested prompt is done. Only the transient run state is cleared --
+   * desiredState was never touched, so there is nothing to put back.
+   */
   private async settleAfterInsertNow(): Promise<void> {
-    if (this.stateAfterInsertNow === "armed") {
-      await this.updateRuntime((runtime) => ({
-        ...runtime,
-        runner: { ...runtime.runner, desiredState: "armed", state: "paused", activePromptId: null, activeTurnId: null, lastTransitionAt: isoNow() },
-      }));
-      return;
-    }
-    await this.pauseRunner();
+    await this.setRunnerState("paused");
   }
 
   private async pauseRunner(): Promise<void> {
@@ -225,7 +231,7 @@ export class QueueRunner extends EventEmitter {
       while (!this.stopping && generation === this.loopGeneration) {
         const bundle = await this.storage.readTab(this.tabId);
         if (generation !== this.loopGeneration) return;
-        if (bundle.runtime.runner.desiredState !== "running") {
+        if (!this.keepsRunning(bundle.runtime)) {
           await this.setRunnerState("paused");
           return;
         }
@@ -243,7 +249,7 @@ export class QueueRunner extends EventEmitter {
         }
         if (generation !== this.loopGeneration) return;
         const fresh = await this.storage.readTab(this.tabId);
-        if (fresh.runtime.runner.desiredState !== "running") { await this.setRunnerState("paused"); return; }
+        if (!this.keepsRunning(fresh.runtime)) { await this.setRunnerState("paused"); return; }
         const prompt = this.pauseAfterPromptId
           ? fresh.prompts.prompts.find((item) => item.id === this.pauseAfterPromptId && item.status === "pending" && (!item.threadId || item.threadId === threadId))
           : fresh.prompts.prompts.find((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId));
@@ -276,7 +282,7 @@ export class QueueRunner extends EventEmitter {
     return this.storage.withTabLock(this.tabId, async () => {
       if (generation !== this.loopGeneration) return null;
       const bundle = await this.storage.readTab(this.tabId);
-      if (bundle.runtime.runner.desiredState !== "running") return null;
+      if (!this.keepsRunning(bundle.runtime)) return null;
       const threadId = bundle.tab.session.threadId;
       if (!threadId) return null;
       const prompt = bundle.prompts.prompts.find((item) => item.id === promptId
@@ -311,7 +317,6 @@ export class QueueRunner extends EventEmitter {
       if (targetIndex < 0 || !target) throw new Error("PROMPT_NOT_FOUND");
       if (target.status !== "pending" || (target.threadId && target.threadId !== threadId)) throw new Error("PROMPT_NOT_PENDING");
       const wasRunning = bundle.runtime.runner.desiredState === "running";
-      if (!wasRunning) this.stateAfterInsertNow = bundle.runtime.runner.desiredState === "armed" ? "armed" : "paused";
       const firstPendingIndex = bundle.prompts.prompts.findIndex((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId));
       if (firstPendingIndex >= 0 && firstPendingIndex !== targetIndex) {
         bundle.prompts.prompts.splice(targetIndex, 1);
@@ -323,8 +328,18 @@ export class QueueRunner extends EventEmitter {
       }
       return wasRunning;
     });
-    if (!continueQueue) this.pauseAfterPromptId = promptId;
-    await this.activate();
+    if (continueQueue) {
+      // Already rolling: the prompt was moved to the front and the running
+      // loop will take it next. Nothing about the queue's setting changes.
+      await this.activate();
+      return { mode: "started", turnId: null };
+    }
+    // Idle: drive the loop directly for this one prompt. Going through
+    // activate() would write desiredState "running", which is what used to
+    // make a stopped queue read as rolling for the length of the turn.
+    this.pauseAfterPromptId = promptId;
+    this.stopping = false;
+    this.launchLoop();
     return { mode: "started", turnId: null };
   }
 
@@ -698,6 +713,7 @@ export class QueueRunner extends EventEmitter {
   }
 
   private async failRunner(code: string, message: string): Promise<void> {
+    this.pauseAfterPromptId = null;
     await this.updateRuntime((runtime) => ({
       ...runtime,
       runner: { ...runtime.runner, desiredState: "paused", state: "error", lastError: { code, message }, activePromptId: null, activeTurnId: null, lastTransitionAt: isoNow() },

@@ -446,7 +446,7 @@ describe("insert now", () => {
   it.each([
     ["paused", "paused"],
     ["armed", "armed"],
-  ] as const)("runs only the selected prompt and restores the idle queue (%s)", async (before, after) => {
+  ] as const)("runs only the selected prompt and never disturbs the idle queue (%s)", async (before, after) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-insert-idle-"));
     const storage = new StorageService(root);
     try {
@@ -458,8 +458,8 @@ describe("insert now", () => {
         session: { ...current.session, state: "ready", workingDirectory: root, threadId: "thread-idle-now", sessionId: "thread-idle-now", connectedAt: isoNow() },
       }));
       const bundle = await storage.readTab(tab.id);
-      // Running one prompt on request is not the user stopping the queue, so a
-      // queue that was merely armed has to come back armed.
+      // Running one prompt on request says nothing about whether the queue
+      // rolls, so the setting must read the same before, during and after.
       bundle.runtime.runner.desiredState = before;
       await storage.writeRuntime(tab.id, bundle.runtime);
       const earlier = newPrompt("原先排队", "queue");
@@ -492,6 +492,11 @@ describe("insert now", () => {
       expect(await runner.insertNow(selected.id)).toEqual({ mode: "started", turnId: null });
       await waitUntil(async () => calls.length === 1);
       expect(calls).toEqual(["只运行这一条"]);
+      // Mid-turn, with the prompt dispatched and the answer not back yet: the
+      // queue still reads as the user set it, never as rolling.
+      const midTurn = await storage.readTab(tab.id);
+      expect(midTurn.runtime.runner.desiredState).toBe(before);
+      expect(midTurn.runtime.runner.activePromptId).toBe(selected.id);
       release();
       await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.state === "paused");
 
@@ -500,6 +505,76 @@ describe("insert now", () => {
       expect(finished.prompts.prompts.find((item) => item.id === selected.id)?.status).toBe("completed");
       expect(finished.prompts.prompts.find((item) => item.id === earlier.id)?.status).toBe("pending");
       expect(finished.answers.answers).toHaveLength(1);
+      await runner.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("starting the queue during a one-shot", () => {
+  it("takes over the run instead of stopping after the requested prompt", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-insert-then-start-"));
+    const storage = new StorageService(root);
+    try {
+      await storage.ensure();
+      const tab = await storage.createTab("先插入再开始");
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        updatedAt: isoNow(),
+        session: { ...current.session, state: "ready", workingDirectory: root, threadId: "thread-takeover", sessionId: "thread-takeover", connectedAt: isoNow() },
+      }));
+      const bundle = await storage.readTab(tab.id);
+      bundle.runtime.runner.desiredState = "armed";
+      await storage.writeRuntime(tab.id, bundle.runtime);
+      const earlier = newPrompt("原先排队", "queue");
+      const selected = newPrompt("只运行这一条", "queue");
+      bundle.prompts.prompts.push(earlier, selected);
+      await storage.writePrompts(tab.id, bundle.prompts);
+
+      const calls: string[] = [];
+      const gates: Array<() => void> = [];
+      const sent = new Map<string, string>();
+      let turns = 0;
+      const codex = {
+        rpc: {
+          activeTurnIds: () => [],
+          waitForThreadIdle: async () => undefined,
+          startTurn: async (_threadId: string, text: string) => {
+            calls.push(text);
+            const turnId = `turn-${++turns}`;
+            sent.set(turnId, text);
+            return { turnId };
+          },
+          waitForTurn: async (turnId: string) => {
+            await new Promise<void>((resolve) => gates.push(resolve));
+            return {
+              turn: { id: turnId, status: "completed" },
+              items: [
+                { type: "userMessage", text: sent.get(turnId) },
+                { type: "agentMessage", phase: "final_answer", text: `已完成 ${turnId}` },
+              ],
+            };
+          },
+        },
+      } as unknown as AppServerManager;
+      const runner = new QueueRunner(tab.id, storage, codex);
+
+      await runner.insertNow(selected.id);
+      await waitUntil(async () => calls.length === 1 && gates.length === 1);
+      expect((await storage.readTab(tab.id)).runtime.runner.desiredState).toBe("armed");
+
+      // Pressing start mid-turn is a decision to keep going, and it has to
+      // outrank the one-shot's standing instruction to stop after this prompt.
+      await runner.start();
+      gates.shift()!();
+
+      await waitUntil(async () => calls.length === 2 && gates.length === 1);
+      expect(calls).toEqual(["只运行这一条", "原先排队"]);
+      gates.shift()!();
+      // Rolling to the end of the queue arms it, as a finished run always does.
+      await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.desiredState === "armed");
+      expect((await storage.readTab(tab.id)).prompts.prompts.map((prompt) => prompt.status)).toEqual(["completed", "completed"]);
       await runner.stop();
     } finally {
       await rm(root, { recursive: true, force: true });
