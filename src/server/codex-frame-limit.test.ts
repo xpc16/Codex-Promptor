@@ -1,16 +1,16 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket as ServerSocket } from "ws";
 
-// The frame ceiling is read once when the module loads, so it is set before the
-// import. 1MB keeps the oversized response in this test small; in production the
-// same path is reached by a `thread/read` on a conversation whose rollout has
-// grown past 100MB.
-process.env.CODEX_PROMPTOR_CODEX_MAX_FRAME_MB = "1";
+// Both ceilings are read once when the module loads, so they are set before the
+// import. Scaled down by ~64x from production: what a `thread/read` on a 200MB
+// conversation does to the real limits, a few megabytes do to these.
+process.env.CODEX_PROMPTOR_CODEX_MAX_FRAME_MB = "8";
+process.env.CODEX_PROMPTOR_CODEX_MAX_PARSE_MB = "1";
 const { AppServerManager, CodexRpcClient } = await import("./codex.js");
 
 type FakeServer = { url: string; close: () => Promise<void>; requests: string[] };
 
-/** An app server that answers `initialize` normally and `thread/read` with an oversized response. */
+/** An app server whose `thread/read` and `thread/resume` responses are as big as the test asks for. */
 async function startFakeAppServer(responseBytes: number): Promise<FakeServer> {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   const requests: string[] = [];
@@ -23,8 +23,11 @@ async function startFakeAppServer(responseBytes: number): Promise<FakeServer> {
       if (!message.method) return;
       requests.push(message.method);
       if (message.id === undefined) return;
-      if (message.method === "thread/read") {
-        socket.send(JSON.stringify({ id: message.id, result: { thread: { id: message.params.threadId, turns: [], filler: "x".repeat(responseBytes) } } }));
+      if (message.method === "thread/read" || message.method === "thread/resume") {
+        socket.send(JSON.stringify({
+          id: message.id,
+          result: { thread: { id: message.params.threadId, sessionId: "session-1", turns: [], filler: "x".repeat(responseBytes) } },
+        }));
         return;
       }
       socket.send(JSON.stringify({ id: message.id, result: {} }));
@@ -43,12 +46,12 @@ async function startFakeAppServer(responseBytes: number): Promise<FakeServer> {
   };
 }
 
-describe("oversized app-server responses", () => {
+describe("responses too large to receive", () => {
   const servers: FakeServer[] = [];
   afterEach(async () => { await Promise.all(servers.splice(0).map((server) => server.close())); });
 
-  it("survives a response too large to receive and blames the thread that caused it", async () => {
-    const server = await startFakeAppServer(1_500_000);
+  it("survives one and blames the thread that caused it", async () => {
+    const server = await startFakeAppServer(10_000_000);
     servers.push(server);
     const rpc = new CodexRpcClient();
     await rpc.connect(server.url);
@@ -61,7 +64,7 @@ describe("oversized app-server responses", () => {
   });
 
   it("refuses a thread already known to be unreadable instead of killing another socket", async () => {
-    const server = await startFakeAppServer(1_500_000);
+    const server = await startFakeAppServer(10_000_000);
     servers.push(server);
     const rpc = new CodexRpcClient();
     await rpc.connect(server.url);
@@ -74,8 +77,40 @@ describe("oversized app-server responses", () => {
     expect(server.requests.filter((method) => method === "thread/read")).toHaveLength(1);
     expect(rpc.connected).toBe(true);
   });
+});
 
-  it("keeps ordinary responses working under the same ceiling", async () => {
+describe("responses too large to be worth parsing", () => {
+  const servers: FakeServer[] = [];
+  afterEach(async () => { await Promise.all(servers.splice(0).map((server) => server.close())); });
+
+  it("subscribes to a thread whose resume response carries the whole conversation", async () => {
+    const server = await startFakeAppServer(3_000_000);
+    servers.push(server);
+    const rpc = new CodexRpcClient();
+    await rpc.connect(server.url);
+
+    // `thread/resume` is the only way to subscribe and it always answers with
+    // the entire thread. Opening a long conversation depends on this call
+    // completing without the payload ever becoming objects.
+    await expect(rpc.resumeThread("thread-long", "D:\\\\work")).resolves.toBeUndefined();
+    expect(rpc.connected).toBe(true);
+  });
+
+  it("treats a history read it declined to parse as a thread it cannot read", async () => {
+    const server = await startFakeAppServer(3_000_000);
+    servers.push(server);
+    const rpc = new CodexRpcClient();
+    await rpc.connect(server.url);
+
+    // Unparsed is as unusable as unreceived for a call whose whole purpose is
+    // the turns, so it settles into the same outcome and the same memo.
+    await expect(rpc.readThread("thread-long", 5_000)).rejects.toThrow("CODEX_THREAD_TOO_LARGE:thread-long");
+    await expect(rpc.readThread("thread-long", 5_000)).rejects.toThrow("CODEX_THREAD_TOO_LARGE");
+    expect(server.requests.filter((method) => method === "thread/read")).toHaveLength(1);
+    expect(rpc.connected).toBe(true);
+  });
+
+  it("still parses a response under the threshold", async () => {
     const server = await startFakeAppServer(1_000);
     servers.push(server);
     const rpc = new CodexRpcClient();

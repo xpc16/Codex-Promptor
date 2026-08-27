@@ -39,26 +39,65 @@ type TurnAccumulator = {
 const THREAD_SUMMARY_POLL_MS = 5_000;
 
 /**
- * Ceiling for a single app-server response.
+ * Ceiling for a single app-server frame.
  *
- * `thread/read` has no pagination: `includeTurns: true` returns the whole
- * rollout in one frame, so this response is bounded only by how long the
- * conversation ran, and rollouts above 200MB exist. Accepting one would mean a
- * buffer that size, a string that size, and the parsed object graph on top of
- * both -- all to extract a single turn -- so the limit is stated here rather
- * than inherited from `ws`, which applies the same 100MB by default and tears
- * the connection down with an unattributed RangeError when it is passed.
- * Raise it with CODEX_PROMPTOR_CODEX_MAX_FRAME_MB if a large thread matters
- * more than the memory that reading it costs.
+ * Some responses are unavoidably enormous. `thread/resume` is the only way to
+ * subscribe to a thread and it returns the entire conversation every time --
+ * measured at 101MB for a 202MB rollout, whether the thread was cold or
+ * already loaded -- so a limit that rejects it makes the conversation
+ * impossible to open. What keeps that affordable is not receiving less but
+ * refusing to build objects out of it; see MAX_PARSED_RESPONSE_BYTES.
+ * `ws` would otherwise apply its own 100MB and tear the connection down with
+ * an unattributed RangeError. Override with CODEX_PROMPTOR_CODEX_MAX_FRAME_MB.
  */
-const MAX_RPC_FRAME_MB = boundedFrameLimit(process.env.CODEX_PROMPTOR_CODEX_MAX_FRAME_MB);
+const MAX_RPC_FRAME_MB = boundedMegabytes(process.env.CODEX_PROMPTOR_CODEX_MAX_FRAME_MB, 512);
+
+/**
+ * Above this, a response is acknowledged without being parsed.
+ *
+ * Every caller of `thread/resume` wants the subscription, not the payload, and
+ * the one field ever read from it -- `sessionId` -- is in the 2.7KB summary as
+ * well. Turning 101MB of JSON into objects costs several times its size in
+ * memory to produce a value nobody looks at.
+ */
+const MAX_PARSED_RESPONSE_BYTES = boundedMegabytes(process.env.CODEX_PROMPTOR_CODEX_MAX_PARSE_MB, 4) * 1024 * 1024;
+
+/** How far into a frame the JSON-RPC id is looked for before giving up and parsing normally. */
+const RESPONSE_ID_PREFIX_BYTES = 256;
+
+/**
+ * `thread/resume` loads and replays the whole rollout: 6-10s for a 202MB thread
+ * on an idle server, and it runs while the TUI is loading the same thread. The
+ * ordinary 30s request timeout turns that into a failed open.
+ */
+const RESUME_TIMEOUT_MS = 180_000;
+
 /** The `ws` error code for a frame that declares more bytes than `maxPayload` allows. */
 const WS_OVERSIZED_FRAME = "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH";
 
-function boundedFrameLimit(raw: string | undefined): number {
+/** Stands in for a response too large to be worth parsing. */
+export type OversizedResponse = { oversizedBytes: number };
+
+export function isOversizedResponse(value: unknown): value is OversizedResponse {
+  return typeof (value as OversizedResponse | null)?.oversizedBytes === "number";
+}
+
+function boundedMegabytes(raw: string | undefined, fallback: number): number {
   const megabytes = Number(raw);
-  if (!Number.isFinite(megabytes)) return 100;
-  return Math.min(512, Math.max(1, Math.trunc(megabytes)));
+  if (!Number.isFinite(megabytes)) return fallback;
+  return Math.min(1_024, Math.max(1, Math.trunc(megabytes)));
+}
+
+/**
+ * The JSON-RPC id from the head of a frame, without parsing the rest of it.
+ * A guess that does not match a pending request is discarded by the caller, so
+ * the worst case is the parse that would have happened anyway.
+ */
+function peekResponseId(raw: Buffer): number | string | null {
+  const head = raw.subarray(0, RESPONSE_ID_PREFIX_BYTES).toString("latin1");
+  const match = /"id"\s*:\s*(\d+|"([^"\\]*)")/.exec(head);
+  if (!match) return null;
+  return match[2] !== undefined ? match[2] : Number(match[1]);
 }
 
 export class CodexRpcClient extends EventEmitter {
@@ -128,7 +167,7 @@ export class CodexRpcClient extends EventEmitter {
           fail(error instanceof Error ? error : new Error(String(error)));
         }
       });
-      socket.on("message", (data) => this.handleMessage(data.toString()));
+      socket.on("message", (data) => this.handleMessage(toBuffer(data)));
       socket.once("close", () => {
         if (!settled) fail(new Error("CODEX_APP_SERVER_DISCONNECTED"));
         if (this.socket !== socket) return;
@@ -144,9 +183,10 @@ export class CodexRpcClient extends EventEmitter {
     try { await this.connectPromise; } finally { this.connectPromise = null; }
   }
 
-  private handleMessage(raw: string): void {
+  private handleMessage(raw: Buffer): void {
+    if (raw.length > MAX_PARSED_RESPONSE_BYTES && this.settleWithoutParsing(raw)) return;
     let message: RpcMessage;
-    try { message = JSON.parse(raw) as RpcMessage; } catch { return; }
+    try { message = JSON.parse(raw.toString()) as RpcMessage; } catch { return; }
     if (message.id !== undefined && (Object.prototype.hasOwnProperty.call(message, "result") || Object.prototype.hasOwnProperty.call(message, "error"))) {
       const request = this.pending.get(message.id);
       if (!request) return;
@@ -161,6 +201,22 @@ export class CodexRpcClient extends EventEmitter {
       return;
     }
     if (message.method) this.handleNotification(message.method, message.params ?? {});
+  }
+
+  /**
+   * Complete a pending request from an oversized frame using only its head.
+   * Returns false when the id cannot be read or does not belong to a request
+   * still waiting, in which case the frame is parsed as usual rather than lost.
+   */
+  private settleWithoutParsing(raw: Buffer): boolean {
+    const id = peekResponseId(raw);
+    if (id === null) return false;
+    const request = this.pending.get(id);
+    if (!request) return false;
+    this.pending.delete(id);
+    clearTimeout(request.timer);
+    request.resolve({ oversizedBytes: raw.length } satisfies OversizedResponse);
+    return true;
   }
 
   private handleNotification(method: string, params: any): void {
@@ -237,7 +293,12 @@ export class CodexRpcClient extends EventEmitter {
     if (this.oversizedThreads.has(threadId)) throw new Error(`CODEX_THREAD_TOO_LARGE:${threadId}`);
     const startedAt = Date.now();
     try {
-      return await this.request("thread/read", { threadId, includeTurns: true }, timeoutMs);
+      const result = await this.request("thread/read", { threadId, includeTurns: true }, timeoutMs);
+      if (isOversizedResponse(result)) {
+        this.oversizedThreads.add(threadId);
+        throw new Error(`CODEX_THREAD_TOO_LARGE:${threadId}`);
+      }
+      return result;
     } catch (error) {
       // The frame limit closes the socket instead of failing one request, so
       // this read comes back as a disconnect. Recognising it here is what
@@ -254,8 +315,13 @@ export class CodexRpcClient extends EventEmitter {
     return this.request("thread/read", { threadId, includeTurns: false }, timeoutMs);
   }
 
-  async resumeThread(threadId: string, cwd: string): Promise<any> {
-    return this.request("thread/resume", { threadId, cwd });
+  /**
+   * Join a thread so this connection receives its notifications. There is no
+   * lighter call for it -- the protocol has no `thread/subscribe` -- and the
+   * response carries the whole conversation, which no caller reads.
+   */
+  async resumeThread(threadId: string, cwd: string): Promise<void> {
+    await this.request("thread/resume", { threadId, cwd }, RESUME_TIMEOUT_MS);
   }
 
   async loadedThreadIds(timeoutMs = 2_000): Promise<string[]> {
@@ -810,4 +876,12 @@ async function waitForPortClosed(port: number, timeoutMs: number): Promise<void>
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`APP_SERVER_PORT_STILL_OPEN:${port}`);
+}
+
+
+function toBuffer(data: unknown): Buffer {
+  if (Buffer.isBuffer(data)) return data;
+  if (Array.isArray(data)) return Buffer.concat(data as Buffer[]);
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  return Buffer.from(String(data));
 }

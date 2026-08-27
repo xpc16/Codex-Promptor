@@ -1392,7 +1392,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         report = { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
       } else {
         await waitForThreadLoaded(rpc, threadId, 30_000, 200, () => pty.startupError(tabId));
-        thread = historyThreadFromResponse(await rpc.resumeThread(threadId, cwd));
+        // The resume response is the whole conversation and the only field ever
+        // taken from it, `sessionId`, is already on the summary read above.
+        await rpc.resumeThread(threadId, cwd);
         report = await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, threadId));
       }
       await storage.updateTab(tabId, (current) => ({
