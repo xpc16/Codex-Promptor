@@ -5,6 +5,7 @@ import {
   latestQueueCompletion,
   promptIsExecuting,
   runnerIsWorking,
+  settledDesiredState,
   tabVisualState,
   type TabActivitySummary,
 } from "./tab-activity.js";
@@ -57,5 +58,16 @@ describe("what counts as the agent working", () => {
     expect(runnerIsWorking("waiting_for_thread")).toBe(false);
     expect(runnerIsWorking("starting")).toBe(false);
     expect(runnerIsWorking("error")).toBe(false);
+  });
+});
+
+describe("queue intent across a restart", () => {
+  it("keeps both idle intents, because neither has anything in flight", () => {
+    expect(settledDesiredState("paused")).toBe("paused");
+    expect(settledDesiredState("armed")).toBe("armed");
+  });
+
+  it("settles a rolling queue where a finished run settles, rather than resuming it", () => {
+    expect(settledDesiredState("running")).toBe("armed");
   });
 });

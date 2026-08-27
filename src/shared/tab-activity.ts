@@ -25,6 +25,21 @@ export function runnerIsWorking(state: RuntimeFile["runner"]["state"]): boolean 
   return WORKING_RUNNER_STATES.has(state);
 }
 
+/**
+ * Where a runner's intent lands when the loop it belonged to no longer exists
+ * -- across a service restart, or after a session was torn down and reopened.
+ *
+ * "paused" and "armed" are both idle. Nothing is in flight in either, and the
+ * only difference between them is whether adding a prompt starts the queue, so
+ * neither is unsafe to carry across and collapsing them threw away a choice
+ * the user had made. "running" cannot survive: the loop, the turn and the
+ * terminal behind it are all gone. It settles where a run that finishes on its
+ * own settles -- armed, ready for the next prompt but not resuming by itself.
+ */
+export function settledDesiredState(desired: RuntimeFile["runner"]["desiredState"]): "paused" | "armed" {
+  return desired === "paused" ? "paused" : "armed";
+}
+
 export function promptIsExecuting(activity: TabActivitySummary | undefined): boolean {
   if (!activity?.activePromptId) return false;
   return runnerIsWorking(activity.runnerState);

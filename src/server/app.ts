@@ -6,7 +6,7 @@ import fastifyCompress from "@fastify/compress";
 import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
 import { AgentProviderSchema, type AgentProvider, type AnswerRecord, type Group, type IndexFile, IndexFileSchema, isoNow, newPrompt, PromptFileSchema, RuntimeFileSchema, type RuntimeFile, type TabBundle, type TabMeta } from "../shared/schemas.js";
-import type { TabActivitySummary } from "../shared/tab-activity.js";
+import { settledDesiredState, type TabActivitySummary } from "../shared/tab-activity.js";
 import type { PromptDelta } from "../shared/tab-delta.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
 import {
@@ -1786,7 +1786,9 @@ async function clearSessionNotReadyError(storage: StorageService, tabId: string)
       revision: bundle.runtime.revision + 1,
       runner: {
         ...bundle.runtime.runner,
-        desiredState: "paused",
+        // Clearing the error is the job here; the queue's intent is not the
+        // error's to reset, and an armed conversation stays armed.
+        desiredState: settledDesiredState(bundle.runtime.runner.desiredState),
         state: "paused",
         activePromptId: null,
         activeTurnId: null,
@@ -1841,7 +1843,10 @@ export async function recoverTerminalRuntime(storage: StorageService): Promise<n
       }
       const terminalStale = bundle.runtime.terminal.state === "starting" || bundle.runtime.terminal.state === "running";
       const sessionStale = bundle.tab.session.state === "ready" || bundle.tab.session.state === "connecting";
-      const runnerStale = bundle.runtime.runner.desiredState !== "paused"
+      // An idle intent -- stopped or armed -- is not stale. It is a choice the
+      // user made, there is nothing in flight behind it, and it belongs to the
+      // conversation rather than to the process that happened to be running.
+      const runnerStale = bundle.runtime.runner.desiredState === "running"
         || bundle.runtime.runner.state !== "paused"
         || bundle.runtime.runner.activePromptId !== null
         || bundle.runtime.runner.activeTurnId !== null;
@@ -1852,7 +1857,7 @@ export async function recoverTerminalRuntime(storage: StorageService): Promise<n
         const runtime = RuntimeFileSchema.parse({
           ...bundle.runtime,
           revision: bundle.runtime.revision + 1,
-          runner: { ...bundle.runtime.runner, desiredState: "paused", state: "paused", activePromptId: null, activeTurnId: null, lastTransitionAt: recoveredAt },
+          runner: { ...bundle.runtime.runner, desiredState: settledDesiredState(bundle.runtime.runner.desiredState), state: "paused", activePromptId: null, activeTurnId: null, lastTransitionAt: recoveredAt },
           terminal: {
             ...bundle.runtime.terminal,
             state: appServerCleanupError ? "error" : "stopped",

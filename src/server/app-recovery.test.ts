@@ -76,7 +76,9 @@ describe("runtime recovery", () => {
       const recovered = await storage.readTab(tab.id);
       expect(recovered.tab.session.state).toBe("closed");
       expect(recovered.tab.session.reopenOnLaunch).toBe(true);
-      expect(recovered.runtime.runner).toMatchObject({ desiredState: "paused", state: "paused", activeTurnId: null, activePromptId: null });
+      // A rolling queue cannot resume -- the loop and the turn are gone -- but
+      // it settles where a run that ends on its own settles, not stopped.
+      expect(recovered.runtime.runner).toMatchObject({ desiredState: "armed", state: "paused", activeTurnId: null, activePromptId: null });
       expect(recovered.prompts.prompts[0]).toMatchObject({ status: "interrupted", error: { code: "SERVICE_RESTARTED" } });
       expect(recovered.prompts.prompts[0].completedAt).not.toBeNull();
       expect(recovered.prompts.prompts[0].attempts[0]).toMatchObject({ status: "interrupted", error: { code: "SERVICE_RESTARTED" } });
@@ -93,6 +95,51 @@ describe("runtime recovery", () => {
       });
       expect(recovered.answers.answers[0].completedAt).not.toBeNull();
       expect(await recoverTerminalRuntime(storage)).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("carries an idle queue's own setting across the restart", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-intent-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      // "armed" and "stopped" are both idle and both deliberate: nothing is in
+      // flight behind either, so a restart has no business collapsing them.
+      for (const desiredState of ["armed", "paused"] as const) {
+        const tab = await storage.createTab(`意图-${desiredState}`);
+        const bundle = await storage.readTab(tab.id);
+        bundle.runtime.runner.desiredState = desiredState;
+        bundle.runtime.terminal.state = "running";
+        await storage.writeRuntime(tab.id, bundle.runtime);
+
+        expect(await recoverTerminalRuntime(storage)).toBe(1);
+        const recovered = await storage.readTab(tab.id);
+        expect(recovered.runtime.runner.desiredState).toBe(desiredState);
+        expect(recovered.runtime.terminal.state).toBe("stopped");
+        await storage.deleteTab(tab.id);
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves an already-idle armed queue alone instead of rewriting it every launch", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-idle-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      const tab = await storage.createTab("空闲队列");
+      const bundle = await storage.readTab(tab.id);
+      bundle.runtime.runner.desiredState = "armed";
+      await storage.writeRuntime(tab.id, bundle.runtime);
+      const revision = (await storage.readTab(tab.id)).runtime.revision;
+
+      expect(await recoverTerminalRuntime(storage)).toBe(0);
+      const after = await storage.readTab(tab.id);
+      expect(after.runtime.revision).toBe(revision);
+      expect(after.runtime.runner.desiredState).toBe("armed");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -139,7 +186,9 @@ describe("runtime recovery", () => {
 
       expect(await recoverTerminalRuntime(storage)).toBe(1);
       expect((await storage.readTab(tab.id)).runtime.runner).toMatchObject({
-        desiredState: "paused",
+        // The stale run is cleared; the queue's own setting is not the stale
+        // part and survives, as it does everywhere else.
+        desiredState: "armed",
         state: "paused",
         activePromptId: null,
         activeTurnId: null,
