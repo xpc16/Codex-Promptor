@@ -26,6 +26,14 @@ import {
 } from "../shared/schemas.js";
 import { latestQueueCompletion, type TabActivitySummary } from "../shared/tab-activity.js";
 import { buildRecordDelta, type AnswerDelta, type PromptDelta } from "../shared/tab-delta.js";
+import {
+  EARLIER_ANSWER_PAGE,
+  EARLIER_PROMPT_PAGE,
+  INITIAL_ANSWER_WINDOW,
+  INITIAL_PROMPT_WINDOW,
+  MAX_WINDOW_RECORDS,
+  tailWindowStart,
+} from "../shared/tab-window.js";
 
 export class KeyedMutex {
   private readonly locks = new Map<string, Promise<void>>();
@@ -218,21 +226,23 @@ export class StorageService {
     return { tab, prompts, answers, runtime };
   }
 
-  async readTabWindow(tabId: string, promptLimit = 200, answerLimit = 80): Promise<TabBundle> {
+  async readTabWindow(tabId: string, promptLimit = INITIAL_PROMPT_WINDOW, answerLimit = INITIAL_ANSWER_WINDOW): Promise<TabBundle> {
     const bundle = await this.readTab(tabId);
     const { prompts, answers } = recordsForCurrentThread(bundle);
-    const promptTail = Math.max(0, prompts.length - boundedPageLimit(promptLimit, 200));
-    const firstRunningPrompt = prompts.findIndex((prompt) => prompt.status === "running");
-    // Keep the active turn visible, but never let an unusually large pending
-    // queue turn the initial REST response back into an unbounded history dump.
-    const promptStart = firstRunningPrompt >= 0
-      ? Math.max(0, prompts.length - 500, Math.min(promptTail, firstRunningPrompt))
-      : promptTail;
-    const answerTail = Math.max(0, answers.length - boundedPageLimit(answerLimit, 80));
-    const firstRunning = answers.findIndex((answer) => answer.status === "running");
-    const answerStart = firstRunning >= 0
-      ? Math.max(0, answers.length - 500, Math.min(answerTail, firstRunning))
-      : answerTail;
+    // The queue's actionable rows -- the turn running now and everything still
+    // waiting to run -- always ship whole. Reordering the queue sends the full
+    // pending list back, so a window that clipped it would make drag-and-drop
+    // fail. Only settled history is paged.
+    const promptStart = tailWindowStart(
+      prompts.length,
+      boundedPageLimit(promptLimit, INITIAL_PROMPT_WINDOW),
+      [prompts.findIndex((prompt) => prompt.status === "running"), prompts.findIndex((prompt) => prompt.status === "pending")],
+    );
+    const answerStart = tailWindowStart(
+      answers.length,
+      boundedPageLimit(answerLimit, INITIAL_ANSWER_WINDOW),
+      [answers.findIndex((answer) => answer.status === "running")],
+    );
     return {
       ...bundle,
       prompts: { ...bundle.prompts, prompts: prompts.slice(promptStart) },
@@ -244,16 +254,16 @@ export class StorageService {
     };
   }
 
-  async readPromptPage(tabId: string, before: number, limit = 100): Promise<TabRecordPage<PromptRecord>> {
+  async readPromptPage(tabId: string, before: number, limit = EARLIER_PROMPT_PAGE): Promise<TabRecordPage<PromptRecord>> {
     const bundle = await this.readTab(tabId);
     const records = recordsForCurrentThread(bundle).prompts;
-    return recordPage(records, before, limit, bundle.prompts.revision, bundle.prompts.updatedAt);
+    return recordPage(records, before, limit, EARLIER_PROMPT_PAGE, bundle.prompts.revision, bundle.prompts.updatedAt);
   }
 
-  async readAnswerPage(tabId: string, before: number, limit = 40): Promise<TabRecordPage<AnswerRecord>> {
+  async readAnswerPage(tabId: string, before: number, limit = EARLIER_ANSWER_PAGE): Promise<TabRecordPage<AnswerRecord>> {
     const bundle = await this.readTab(tabId);
     const records = recordsForCurrentThread(bundle).answers;
-    return recordPage(records, before, limit, bundle.answers.revision, bundle.answers.updatedAt);
+    return recordPage(records, before, limit, EARLIER_ANSWER_PAGE, bundle.answers.revision, bundle.answers.updatedAt);
   }
 
   async readTabActivity(tabId: string): Promise<TabActivitySummary> {
@@ -392,20 +402,35 @@ function currentPromptRecords(tab: TabMeta, records: readonly PromptRecord[], an
   if (tab.session.provider === "shell") return [];
   const threadId = tab.session.threadId;
   const answerPromptIds = new Set(answers.map((answer) => answer.promptId));
-  return records.filter((prompt) => Boolean(threadId) && prompt.threadId === threadId
-    || (!prompt.threadId && answerPromptIds.has(prompt.id))
-    || (prompt.status === "pending" && !prompt.threadId));
+  return records
+    .filter((prompt) => Boolean(threadId) && prompt.threadId === threadId
+      || (!prompt.threadId && answerPromptIds.has(prompt.id))
+      || (prompt.status === "pending" && !prompt.threadId))
+    .map(withoutTransportBallast);
 }
 
-function recordPage<T>(records: T[], before: number, limit: number, revision: number, updatedAt: string): TabRecordPage<T> {
+/**
+ * `inputSnapshot` is reconciliation provenance -- the raw turn input the agent
+ * reported -- and it is the largest field on a prompt record, averaging twice
+ * the prompt text itself. No screen renders it, so it stays on disk and out of
+ * every read and broadcast. Both sides of a delta comparison come through
+ * here, so dropping it cannot manufacture a spurious change.
+ */
+function withoutTransportBallast(prompt: PromptRecord): PromptRecord {
+  if (prompt.inputSnapshot === undefined) return prompt;
+  const { inputSnapshot: _dropped, ...rest } = prompt;
+  return rest as PromptRecord;
+}
+
+function recordPage<T>(records: T[], before: number, limit: number, fallbackLimit: number, revision: number, updatedAt: string): TabRecordPage<T> {
   const end = Math.max(0, Math.min(records.length, Number.isFinite(before) ? Math.trunc(before) : records.length));
-  const start = Math.max(0, end - boundedPageLimit(limit, 100));
+  const start = Math.max(0, end - boundedPageLimit(limit, fallbackLimit));
   return { records: records.slice(start, end), start, total: records.length, revision, updatedAt };
 }
 
 function boundedPageLimit(value: number, fallback: number): number {
   const number = Number(value);
-  return Number.isFinite(number) ? Math.max(1, Math.min(500, Math.trunc(number))) : fallback;
+  return Number.isFinite(number) ? Math.max(1, Math.min(MAX_WINDOW_RECORDS, Math.trunc(number))) : fallback;
 }
 
 function notify<T>(listeners: ReadonlySet<T>, call: (listener: T) => void): void {

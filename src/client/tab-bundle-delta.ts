@@ -3,8 +3,35 @@ import { applyRecordDelta, type AnswerDelta, type PromptDelta } from "../shared/
 
 export type TabMessageResult = { bundle: TabBundle; changed: boolean; needsSnapshot: boolean };
 
+type WindowSpan = { start: number; total: number };
+
+/**
+ * Older records the reader has already scrolled open, kept across a snapshot.
+ *
+ * A snapshot carries the opening window only. Letting it replace the list
+ * outright would throw away history this browser already paid to download and
+ * send the reader back through the same scroll-back requests. The two lists
+ * are spliced only when they demonstrably belong to the same history: the
+ * snapshot's first record must appear in the current list, and the records
+ * ahead of it must be exactly the gap between the two window starts. Anything
+ * else -- a resumed thread, a cleared conversation -- fails that check and the
+ * snapshot wins whole, which is what a changed thread needs.
+ */
+export function retainEarlierRecords<T extends { id: string }>(
+  current: readonly T[],
+  currentSpan: WindowSpan | undefined,
+  next: readonly T[],
+  nextSpan: WindowSpan | undefined,
+): T[] | null {
+  if (!currentSpan || !nextSpan || next.length === 0) return null;
+  if (currentSpan.start >= nextSpan.start) return null;
+  const overlap = current.findIndex((record) => record.id === next[0].id);
+  if (overlap < 0 || overlap !== nextSpan.start - currentSpan.start) return null;
+  return [...current.slice(0, overlap), ...next];
+}
+
 export function applyTabMessage(bundle: TabBundle, message: any): TabMessageResult {
-  if (message?.type === "snapshot" && message.data) return { bundle: message.data as TabBundle, changed: true, needsSnapshot: false };
+  if (message?.type === "snapshot" && message.data) return { bundle: mergeSnapshot(bundle, message.data as TabBundle), changed: true, needsSnapshot: false };
   if (message?.type === "tab.changed" && message.tab) {
     return { bundle: { ...bundle, tab: message.tab as TabMeta }, changed: true, needsSnapshot: false };
   }
@@ -63,6 +90,24 @@ export function applyTabMessage(bundle: TabBundle, message: any): TabMessageResu
     return { bundle: { ...bundle, answers: { ...bundle.answers, answers } }, changed: true, needsSnapshot: false };
   }
   return unchanged(bundle);
+}
+
+function mergeSnapshot(current: TabBundle, next: TabBundle): TabBundle {
+  if (current.tab.id !== next.tab.id) return next;
+  const prompts = retainEarlierRecords(current.prompts.prompts, current.window?.prompts, next.prompts.prompts, next.window?.prompts);
+  const answers = retainEarlierRecords(current.answers.answers, current.window?.answers, next.answers.answers, next.window?.answers);
+  if (!prompts && !answers) return next;
+  return {
+    ...next,
+    ...(prompts ? { prompts: { ...next.prompts, prompts } } : {}),
+    ...(answers ? { answers: { ...next.answers, answers } } : {}),
+    ...(next.window ? {
+      window: {
+        prompts: prompts ? { ...next.window.prompts, start: current.window!.prompts.start } : next.window.prompts,
+        answers: answers ? { ...next.window.answers, start: current.window!.answers.start } : next.window.answers,
+      },
+    } : {}),
+  };
 }
 
 function unchanged(bundle: TabBundle): TabMessageResult { return { bundle, changed: false, needsSnapshot: false }; }

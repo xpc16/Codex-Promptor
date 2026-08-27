@@ -15,6 +15,7 @@ import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, Runti
 import type { TerminalScreenFrame, TerminalTransportMode, TerminalTransportPreference } from "../shared/terminal-protocol.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
 import { completionNoticeExpiresAt, latestQueueCompletion, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
+import { EARLIER_ANSWER_PAGE, EARLIER_PROMPT_PAGE, INITIAL_ANSWER_WINDOW, INITIAL_PROMPT_WINDOW } from "../shared/tab-window.js";
 import ReactMarkdown from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
@@ -26,6 +27,7 @@ import { loadTabWithRetry, retainRecentTabIds } from "./tab-load.js";
 import { MOBILE_PANES, nextMobilePane, swipeDirection, type MobilePane } from "./mobile-pane.js";
 import { dialogSurvivesIndex, nextSelectedTabId, shouldAdoptIndexRevision } from "./index-sync.js";
 import { applyTabMessage } from "./tab-bundle-delta.js";
+import { forgetCachedTab, readCachedTab, rememberTab, retainCachedTabs, windowLimits } from "./tab-cache.js";
 import { CONSOLE_WIDTH, readPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
 import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
 import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenState } from "./terminal-projection.js";
@@ -227,6 +229,10 @@ export function App() {
   const tabIdsKey = useMemo(() => (index?.tabs ?? []).map((tab) => tab.id).sort().join(","), [index]);
   useEffect(() => {
     const validIds = new Set(tabIdsKey ? tabIdsKey.split(",") : []);
+    // Cached conversation records outlive the mounted views, so a deleted
+    // conversation has to be dropped here or it would keep its bytes for the
+    // life of the page.
+    retainCachedTabs(validIds);
     setRetainedTabIds((current) => {
       const next = retainRecentTabIds(current, selectedId, validIds);
       return next.length === current.length && next.every((tabId, index) => tabId === current[index]) ? current : next;
@@ -396,7 +402,7 @@ export function App() {
   const confirmDelete = async () => {
     if (!dialog || (dialog.kind !== "delete-tab" && dialog.kind !== "delete-group")) return;
     try {
-      if (dialog.kind === "delete-tab") await api(`/api/tabs/${dialog.tabId}`, { method: "DELETE" });
+      if (dialog.kind === "delete-tab") { await api(`/api/tabs/${dialog.tabId}`, { method: "DELETE" }); forgetCachedTab(dialog.tabId); }
       else await api(`/api/groups/${dialog.groupId}`, { method: "DELETE" });
       setDialog(null);
       await refresh();
@@ -649,6 +655,10 @@ function Welcome({ onCreate }: { onCreate: () => void }) {
 
 function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: number, hasEarlier = false, onLoadEarlier?: () => Promise<number>) {
   const [visibleCount, setVisibleCount] = useState(pageSize);
+  // Scrolling to the top is the usual way back through history, but an opening
+  // window of a few short records may not overflow its pane at all, leaving
+  // nothing to scroll. The reveal is therefore also exposed as a control.
+  const [revealing, setRevealing] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const prependAnchor = useRef<{ height: number; top: number } | null>(null);
   const loadingEarlier = useRef(false);
@@ -665,6 +675,7 @@ function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: num
     }
     if (!hasEarlier || !onLoadEarlier) return;
     loadingEarlier.current = true;
+    setRevealing(true);
     prependAnchor.current = { height: element.scrollHeight, top: element.scrollTop };
     try {
       const added = await onLoadEarlier();
@@ -674,6 +685,7 @@ function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: num
       prependAnchor.current = null;
     } finally {
       loadingEarlier.current = false;
+      setRevealing(false);
     }
   }, [hasEarlier, items.length, onLoadEarlier, pageSize, visibleCount]);
 
@@ -697,13 +709,22 @@ function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: num
     setVisibleCount((current) => Math.max(Math.min(current, items.length), Math.min(pageSize, items.length)));
   }, [items.length, pageSize]);
 
-  return { onScroll, scrollRef, startIndex, visibleItems };
+  return { onScroll, scrollRef, startIndex, visibleItems, revealEarlier, revealing, canRevealEarlier: hasEarlier || visibleCount < items.length };
+}
+
+function LoadEarlier({ shown, busy, label, busyLabel, onReveal }: { shown: boolean; busy: boolean; label: string; busyLabel: string; onReveal: () => void }) {
+  if (!shown) return null;
+  return <button type="button" className="load-earlier" disabled={busy} onClick={onReveal}>{busy ? busyLabel : label}</button>;
 }
 
 function TabView({ tab, active, refreshNonce, theme, terminalPreference, projectionSupported, onTerminalPreferenceChange, onBundleChanged, onError }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; terminalPreference: TerminalTransportPreference; projectionSupported: boolean; onTerminalPreferenceChange: (value: TerminalTransportPreference) => void; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
-  const [bundle, setBundle] = useState<TabBundle | null>(null);
+  // Re-selecting a conversation paints from what this page already downloaded
+  // instead of showing a spinner and fetching the same records again; the load
+  // below still runs, but as a revalidation the server answers with a 304.
+  const cached = readCachedTab(tab.id);
+  const [bundle, setBundle] = useState<TabBundle | null>(cached?.bundle ?? null);
   const [loadError, setLoadError] = useState<unknown | null>(null);
   // The persisted tab layout is only the starting point for a browser that has
   // never been resized here; after that this screen keeps its own split.
@@ -713,19 +734,28 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
   const workspace = useRef<HTMLDivElement>(null);
   const [reopening, setReopening] = useState(false);
   const loadSequence = useRef(0);
-  const initialBundleApplied = useRef(false);
-  const bundleRef = useRef<TabBundle | null>(null);
+  const initialBundleApplied = useRef(Boolean(cached));
+  const bundleRef = useRef<TabBundle | null>(cached?.bundle ?? null);
+  // How deep this browser is currently scrolled, so a refresh re-reads the
+  // same span rather than snapping back to the opening records.
+  const windowDepth = useRef({ promptLimit: cached?.promptLimit ?? INITIAL_PROMPT_WINDOW, answerLimit: cached?.answerLimit ?? INITIAL_ANSWER_WINDOW });
+  const keepBundle = useCallback((next: TabBundle) => {
+    bundleRef.current = next;
+    windowDepth.current = windowLimits(next);
+    rememberTab(next);
+  }, []);
   const applyBundle = useCallback((next: TabBundle) => {
     initialBundleApplied.current = true;
-    bundleRef.current = next;
+    keepBundle(next);
     setBundle(next);
     setLoadError(null);
     onBundleChanged(next);
-  }, [onBundleChanged]);
+  }, [keepBundle, onBundleChanged]);
   const load = useCallback(async () => {
     const sequence = ++loadSequence.current;
+    const { promptLimit, answerLimit } = windowDepth.current;
     try {
-      const next = await loadTabWithRetry(() => api<TabBundle>(`/api/tabs/${tab.id}?promptLimit=200&answerLimit=80`));
+      const next = await loadTabWithRetry(() => api<TabBundle>(`/api/tabs/${tab.id}?promptLimit=${promptLimit}&answerLimit=${answerLimit}`));
       if (!initialBundleApplied.current) {
         // A fast response followed by Markdown/xterm setup can otherwise land
         // before the browser paints this newly selected view, producing a
@@ -751,16 +781,16 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
       return;
     }
     if (!result.changed) return;
-    bundleRef.current = result.bundle;
+    keepBundle(result.bundle);
     setBundle(result.bundle);
     onBundleChanged(result.bundle);
-  }, [load, onBundleChanged]);
+  }, [keepBundle, load, onBundleChanged]);
   const loadEarlierPrompts = useCallback(async (): Promise<number> => {
     try {
       const current = bundleRef.current;
       const before = current?.window?.prompts.start ?? 0;
       if (!current || before <= 0) return 0;
-      const page = await api<TabRecordPage<PromptRecord>>(`/api/tabs/${tab.id}/prompts/page?before=${before}&limit=100`);
+      const page = await api<TabRecordPage<PromptRecord>>(`/api/tabs/${tab.id}/prompts/page?before=${before}&limit=${EARLIER_PROMPT_PAGE}`);
       if (bundleRef.current?.prompts.revision !== page.revision) { void load(); return 0; }
       const known = new Set(current.prompts.prompts.map((item) => item.id));
       const earlier = page.records.filter((item) => !known.has(item.id));
@@ -769,7 +799,7 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
         prompts: { ...current.prompts, prompts: [...earlier, ...current.prompts.prompts] },
         window: { ...(current.window ?? { prompts: { start: 0, total: 0, completed: 0 }, answers: { start: 0, total: 0 } }), prompts: { start: page.start, total: page.total, completed: current.window?.prompts.completed ?? current.prompts.prompts.filter((prompt) => prompt.status === "completed").length } },
       };
-      bundleRef.current = next;
+      keepBundle(next);
       setBundle(next);
       onBundleChanged(next);
       return earlier.length;
@@ -777,13 +807,13 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
       onError(error);
       return 0;
     }
-  }, [load, onBundleChanged, onError, tab.id]);
+  }, [keepBundle, load, onBundleChanged, onError, tab.id]);
   const loadEarlierAnswers = useCallback(async (): Promise<number> => {
     try {
       const current = bundleRef.current;
       const before = current?.window?.answers.start ?? 0;
       if (!current || before <= 0) return 0;
-      const page = await api<TabRecordPage<AnswerRecord>>(`/api/tabs/${tab.id}/answers/page?before=${before}&limit=40`);
+      const page = await api<TabRecordPage<AnswerRecord>>(`/api/tabs/${tab.id}/answers/page?before=${before}&limit=${EARLIER_ANSWER_PAGE}`);
       if (bundleRef.current?.answers.revision !== page.revision) { void load(); return 0; }
       const known = new Set(current.answers.answers.map((item) => item.id));
       const earlier = page.records.filter((item) => !known.has(item.id));
@@ -792,7 +822,7 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
         answers: { ...current.answers, answers: [...earlier, ...current.answers.answers] },
         window: { ...(current.window ?? { prompts: { start: 0, total: 0, completed: 0 }, answers: { start: 0, total: 0 } }), answers: { start: page.start, total: page.total } },
       };
-      bundleRef.current = next;
+      keepBundle(next);
       setBundle(next);
       onBundleChanged(next);
       return earlier.length;
@@ -800,7 +830,7 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
       onError(error);
       return 0;
     }
-  }, [load, onBundleChanged, onError, tab.id]);
+  }, [keepBundle, load, onBundleChanged, onError, tab.id]);
   useEffect(() => { void load(); }, [load, refreshNonce]);
   useEffect(() => {
     const move = (event: MouseEvent) => { if (!active || !dragging.current) return; const rect = workspace.current?.getBoundingClientRect(); if (!rect) return; setLeftWidth(Math.max(24, Math.min(76, ((event.clientX - rect.left) / rect.width) * 100))); };
@@ -894,8 +924,8 @@ function AnswerHistory({ answers, total, hasEarlier, onLoadEarlier, emptyKey }: 
   const i18n = useI18n();
   const { t } = i18n;
   const contentKey = answers.map((answer) => `${answer.id}:${answer.status}:${answer.completedAt ?? ""}:${answer.finalAnswer.length}`).join("|");
-  const { onScroll, scrollRef, visibleItems } = useTailWindow(answers, contentKey, 12, hasEarlier, onLoadEarlier);
-  return <div className="answers"><div className="answers-heading"><span>{t("answers.title")}</span><em>{total}</em></div><div className="answer-scroll" ref={scrollRef} onScroll={onScroll}>{answers.length === 0 ? <div className="empty-answers">{t(emptyKey)}</div> : <div className="answer-list">{visibleItems.map((answer) => {
+  const { onScroll, scrollRef, visibleItems, revealEarlier, revealing, canRevealEarlier } = useTailWindow(answers, contentKey, 12, hasEarlier, onLoadEarlier);
+  return <div className="answers"><div className="answers-heading"><span>{t("answers.title")}</span><em>{total}</em></div><div className="answer-scroll" ref={scrollRef} onScroll={onScroll}>{answers.length === 0 ? <div className="empty-answers">{t(emptyKey)}</div> : <div className="answer-list"><LoadEarlier shown={canRevealEarlier} busy={revealing} label={t("answers.loadEarlier")} busyLabel={t("answers.loadingEarlier")} onReveal={() => void revealEarlier()} />{visibleItems.map((answer) => {
     const statusLabel = t(answer.status === "running" ? "answers.running" : answer.status === "completed" ? "answers.completed" : answer.status === "interrupted" ? "answers.interrupted" : "answers.failed");
     // A turn can end without a clean final answer (interrupted mid-stream, or
     // Claude's transcript never reaching end_turn) yet still carry the last
@@ -939,7 +969,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     || (!prompt.threadId && currentAnswerPromptIds.has(prompt.id))
     || (prompt.status === "pending" && !prompt.threadId));
   const promptContentKey = prompts.map((prompt) => prompt.id).join("|");
-  const { onScroll: onPromptScroll, scrollRef: promptWindow, startIndex: promptStartIndex, visibleItems: visiblePrompts } = useTailWindow(prompts, promptContentKey, 24, hasEarlier, onLoadEarlier);
+  const { onScroll: onPromptScroll, scrollRef: promptWindow, startIndex: promptStartIndex, visibleItems: visiblePrompts, revealEarlier: revealEarlierPrompts, revealing: revealingPrompts, canRevealEarlier: canRevealEarlierPrompts } = useTailWindow(prompts, promptContentKey, 24, hasEarlier, onLoadEarlier);
   const runtime = bundle.runtime;
   // Two different facts, and they come apart: the agent can be idle between
   // prompts while the queue is still set to keep feeding it, and the agent can
@@ -990,7 +1020,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   const completedCount = bundle.window?.prompts.completed ?? prompts.filter((item) => item.status === "completed").length;
   return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "running" ? "running" : runtime.runner.state === "error" ? "error" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "start"} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
-    <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t("queue.empty")}</div>}{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; const pendingIndex = pendingIds.indexOf(prompt.id); return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} canMoveUp={pendingIndex > 0} canMoveDown={pendingIndex >= 0 && pendingIndex < pendingIds.length - 1} onMove={(direction) => { const target = pendingIds[pendingIndex + direction]; if (target) void reorder(prompt.id, target); }} onChanged={onChanged} onError={onError} />; })}</div>
+    <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t("queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; const pendingIndex = pendingIds.indexOf(prompt.id); return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} canMoveUp={pendingIndex > 0} canMoveDown={pendingIndex >= 0 && pendingIndex < pendingIds.length - 1} onMove={(direction) => { const target = pendingIds[pendingIndex + direction]; if (target) void reorder(prompt.id, target); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}
     <div className="add-prompt"><textarea disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
   </div>;

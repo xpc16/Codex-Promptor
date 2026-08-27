@@ -7,6 +7,13 @@ import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
 import { AgentProviderSchema, type AgentProvider, type AnswerRecord, type Group, type IndexFile, IndexFileSchema, isoNow, newPrompt, PromptFileSchema, RuntimeFileSchema, type RuntimeFile, type TabBundle, type TabMeta } from "../shared/schemas.js";
 import type { TabActivitySummary } from "../shared/tab-activity.js";
+import {
+  EARLIER_ANSWER_PAGE,
+  EARLIER_PROMPT_PAGE,
+  INITIAL_ANSWER_WINDOW,
+  INITIAL_PROMPT_WINDOW,
+  MAX_WINDOW_RECORDS,
+} from "../shared/tab-window.js";
 import { AppServerPool, type AppServerManager, terminateStaleAppServer, waitForThreadLoaded } from "./codex.js";
 import { ClaudeCodePool, type ClaudeCodeManager, probeClaudeVersion } from "./claude.js";
 import { syncClaudeHistory } from "./claude-history.js";
@@ -16,6 +23,7 @@ import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-pi
 import { withCodexRolloutTurns } from "./codex-history.js";
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
+import { entityTag, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
 import { CLAUDE_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, type TerminalCursor } from "./pty.js";
 import { RunnerManager } from "./queue.js";
 import { StorageService } from "./storage.js";
@@ -130,7 +138,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const cursorVersion = probeCursorVersion();
 
   await storage.ensure();
-  const readClientTab = (tabId: string): Promise<TabBundle> => storage.readTabWindow(tabId, 200, 80);
+  const readClientTab = (tabId: string): Promise<TabBundle> => storage.readTabWindow(tabId, INITIAL_PROMPT_WINDOW, INITIAL_ANSWER_WINDOW);
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
   await recoverTerminalRuntime(storage);
 
@@ -992,9 +1000,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   app.get("/api/tabs/:tabId", async (request, reply) => {
     const tabId = String((request.params as any).tabId);
     const query = (request.query ?? {}) as any;
-    const promptLimit = boundedInteger(query.promptLimit, 1, 500, 200);
-    const answerLimit = boundedInteger(query.answerLimit, 1, 500, 80);
-    try { return reply.send({ data: await storage.readTabWindow(tabId, promptLimit, answerLimit) }); }
+    const promptLimit = boundedInteger(query.promptLimit, 1, MAX_WINDOW_RECORDS, INITIAL_PROMPT_WINDOW);
+    const answerLimit = boundedInteger(query.answerLimit, 1, MAX_WINDOW_RECORDS, INITIAL_ANSWER_WINDOW);
+    try { return sendRevalidatable(request, reply, await storage.readTabWindow(tabId, promptLimit, answerLimit)); }
     catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const missing = (error as NodeJS.ErrnoException)?.code === "ENOENT";
@@ -1008,7 +1016,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const tabId = String((request.params as any).tabId);
     const query = (request.query ?? {}) as any;
     try {
-      return reply.send({ data: await storage.readPromptPage(tabId, Number(query.before), boundedInteger(query.limit, 1, 500, 100)) });
+      return sendRevalidatable(request, reply, await storage.readPromptPage(tabId, Number(query.before), boundedInteger(query.limit, 1, MAX_WINDOW_RECORDS, EARLIER_PROMPT_PAGE)));
     } catch (error) {
       return apiError(reply, 404, "TAB_NOT_FOUND", error instanceof Error ? error.message : String(error));
     }
@@ -1018,7 +1026,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const tabId = String((request.params as any).tabId);
     const query = (request.query ?? {}) as any;
     try {
-      return reply.send({ data: await storage.readAnswerPage(tabId, Number(query.before), boundedInteger(query.limit, 1, 500, 40)) });
+      return sendRevalidatable(request, reply, await storage.readAnswerPage(tabId, Number(query.before), boundedInteger(query.limit, 1, MAX_WINDOW_RECORDS, EARLIER_ANSWER_PAGE)));
     } catch (error) {
       return apiError(reply, 404, "TAB_NOT_FOUND", error instanceof Error ? error.message : String(error));
     }
@@ -1691,6 +1699,24 @@ function parseTerminalSubscriptions(value: unknown): Map<string, TerminalStream>
     });
   }
   return result;
+}
+
+/**
+ * Serve a read through the browser's cache instead of the wire.
+ *
+ * The body is stored by the browser and revalidated on the next request; an
+ * unchanged conversation then costs a 304 rather than its answer text again.
+ * The tag has to be computed here, before @fastify/compress rewrites the
+ * payload, so it identifies the content and not one particular encoding.
+ */
+function sendRevalidatable(request: FastifyRequest, reply: FastifyReply, data: unknown): FastifyReply {
+  const body = JSON.stringify({ data });
+  const etag = entityTag(body);
+  reply.header("cache-control", REVALIDATE_CACHE_CONTROL);
+  reply.header("vary", REVALIDATE_VARY);
+  reply.header("etag", etag);
+  if (ifNoneMatchSatisfied(request.headers["if-none-match"], etag)) return reply.code(304).send();
+  return reply.type("application/json; charset=utf-8").send(body);
 }
 
 function boundedInteger(value: unknown, min: number, max: number, fallback: number): number {
