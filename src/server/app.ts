@@ -22,6 +22,7 @@ import { syncClaudeHistory } from "./claude-history.js";
 import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorHookBridge, probeCursorVersion } from "./cursor.js";
 import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
+import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
 import { withCodexRolloutTurns } from "./codex-history.js";
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
@@ -38,7 +39,7 @@ import {
   terminalTransportConfigFromEnv,
   type TerminalTrafficKind,
 } from "./terminal-transport.js";
-import { defaultProjectionSchedulerConfig, TerminalProjectionScheduler } from "./terminal-projection.js";
+import { defaultProjectionSchedulerConfig, fullTerminalScreenFrame, TerminalProjectionScheduler } from "./terminal-projection.js";
 import { syncTerminalThreadSelection } from "./terminal-thread-sync.js";
 import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionHandler } from "./tui-protocol.js";
 import { TuiProxyPool } from "./tui-proxy.js";
@@ -99,6 +100,7 @@ export type PromptorApp = FastifyInstance & {
     runners: RunnerManager;
     ui: UiLifecycle;
     traffic: TerminalTrafficMeter;
+    documents: DocumentService;
     token: string;
     restoreOpenSessions: () => Promise<RestoreOpenSessionsSummary>;
     close: () => Promise<void>;
@@ -140,6 +142,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const cursorVersion = probeCursorVersion();
 
   await storage.ensure();
+  const documents = await DocumentService.create(rootDir, storage);
   const readClientTab = (tabId: string): Promise<TabBundle> => storage.readTabWindow(tabId, INITIAL_PROMPT_WINDOW, INITIAL_ANSWER_WINDOW);
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
   await recoverTerminalRuntime(storage);
@@ -564,7 +567,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         updatedAt: isoNow(),
       }));
       await clearSessionNotReadyError(storage, tabId);
-      const bundle = await storage.readTab(tabId);
+      const bundle = await readClientTab(tabId);
       emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
       return { ok: true, bundle };
     } catch (error) {
@@ -607,7 +610,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         updatedAt: isoNow(),
       }));
       await clearSessionNotReadyError(storage, tabId);
-      const bundle = await storage.readTab(tabId);
+      const bundle = await readClientTab(tabId);
       emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
       return { ok: true, bundle };
     } catch (error) {
@@ -646,7 +649,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       updatedAt: isoNow(),
     }));
     await clearSessionNotReadyError(storage, tab.id);
-    return { ok: true, bundle: await storage.readTab(tab.id) };
+    return { ok: true, bundle: await readClientTab(tab.id) };
   };
 
   const performTerminalReopen = async (tabId: string): Promise<TerminalReopenResult> => {
@@ -690,7 +693,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       // loop seen in the remote TUI. This draft space is never submitted and
       // queue prompts continue to use App Server turn/start or turn/steer.
       pty.primeCodexInput(tabId);
-      const bundle = await storage.readTab(tabId);
+      const bundle = await readClientTab(tabId);
       emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
       return { ok: true, bundle };
     } catch (error) {
@@ -737,7 +740,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return restoreOpenSessionsPromise;
   };
 
-  app.promptor = { storage, codex, claude, cursor, pty, runners, ui, traffic, token, restoreOpenSessions, close: async () => {
+  app.promptor = { storage, codex, claude, cursor, pty, runners, ui, traffic, documents, token, restoreOpenSessions, close: async () => {
     ui.stop();
     rawBatcher.close(false);
     projectionScheduler.close();
@@ -830,8 +833,50 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   app.addHook("onRequest", async (request, reply) => {
     if (request.url.startsWith("/api/")) await apiAuth(request, reply);
   });
+  app.addHook("onSend", async (request, reply, payload) => {
+    if (request.url.startsWith("/api/documents/") && reply.statusCode >= 400) reply.header("Cache-Control", "no-store");
+    return payload;
+  });
 
   app.get("/api/health", async (_request, reply) => reply.send({ data: { ok: true, codex: codex.status, claude: await claudeVersion, cursor: await cursorVersion } }));
+
+  app.post("/api/documents/open", { bodyLimit: 12 * 1024 }, async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    try {
+      const data = await documents.open(request.body as any);
+      return reply.send({ data });
+    } catch (error) { return sendDocumentError(reply, error); }
+  });
+
+  app.post("/api/documents/open-local", { bodyLimit: 12 * 1024 }, async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    if (!isLocalBrowserRequest(request.headers)) {
+      return sendDocumentError(reply, new DocumentError(403, "DOCUMENT_LOCAL_ONLY", "Opening a desktop application is allowed only from a loopback browser."));
+    }
+    try {
+      const data = await documents.openLocal(request.body as any);
+      return reply.send({ data });
+    } catch (error) { return sendDocumentError(reply, error); }
+  });
+
+  app.get("/api/documents/:docId/chunks/:index", async (request, reply) => {
+    try {
+      const params = request.params as { docId?: unknown; index?: unknown };
+      const query = request.query as { rev?: unknown };
+      const rawIndex = String(params.index ?? "");
+      if (!/^(?:0|[1-9]\d{0,7})$/.test(rawIndex)) throw new DocumentError(400, "DOCUMENT_CHUNK_OUT_OF_RANGE", "The document chunk index is invalid.");
+      const chunk = await documents.readChunk(String(params.docId ?? ""), String(query.rev ?? ""), Number(rawIndex));
+      reply
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("Cache-Control", "private, max-age=31536000, immutable")
+        .header("ETag", `W/\"${chunk.docId}.${chunk.revision}.${chunk.index}\"`)
+        .header("Vary", "x-codex-promptor-token, accept-encoding");
+      return reply.send(chunk.bytes);
+    } catch (error) {
+      reply.header("Cache-Control", "no-store");
+      return sendDocumentError(reply, error);
+    }
+  });
 
   app.get("/api/diagnostics/terminal-traffic", async (_request, reply) => reply.send({ data: traffic.snapshot() }));
 
@@ -1095,7 +1140,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           updatedAt: isoNow(),
         }));
         await clearSessionNotReadyError(storage, tabId);
-        return reply.send({ data: { bundle: await storage.readTab(tabId), report: { imported: 0, skipped: 0, ignored: 0, repaired: 0 } } });
+        return reply.send({ data: { bundle: await readClientTab(tabId), report: { imported: 0, skipped: 0, ignored: 0, repaired: 0 } } });
       }
       if (provider === "claude") {
         const now = isoNow();
@@ -1125,7 +1170,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           updatedAt: isoNow(),
         }));
         await clearSessionNotReadyError(storage, tabId);
-        return reply.send({ data: { bundle: await storage.readTab(tabId), report } });
+        return reply.send({ data: { bundle: await readClientTab(tabId), report } });
       }
       if (provider === "cursor") {
         const now = isoNow();
@@ -1155,7 +1200,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           updatedAt: isoNow(),
         }));
         await clearSessionNotReadyError(storage, tabId);
-        return reply.send({ data: { bundle: await storage.readTab(tabId), report } });
+        return reply.send({ data: { bundle: await readClientTab(tabId), report } });
       }
       let manager = codex.get(tabId);
       let rpc = await manager.ensureReady();
@@ -1228,7 +1273,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       // Prime the real TUI only after its initial thread has been selected, so
       // the space cannot be consumed by the surrounding PowerShell command.
       pty.primeCodexInput(tabId);
-      const bundle = await storage.readTab(tabId);
+      const bundle = await readClientTab(tabId);
       return reply.send({ data: { bundle, report } });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1258,17 +1303,17 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (tab.session.provider === "claude") {
         const manager = claude.existing(tabId);
         const result = await syncClaudeHistory(storage, tabId, tab.session.threadId, manager?.session?.transcriptPath);
-        return reply.send({ data: { report: result.report, bundle: await storage.readTab(tabId) } });
+        return reply.send({ data: { report: result.report, bundle: await readClientTab(tabId) } });
       }
       if (tab.session.provider === "cursor") {
         const manager = cursor.existing(tabId);
         const result = await syncCursorHistory(storage, tabId, tab.session.threadId, manager?.session?.transcriptPath);
-        return reply.send({ data: { report: result.report, bundle: await storage.readTab(tabId) } });
+        return reply.send({ data: { report: result.report, bundle: await readClientTab(tabId) } });
       }
       const rpc = await codex.get(tabId).ensureReady();
       const thread = await withCodexRolloutTurns(historyThreadFromResponse(await rpc.readThread(tab.session.threadId)), tab.session.threadId);
       const report = await syncHistory(storage, tabId, thread);
-      return reply.send({ data: { report, bundle: await storage.readTab(tabId) } });
+      return reply.send({ data: { report, bundle: await readClientTab(tabId) } });
     } catch (error) { return apiError(reply, 502, "HISTORY_SYNC_FAILED", error instanceof Error ? error.message : String(error), true); }
   });
 
@@ -1310,7 +1355,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         updatedAt: now,
       }));
       await updateTerminalRuntime(storage, tabId, { state: "stopped", lastExitCode: null, lastError: null, appServer: null });
-      return reply.send({ data: await storage.readTab(tabId) });
+      return reply.send({ data: await readClientTab(tabId) });
     } catch (error) { return apiError(reply, 500, "CONVERSATION_CLOSE_FAILED", error instanceof Error ? error.message : String(error)); }
   });
 
@@ -1550,6 +1595,19 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           if (terminal) sendRawTerminal(client, tabId, { type: "terminal.output", ...terminal }, "terminal.snapshot");
         } else if (message.type === "terminal.screen.snapshot.request" && message.tabId) {
           const tabId = String(message.tabId);
+          if (message.oneShot === true) {
+            if (!client.stateSubscriptions.has(tabId)) {
+              sendClient(client, wsError("TAB_NOT_SUBSCRIBED", "Subscribe to the tab before requesting a one-shot screen."), "error");
+              return;
+            }
+            const snapshot = await pty.screenSnapshot(tabId, boundedInteger(message.viewportRows, 5, 60, 20));
+            if (!snapshot) {
+              sendClient(client, wsError("TERMINAL_SCREEN_UNAVAILABLE", "The current terminal screen is unavailable."), "error");
+              return;
+            }
+            sendClient(client, fullTerminalScreenFrame(snapshot, { tabId, oneShot: true }), "terminal.snapshot");
+            return;
+          }
           const stream = client.terminalSubscriptions.get(tabId);
           if (!stream || stream.mode !== "projection" || !projectionScheduler.requestFull(client.id, tabId)) {
             sendClient(client, wsError("TERMINAL_PROJECTION_NOT_SUBSCRIBED", "Subscribe in projection mode before requesting a screen snapshot."), "error");
@@ -1704,11 +1762,15 @@ function parseTerminalSubscriptions(value: unknown): Map<string, TerminalStream>
     }
     if (config.mode !== undefined && config.mode !== "raw") throw new Error("Unsupported terminal transport mode");
     const nextOffset = Number(config.nextOffset);
+    const maxCatchUpBytes = Number(config.maxCatchUpBytes);
     result.set(tabId, {
       mode: "raw",
       cursor: {
         generation: typeof config.generation === "string" ? config.generation : null,
         nextOffset: Number.isSafeInteger(nextOffset) && nextOffset >= 0 ? nextOffset : null,
+        ...(Number.isSafeInteger(maxCatchUpBytes) && maxCatchUpBytes >= 0
+          ? { maxCatchUpBytes: Math.min(64 * 1024, maxCatchUpBytes) }
+          : {}),
       },
       streamId: randomUUID(),
       sequence: 0,
@@ -1963,6 +2025,14 @@ export async function recoverTerminalRuntime(storage: StorageService): Promise<n
 
 function apiError(reply: FastifyReply, statusCode: number, code: string, message: string, retryable = false) {
   return reply.code(statusCode).send({ error: { code, message, details: {}, retryable } });
+}
+
+function sendDocumentError(reply: FastifyReply, error: unknown) {
+  reply.header("Cache-Control", "no-store");
+  if (error instanceof DocumentError) {
+    return reply.code(error.statusCode).send({ error: { code: error.code, message: error.message, details: error.details, retryable: false } });
+  }
+  return reply.code(500).send({ error: { code: "DOCUMENT_CHUNK_FAILED", message: "The document request failed.", details: {}, retryable: false } });
 }
 
 /** Carries its own status and code so routes never have to match on message text. */

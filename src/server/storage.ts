@@ -247,7 +247,7 @@ export class StorageService {
     return {
       ...bundle,
       prompts: { ...bundle.prompts, prompts: prompts.slice(promptStart) },
-      answers: { ...bundle.answers, answers: answers.slice(answerStart) },
+      answers: { ...bundle.answers, answers: answers.slice(answerStart).map(withoutAnswerTransportBallast) },
       window: {
         prompts: { start: promptStart, total: prompts.length, completed: prompts.filter((prompt) => prompt.status === "completed").length },
         answers: { start: answerStart, total: answers.length },
@@ -263,7 +263,7 @@ export class StorageService {
 
   async readAnswerPage(tabId: string, before: number, limit = EARLIER_ANSWER_PAGE): Promise<TabRecordPage<AnswerRecord>> {
     const bundle = await this.readTab(tabId);
-    const records = recordsForCurrentThread(bundle).answers;
+    const records = recordsForCurrentThread(bundle).answers.map(withoutAnswerTransportBallast);
     return recordPage(records, before, limit, EARLIER_ANSWER_PAGE, bundle.answers.revision, bundle.answers.updatedAt);
   }
 
@@ -325,18 +325,31 @@ export class StorageService {
   }
 
   async writeAnswers(tabId: string, answers: AnswerFile): Promise<AnswerDelta> {
-    const value = AnswerFileSchema.parse(answers);
+    let value = AnswerFileSchema.parse(answers);
     const [previous, tab] = await Promise.all([
       this.readFile(this.answerPath(tabId), (raw) => AnswerFileSchema.parse(raw)).catch(() => null),
       this.readFile(this.tabPath(tabId), (raw) => TabMetaSchema.parse(raw)).catch(() => null),
     ]);
+    // Relative document links in an answer must continue to resolve against
+    // the directory in which that answer was produced, even after the tab
+    // switches thread or working directory. This value is intentionally kept
+    // on disk only; every client read and delta strips it below.
+    if (tab?.session.workingDirectory && tab.session.threadId) {
+      value = AnswerFileSchema.parse({
+        ...value,
+        answers: value.answers.map((answer) => answer.threadId === tab.session.threadId
+          && typeof answer.metadata.documentBasePath !== "string"
+          ? { ...answer, metadata: { ...answer.metadata, documentBasePath: tab.session.workingDirectory } }
+          : answer),
+      });
+    }
     await this.writeFile(this.answerPath(tabId), value);
     const previousRecords = tab && previous
-      ? currentAnswerRecords(tab, previous.answers)
-      : previous?.answers ?? null;
+      ? currentAnswerRecords(tab, previous.answers).map(withoutAnswerTransportBallast)
+      : previous?.answers.map(withoutAnswerTransportBallast) ?? null;
     const nextRecords = tab
-      ? currentAnswerRecords(tab, value.answers)
-      : value.answers;
+      ? currentAnswerRecords(tab, value.answers).map(withoutAnswerTransportBallast)
+      : value.answers.map(withoutAnswerTransportBallast);
     const delta = buildRecordDelta(previousRecords, nextRecords, value.revision, value.updatedAt) as AnswerDelta;
     notify(this.answerListeners, (listener) => listener(tabId, delta));
     return delta;
@@ -434,6 +447,13 @@ function withoutTransportBallast(prompt: PromptRecord): PromptRecord {
   if (prompt.inputSnapshot === undefined) return prompt;
   const { inputSnapshot: _dropped, ...rest } = prompt;
   return rest as PromptRecord;
+}
+
+/** Server-only answer provenance must never enter TabBundle, pages or deltas. */
+function withoutAnswerTransportBallast(answer: AnswerRecord): AnswerRecord {
+  if (!("documentBasePath" in answer.metadata)) return answer;
+  const { documentBasePath: _dropped, ...metadata } = answer.metadata;
+  return { ...answer, metadata };
 }
 
 function recordPage<T>(records: T[], before: number, limit: number, fallbackLimit: number, revision: number, updatedAt: string): TabRecordPage<T> {

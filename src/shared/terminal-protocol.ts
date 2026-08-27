@@ -64,5 +64,7 @@ export type TerminalScreenFrame = {
   cursor: TerminalScreenCursor;
   rows: TerminalScreenRow[];
   scroll?: TerminalScreenScroll;
+  /** Raw PTY cursor aligned with this parsed screen (one-shot bootstrap only). */
+  rawNextOffset?: number;
+  oneShot?: boolean;
 };
-

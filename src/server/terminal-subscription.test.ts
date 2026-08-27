@@ -187,6 +187,34 @@ describe("terminal WebSocket subscription isolation", () => {
     await eventually(() => messages.some((message) => message.error?.code === "TERMINAL_PROJECTION_RESIZE_FORBIDDEN"));
     expect(resize).not.toHaveBeenCalled();
   });
+
+  it("bootstraps a state-only raw viewer with one parsed screen and its aligned cursor", async () => {
+    const tab = await app.promptor.storage.createTab("one-shot");
+    const snapshot = vi.spyOn(app.promptor.pty, "screenSnapshot").mockResolvedValue({
+      generation: "screen-generation",
+      rawNextOffset: 123_456,
+      revision: 8,
+      sizeEpoch: 1,
+      cols: 80,
+      totalRows: 20,
+      viewportTop: 0,
+      viewportRows: 20,
+      alternateScreen: false,
+      inputModes: { applicationCursorKeys: false, applicationKeypad: false, bracketedPaste: true, mouseTracking: "none", sendFocus: false },
+      cursor: { row: 19, col: 2, visible: true },
+      rows: Array.from({ length: 20 }, (_unused, row) => ({ row, clearToEnd: true as const, runs: row === 19 ? [{ text: "ready", style: { fg: "default" as const, bg: "default" as const, flags: [] } }] : [], hash: String(row) })),
+    });
+    const socket = await connect(url, sockets);
+    const messages = collect(socket);
+    socket.send(JSON.stringify({ type: "subscribe", tabIds: [tab.id], snapshots: false, terminals: {} }));
+    socket.send(JSON.stringify({ type: "terminal.screen.snapshot.request", tabId: tab.id, viewportRows: 20, oneShot: true }));
+
+    await eventually(() => messages.some((message) => message.type === "terminal.screen" && message.oneShot));
+    const frame = messages.find((message) => message.type === "terminal.screen" && message.oneShot);
+    expect(frame).toMatchObject({ full: true, sequence: 1, rawNextOffset: 123_456, generation: "screen-generation" });
+    expect(frame.rows[19].runs[0].text).toBe("ready");
+    expect(snapshot).toHaveBeenCalledWith(tab.id, 20);
+  });
 });
 
 function rawEvent(tabId: string, startOffset: number, text: string) {

@@ -17,13 +17,14 @@ type TerminalBuffer = { generation: string; buffer: Buffer; bufferStart: number;
 type TerminalSize = { cols: number; rows: number };
 type Session = TerminalBuffer & TerminalSize & { process: pty.IPty; agentExited: boolean; inputPrimed: boolean };
 
-export type TerminalCursor = { generation?: string | null; nextOffset?: number | null };
+export type TerminalCursor = { generation?: string | null; nextOffset?: number | null; maxCatchUpBytes?: number | null };
 export type TerminalSnapshot = {
   generation: string;
   startOffset: number;
   endOffset: number;
   reset: boolean;
   dataBase64: string;
+  catchUpExceeded?: boolean;
 };
 
 export const CODEX_EXIT_MARKER = "__CODEX_PROMPTOR_EXIT__:";
@@ -111,10 +112,10 @@ export class PtyManager extends EventEmitter {
       child.onData((data) => {
         // Queue parser work before publishing the output event. Projection
         // snapshots triggered by that event await the same queue barrier.
-        void screen.write(data);
         const bytes = Buffer.from(data, "utf8");
         const startOffset = session.nextOffset;
         session.nextOffset += bytes.length;
+        void screen.write(data, session.nextOffset);
         session.buffer = Buffer.concat([session.buffer, bytes]);
         if (session.buffer.length > MAX_BUFFER_BYTES) {
           const overflow = session.buffer.length - MAX_BUFFER_BYTES;
@@ -245,10 +246,23 @@ export class PtyManager extends EventEmitter {
 
 export function sliceTerminalBuffer(source: Pick<TerminalBuffer, "generation" | "buffer" | "bufferStart" | "nextOffset">, cursor: TerminalCursor = {}): TerminalSnapshot {
     const requestedOffset = Number(cursor.nextOffset);
-    const canContinue = cursor.generation === source.generation
+    const canContinueFromCursor = cursor.generation === source.generation
       && Number.isSafeInteger(requestedOffset)
       && requestedOffset >= source.bufferStart
       && requestedOffset <= source.nextOffset;
+    const maximum = Number(cursor.maxCatchUpBytes);
+    const hasMaximum = Number.isSafeInteger(maximum) && maximum >= 0;
+    if (canContinueFromCursor && hasMaximum && source.nextOffset - requestedOffset > maximum) {
+      return {
+        generation: source.generation,
+        startOffset: requestedOffset,
+        endOffset: requestedOffset,
+        reset: false,
+        dataBase64: "",
+        catchUpExceeded: true,
+      };
+    }
+    const canContinue = canContinueFromCursor;
     const startOffset = canContinue ? requestedOffset : source.bufferStart;
     const startIndex = startOffset - source.bufferStart;
     return {

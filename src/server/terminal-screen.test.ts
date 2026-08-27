@@ -4,10 +4,11 @@ import { TerminalScreenModel } from "./terminal-screen.js";
 describe("TerminalScreenModel", () => {
   it("serializes parser writes and returns the bottom physical viewport", async () => {
     const screen = new TerminalScreenModel({ generation: "gen-1", cols: 12, rows: 6 });
-    await screen.write("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+    await screen.write("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix", 42);
 
     const snapshot = await screen.snapshot(5);
     expect(snapshot.generation).toBe("gen-1");
+    expect(snapshot.rawNextOffset).toBe(42);
     expect(snapshot.revision).toBe(1);
     expect(snapshot.viewportTop).toBe(1);
     expect(snapshot.viewportRows).toBe(5);

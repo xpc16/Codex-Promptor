@@ -37,6 +37,32 @@ export const defaultProjectionSchedulerConfig: ProjectionSchedulerConfig = {
   maxBurstBytes: 8 * 1024,
 };
 
+export function fullTerminalScreenFrame(
+  snapshot: TerminalScreenSnapshot,
+  options: { tabId: string; streamId?: string; sequence?: number; oneShot?: boolean },
+): TerminalScreenFrame {
+  return {
+    type: "terminal.screen",
+    tabId: options.tabId,
+    streamId: options.streamId ?? randomUUID(),
+    sequence: options.sequence ?? 1,
+    generation: snapshot.generation,
+    revision: snapshot.revision,
+    full: true,
+    cols: snapshot.cols,
+    totalRows: snapshot.totalRows,
+    viewportTop: snapshot.viewportTop,
+    viewportRows: snapshot.viewportRows,
+    alternateScreen: snapshot.alternateScreen,
+    sizeEpoch: snapshot.sizeEpoch,
+    inputModes: snapshot.inputModes,
+    cursor: snapshot.cursor,
+    rows: snapshot.rows.map(stripHash),
+    rawNextOffset: snapshot.rawNextOffset ?? 0,
+    ...(options.oneShot ? { oneShot: true } : {}),
+  };
+}
+
 type ProjectionStream = {
   clientId: string;
   tabId: string;

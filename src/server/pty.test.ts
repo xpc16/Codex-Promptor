@@ -48,4 +48,10 @@ describe("remote Codex terminal command", () => {
     expect(snapshot).toMatchObject({ generation: "generation-2", startOffset: 25, endOffset: 33, reset: true });
     expect(Buffer.from(snapshot.dataBase64, "base64").toString("utf8")).toBe("retained");
   });
+
+  it("refuses to replay a raw gap beyond the requested catch-up bound", () => {
+    const source = { generation: "generation-1", buffer: Buffer.from("x".repeat(100), "utf8"), bufferStart: 0, nextOffset: 100 };
+    const snapshot = sliceTerminalBuffer(source, { generation: "generation-1", nextOffset: 10, maxCatchUpBytes: 32 });
+    expect(snapshot).toMatchObject({ startOffset: 10, endOffset: 10, reset: false, catchUpExceeded: true, dataBase64: "" });
+  });
 });

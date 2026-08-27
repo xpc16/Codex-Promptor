@@ -16,6 +16,7 @@ export type TerminalScreenSnapshotRow = TerminalScreenRow & { hash: string };
 
 export type TerminalScreenSnapshot = {
   generation: string;
+  rawNextOffset?: number;
   revision: number;
   sizeEpoch: number;
   cols: number;
@@ -40,6 +41,7 @@ export type TerminalScreenModelOptions = {
 
 type PendingScreenWrite = {
   data: string;
+  rawNextOffset: number;
   waiters: Array<{ resolve: () => void; reject: (error: unknown) => void }>;
 };
 
@@ -54,6 +56,7 @@ export class TerminalScreenModel {
   private readonly onResponse?: (data: string) => void;
   private tail: Promise<void> = Promise.resolve();
   private revisionValue = 0;
+  private rawNextOffsetValue = 0;
   private sizeEpochValue = 0;
   private responderEnabled = true;
   private cursorVisible = true;
@@ -120,19 +123,20 @@ export class TerminalScreenModel {
   setResponderEnabled(enabled: boolean): void { this.responderEnabled = enabled; }
   setTheme(theme: TerminalScreenTheme): void { this.theme = theme; }
 
-  write(data: string): Promise<void> {
+  write(data: string, rawNextOffset = this.rawNextOffsetValue): Promise<void> {
     if (this.disposed || data.length === 0) return Promise.resolve();
     let resolve!: () => void;
     let reject!: (error: unknown) => void;
     const completion = new Promise<void>((accept, decline) => { resolve = accept; reject = decline; });
     let batch = this.openWriteBatch;
     if (!batch) {
-      batch = { data: "", waiters: [] };
+      batch = { data: "", rawNextOffset: this.rawNextOffsetValue, waiters: [] };
       this.openWriteBatch = batch;
       this.writeBatches.add(batch);
       void this.enqueue(() => this.flushWriteBatch(batch!)).catch(() => undefined);
     }
     batch.data += data;
+    batch.rawNextOffset = Math.max(batch.rawNextOffset, rawNextOffset);
     batch.waiters.push({ resolve, reject });
     return completion;
   }
@@ -163,6 +167,7 @@ export class TerminalScreenModel {
     const cursorRow = buffer.cursorY - viewportTop;
     return {
       generation: this.generation,
+      rawNextOffset: this.rawNextOffsetValue,
       revision: this.revisionValue,
       sizeEpoch: this.sizeEpochValue,
       cols: this.terminal.cols,
@@ -203,6 +208,7 @@ export class TerminalScreenModel {
     try {
       if (this.disposed) return;
       await new Promise<void>((resolve) => this.terminal.write(batch.data, resolve));
+      this.rawNextOffsetValue = Math.max(this.rawNextOffsetValue, batch.rawNextOffset);
       this.revisionValue += 1;
       for (const waiter of batch.waiters.splice(0)) waiter.resolve();
     } catch (error) {
