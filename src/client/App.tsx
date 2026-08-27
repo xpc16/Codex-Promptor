@@ -9,7 +9,6 @@ import {
   type FormEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent,
-  type TouchEvent as ReactTouchEvent,
 } from "react";
 import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta, TabRecordPage } from "../shared/schemas.js";
 import type { TerminalScreenFrame, TerminalTransportMode, TerminalTransportPreference } from "../shared/terminal-protocol.js";
@@ -24,12 +23,13 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { sameTerminalSize, terminalFrameLooksSettled, terminalResetNeedsSettling, TerminalCursorQuietScheduler, TerminalResizeScheduler } from "./terminal-resize.js";
 import { loadTabWithRetry, retainRecentTabIds } from "./tab-load.js";
-import { MOBILE_PANES, nextMobilePane, swipeDirection, type MobilePane } from "./mobile-pane.js";
+import { MOBILE_PANES, type MobilePane } from "./mobile-pane.js";
 import { dialogSurvivesIndex, nextSelectedTabId, shouldAdoptIndexRevision } from "./index-sync.js";
 import { applyTabMessage } from "./tab-bundle-delta.js";
 import { forgetCachedTab, readCachedTab, rememberTab, retainCachedTabs, windowLimits } from "./tab-cache.js";
 import { CONSOLE_WIDTH, readPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
 import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
+import { autoSizedHeight, readTextareaMetrics } from "./textarea-autosize.js";
 import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenState } from "./terminal-projection.js";
 import { readTerminalTransportPreference, resolveTerminalTransportPreference, writeTerminalTransportPreference } from "./terminal-preference.js";
 import { forgetCachedTerminal, readCachedProjection, readCachedRawTerminal, rememberProjection, rememberRawTerminal, retainCachedTerminals } from "./terminal-cache.js";
@@ -64,24 +64,6 @@ async function api<T = any>(url: string, init: RequestInit = {}): Promise<T> {
 
 function jsonBody(value: unknown): RequestInit { return { method: "POST", body: JSON.stringify(value) }; }
 
-/**
- * A sideways swipe belongs to the element under the finger whenever that
- * element can actually scroll sideways — a wide code block in an answer, a
- * table, the terminal viewport. Paging the phone layout out from under such a
- * gesture would make those regions unreadable, so the swipe stands down.
- */
-function startsInsideHorizontalScroller(target: EventTarget | null): boolean {
-  let node = target instanceof Element ? target : null;
-  while (node) {
-    if (node.classList.contains("app-shell")) return false;
-    if (node.scrollWidth - node.clientWidth > 2) {
-      const overflowX = getComputedStyle(node).overflowX;
-      if (overflowX === "auto" || overflowX === "scroll") return true;
-    }
-    node = node.parentElement;
-  }
-  return false;
-}
 
 let promptCompletionAudioContext: AudioContext | null = null;
 
@@ -357,25 +339,10 @@ export function App() {
   }, [index, retainedTabIds, selectedId]);
   const groups = useMemo(() => [...(index?.groups ?? [])].sort((a, b) => a.order - b.order), [index]);
   const ungrouped = index?.tabs.filter((tab) => !tab.groupId).sort((a, b) => a.order - b.order) ?? [];
-  // On a phone the four desktop panes become four full-screen pages. The
-  // attribute drives the layout; the pointer state below turns swipes into
-  // page turns. Both are inert above the CSS breakpoint.
+  // On a phone the four desktop panes become four full-screen pages, chosen
+  // from the bar at the bottom. The attribute drives the layout and is inert
+  // above the CSS breakpoint.
   const [mobilePane, setMobilePane] = useState<MobilePane>("console");
-  const touchStart = useRef<{ x: number; y: number; pages: boolean } | null>(null);
-  const onShellTouchStart = (event: ReactTouchEvent<HTMLElement>) => {
-    const touch = event.touches[0];
-    touchStart.current = touch
-      ? { x: touch.clientX, y: touch.clientY, pages: !startsInsideHorizontalScroller(event.target) }
-      : null;
-  };
-  const onShellTouchEnd = (event: ReactTouchEvent<HTMLElement>) => {
-    const start = touchStart.current;
-    touchStart.current = null;
-    const touch = event.changedTouches[0];
-    if (!start?.pages || !touch) return;
-    const step = swipeDirection({ dx: touch.clientX - start.x, dy: touch.clientY - start.y });
-    if (step) setMobilePane((current) => nextMobilePane(current, step));
-  };
   // Picking a conversation from the console is a request to go read it, so the
   // phone follows the tap to the conversation page instead of staying on a
   // list whose selection just moved off-screen.
@@ -472,7 +439,7 @@ export function App() {
 
   if (!index) return <I18nContext.Provider value={i18n}><div className="loading-screen"><div className="orb" /><p>{error ? i18n.errorText(error) : t("app.loading")}</p><button onClick={() => void refresh()}>{t("action.retry")}</button></div></I18nContext.Provider>;
 
-  return <I18nContext.Provider value={i18n}><div className="app-shell" data-mobile-pane={mobilePane} style={{ gridTemplateColumns: `${consoleWidth}px 7px minmax(0, 1fr)` }} onTouchStart={onShellTouchStart} onTouchEnd={onShellTouchEnd}>
+  return <I18nContext.Provider value={i18n}><div className="app-shell" data-mobile-pane={mobilePane} style={{ gridTemplateColumns: `${consoleWidth}px 7px minmax(0, 1fr)` }}>
     <aside className="sidebar" aria-label={t("aria.console")}>
       <div className="brand"><img className="brand-mark" src="/favicon.svg" alt="" aria-hidden="true" draggable={false} /><div><strong>Promptor</strong><span>{t("brand.subtitle")}</span></div></div>
       <div className="sidebar-actions"><button className="primary small" onClick={() => void createTab()}>{t("nav.newConversation")}</button><button className="icon-button" title={t("nav.newGroupTitle")} onClick={() => setDialog({ kind: "group" })}>{t("nav.newGroup")}</button></div>
@@ -1034,18 +1001,49 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     catch (reason) { onError(reason); }
     finally { reorderInFlight.current = false; nativeDragSource.current = null; }
   };
-  const pendingIds = prompts.filter((item) => item.status === "pending").map((item) => item.id);
   const runnerState = runnerLabel(i18n, runtime);
   const completedCount = bundle.window?.prompts.completed ?? prompts.filter((item) => item.status === "completed").length;
   return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "running" ? "running" : runtime.runner.state === "error" ? "error" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "start"} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
-    <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t("queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; const pendingIndex = pendingIds.indexOf(prompt.id); return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} canMoveUp={pendingIndex > 0} canMoveDown={pendingIndex >= 0 && pendingIndex < pendingIds.length - 1} onMove={(direction) => { const target = pendingIds[pendingIndex + direction]; if (target) void reorder(prompt.id, target); }} onChanged={onChanged} onError={onError} />; })}</div>
+    <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t("queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}
     <div className="add-prompt"><textarea disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
   </div>;
 }
 
-function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, onNativeDragEnter, canMoveUp, canMoveDown, onMove, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragEnter: (targetId: string) => void; canMoveUp: boolean; canMoveDown: boolean; onMove: (direction: -1 | 1) => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
+/**
+ * Sizes a queue row's text box to the prompt it holds, up to a cap.
+ *
+ * The measurement has to happen after layout and at the box's real width, so
+ * it reruns when the text changes, when editing swaps the padding, and when
+ * the column is resized. The observer compares widths only: reacting to the
+ * height it just set would loop.
+ */
+function useAutoSizedTextarea(ref: { current: HTMLTextAreaElement | null }, text: string, editing: boolean) {
+  const measuredWidth = useRef(0);
+  const resize = useCallback(() => {
+    const element = ref.current;
+    if (!element) return;
+    element.style.height = "auto";
+    element.style.height = `${autoSizedHeight(readTextareaMetrics(element))}px`;
+  }, [ref]);
+  useLayoutEffect(() => { resize(); }, [resize, text, editing]);
+  useEffect(() => {
+    const element = ref.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+    measuredWidth.current = element.clientWidth;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width ?? 0;
+      if (Math.abs(width - measuredWidth.current) < 1) return;
+      measuredWidth.current = width;
+      resize();
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [ref, resize]);
+}
+
+function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, onNativeDragEnter, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragEnter: (targetId: string) => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   const editable = !locked && !["completed", "running", "dispatching"].includes(prompt.status);
@@ -1053,6 +1051,7 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
   const [editing, setEditing] = useState(false);
   const [insertingNow, setInsertingNow] = useState(false);
   const editor = useRef<HTMLTextAreaElement>(null);
+  useAutoSizedTextarea(editor, text, editing);
   useEffect(() => { setText(prompt.text); setEditing(false); }, [prompt.text, prompt.status]);
   const beginEdit = () => { if (!editable) return; setEditing(true); requestAnimationFrame(() => { editor.current?.focus(); editor.current?.select(); }); };
   const save = async () => {
@@ -1085,7 +1084,7 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", release, { once: true });
   };
   const nativeDragStart = (event: DragEvent<HTMLDivElement>) => { if ((event.target as HTMLElement).closest("textarea, button")) { event.preventDefault(); return; } event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", prompt.id); onNativeDragStart(prompt.id); };
-  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={Math.min(5, Math.max(1, text.split("\n").length))} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button>}{pendingStatus && <span className="move-buttons"><button aria-label={t("queue.moveUp")} title={t("queue.moveUp")} disabled={locked || insertingNow || !canMoveUp} onClick={() => onMove(-1)}>↑</button><button aria-label={t("queue.moveDown")} title={t("queue.moveDown")} disabled={locked || insertingNow || !canMoveDown} onClick={() => onMove(1)}>↓</button></span>}{pendingStatus && <button className="link-button insert-now-button" disabled={locked || insertingNow || editing} title={t("queue.insertNowHelp")} onClick={() => void insertNow()}>{t(insertingNow ? "queue.insertingNow" : "queue.insertNow")}</button>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
+  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button>}{pendingStatus && <button className="link-button insert-now-button" disabled={locked || insertingNow || editing} title={t("queue.insertNowHelp")} onClick={() => void insertNow()}>{t(insertingNow ? "queue.insertingNow" : "queue.insertNow")}</button>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
 function TerminalPanel({ tabId, provider, runtime, theme, active, closed, terminalPreference, projectionSupported, onTerminalPreferenceChange, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; terminalPreference: TerminalTransportPreference; projectionSupported: boolean; onTerminalPreferenceChange: (value: TerminalTransportPreference) => void; onBundle: (bundle: TabBundle) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {

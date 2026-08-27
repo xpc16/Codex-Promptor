@@ -270,7 +270,11 @@ input, textarea, select { color: var(--text); }
 .drag-handle { padding-top: 1px; color: var(--faint); font-size: 15px; cursor: grab; }
 .drag-handle.enabled { user-select: none; touch-action: none; }
 .drag-handle.enabled.dragging { color: var(--primary); cursor: grabbing; }
-.prompt-row textarea { width: 100%; resize: none; padding: 1px 0; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 13px; line-height: 1.5; }
+/* Height is set inline from the measured text (see textarea-autosize): one
+   line for a one-line prompt, up to three, then the box scrolls inside itself.
+   No max-height here -- the cap depends on the padding, which differs between
+   the resting and editing states, and the measurement already accounts for it. */
+.prompt-row textarea { width: 100%; resize: none; overflow-y: auto; overscroll-behavior: contain; padding: 1px 0; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 13px; line-height: 1.5; }
 .prompt-row textarea[readonly]:not(:disabled) { cursor: default; }
 .prompt-row textarea.editing { padding: 5px 7px; border: 1px solid var(--primary); border-radius: 6px; background: var(--panel); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 12%, transparent); }
 .prompt-row textarea:disabled { color: var(--muted); }
@@ -289,8 +293,6 @@ input, textarea, select { color: var(--text); }
 .prompt-edit-button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 1px solid var(--border); border-radius: 5px; background: var(--panel); color: var(--primary); font-size: 15px; line-height: 1; }
 .prompt-edit-button:hover:not(:disabled) { border-color: var(--primary); background: var(--primary-soft); }
 .insert-now-button { font-weight: 700; }
-.move-buttons { display: inline-flex; gap: 2px; }
-.move-buttons button { padding: 0 4px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel); color: var(--muted); font-size: 10px; line-height: 17px; }
 .add-prompt { flex: none; display: flex; gap: 8px; align-items: stretch; margin-top: 10px; }
 .add-prompt textarea { min-height: 50px; max-height: 110px; resize: vertical; }
 
@@ -370,11 +372,16 @@ input, textarea, select { color: var(--text); }
    - grid-template-columns needs !important because the desktop split widths
      are written inline from React state (consoleWidth / leftWidth). */
 @media (max-width: 640px) {
+  /* The shell is the viewport, pinned. Panes scroll; the page never does, so
+     a flick inside the queue cannot drag the whole layout up and leave the
+     pane bar off-screen. */
+  html, body, #root { height: 100dvh; overscroll-behavior: none; }
+  body { position: fixed; inset: 0; }
   .app-shell {
     grid-template-columns: 1fr !important;
     grid-template-rows: minmax(0, 1fr) auto;
-    height: 100vh;
     height: 100dvh;
+    overflow: hidden;
   }
   .console-splitter { display: none; }
   .sidebar, .workspace { grid-area: 1 / 1; min-width: 0; min-height: 0; height: 100%; }
@@ -394,5 +401,12 @@ input, textarea, select { color: var(--text); }
   .app-shell[data-mobile-pane="queue"] .terminal-card { visibility: hidden; pointer-events: none; }
 
   .mobile-pane-bar { grid-area: 2 / 1; display: grid; }
-  .answer-scroll, .prompt-list, .tab-tree { -webkit-overflow-scrolling: touch; }
+  .answer-scroll, .prompt-list, .tab-tree { -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+
+  /* A queue row on a phone has no width to spare: the status and its buttons
+     move under the prompt so the text keeps the full column, which is what
+     makes an opened editor readable rather than a two-character slot. */
+  .prompt-row { grid-template-columns: 24px 18px minmax(0, 1fr); gap: 6px; }
+  .prompt-side { grid-column: 3; max-width: none; justify-content: flex-start; }
+  .prompt-row textarea.editing { padding: 6px 8px; }
 }
