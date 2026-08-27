@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { mergeRolloutTurns, parseCodexRollout } from "./codex-history.js";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { describe, expect, it, vi } from "vitest";
+import { mergeRolloutTurns, parseCodexRollout, readCodexRollout, readCodexThreadForHistory } from "./codex-history.js";
 
 const line = (value: unknown) => JSON.stringify(value);
 const event = (type: string, turnId: string, extra: Record<string, unknown> = {}, timestamp = "2026-08-25T14:22:20.489Z") =>
@@ -87,5 +90,75 @@ describe("Codex rollout history", () => {
     expect(merged.turns[0].items[0].text).toBe("richer api copy");
     expect(merged.turns[1].id).toBe("t2");
     expect(mergeRolloutTurns(apiThread, []).turns).toHaveLength(1);
+  });
+});
+
+describe("reading a rollout from disk", () => {
+  it("streams the file instead of holding it whole", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-rollout-"));
+    try {
+      const file = path.join(root, "thread-1.jsonl");
+      // Padded well past what a single frame would carry, to exercise the path
+      // that made a 200MB rollout unreadable rather than merely expensive.
+      const padding = "x".repeat(200_000);
+      await writeFile(file, [
+        event("task_started", "t1", { started_at: 1787667740 }),
+        event("item_completed", "t1", { item: { type: "ExecCommandOutput", id: "t1-noise", content: [{ type: "text", text: padding }] } }),
+        userItem("t1", "从磁盘读出来的提示"),
+        event("task_complete", "t1", { last_agent_message: "从磁盘读出来的回答" }),
+        "",
+      ].join("\n"), "utf8");
+
+      const thread = await readCodexRollout(file, "thread-1");
+      expect(thread.turns).toHaveLength(1);
+      expect(thread.turns[0].items[0]).toMatchObject({ type: "userMessage", text: "从磁盘读出来的提示" });
+      expect(thread.turns[0].items[1]).toMatchObject({ phase: "final_answer", text: "从磁盘读出来的回答" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("choosing a history source", () => {
+  const summaryOnly = { thread: { id: "thread-1", status: { type: "idle" } } };
+
+  it("does not ask for the full conversation when the rollout can supply it", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-history-source-"));
+    try {
+      const file = path.join(root, "thread-1.jsonl");
+      await writeFile(file, [
+        event("task_started", "t1", { started_at: 1787667740 }),
+        userItem("t1", "来自 rollout"),
+        event("task_complete", "t1", { last_agent_message: "回答" }),
+      ].join("\n"), "utf8");
+      // `path` on the summary is the hint that avoids scanning the sessions tree.
+      const rpc = {
+        readThreadSummary: vi.fn().mockResolvedValue({ thread: { ...summaryOnly.thread, path: file } }),
+        readThread: vi.fn(),
+      };
+
+      const thread = await readCodexThreadForHistory(rpc, "thread-1");
+
+      expect(thread.turns).toHaveLength(1);
+      expect(thread.turns[0].items[0].text).toBe("来自 rollout");
+      // The whole point: the transfer stays flat no matter how long the thread got.
+      expect(rpc.readThread).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the App Server for a thread with no rollout written yet", async () => {
+    const rpc = {
+      readThreadSummary: vi.fn().mockResolvedValue(summaryOnly),
+      readThread: vi.fn().mockResolvedValue({
+        thread: { id: "thread-unwritten", turns: [{ id: "t1", status: "completed", items: [{ type: "userMessage", text: "只有投影里有" }] }] },
+      }),
+    };
+
+    const thread = await readCodexThreadForHistory(rpc, "thread-unwritten");
+
+    expect(thread.turns).toHaveLength(1);
+    expect(rpc.readThread).toHaveBeenCalledWith("thread-unwritten");
   });
 });

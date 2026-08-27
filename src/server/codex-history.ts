@@ -1,6 +1,8 @@
-import { promises as fs } from "node:fs";
+import { createReadStream, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createInterface } from "node:readline";
+import { historyThreadFromResponse } from "./history.js";
 
 /**
  * Reading Codex history from the rollout file instead of the App Server.
@@ -13,6 +15,8 @@ import path from "node:path";
  * append-only source of truth, so history sync falls back to it and unions in
  * whatever the projection has not caught up with.
  */
+export type CodexRolloutThread = { id: string; sessionId: string; turns: CodexRolloutTurn[] };
+
 export type CodexRolloutTurn = {
   id: string;
   status: "completed" | "interrupted" | "running";
@@ -57,7 +61,15 @@ function timeOf(...values: unknown[]): string | null {
   return null;
 }
 
-export function parseCodexRollout(contents: string, threadId: string): { id: string; sessionId: string; turns: CodexRolloutTurn[] } {
+type RolloutParser = { push(line: string): void; finish(): CodexRolloutThread };
+
+/**
+ * Consumes a rollout one line at a time so it never has to exist in memory as a
+ * whole. The largest rollouts on this machine are over 200MB, and holding one
+ * as a string and again as the array it splits into costs far more than the
+ * handful of fields this keeps.
+ */
+function createRolloutParser(threadId: string): RolloutParser {
   const drafts = new Map<string, Draft>();
   let order = 0;
   const draftFor = (turnId: string): Draft => {
@@ -80,19 +92,19 @@ export function parseCodexRollout(contents: string, threadId: string): { id: str
     return created;
   };
 
-  for (const line of contents.split(/\r?\n/)) {
-    if (!line.trim()) continue;
+  const push = (line: string): void => {
+    if (!line.trim()) return;
     let record: any;
-    try { record = JSON.parse(line); } catch { continue; }
+    try { record = JSON.parse(line); } catch { return; }
     const payload = record?.payload;
     const kind = String(payload?.type ?? "");
     const turnId = String(payload?.turn_id ?? payload?.turnId ?? "");
-    if (!turnId) continue;
+    if (!turnId) return;
 
     if (kind === "task_started") {
       const draft = draftFor(turnId);
       draft.startedAt = timeOf(payload.started_at, payload.startedAt, record.timestamp) ?? draft.startedAt;
-      continue;
+      return;
     }
     if (kind === "task_complete") {
       const draft = draftFor(turnId);
@@ -102,15 +114,15 @@ export function parseCodexRollout(contents: string, threadId: string): { id: str
       // guessing which of the turn's agent messages was the closing one.
       const answer = String(payload.last_agent_message ?? payload.lastAgentMessage ?? "").trim();
       if (answer) draft.finalAnswer = answer;
-      continue;
+      return;
     }
     if (kind === "turn_aborted" || kind === "turn_failed") {
       const draft = draftFor(turnId);
       draft.status = "interrupted";
       draft.completedAt = timeOf(record.timestamp) ?? draft.completedAt;
-      continue;
+      return;
     }
-    if (kind !== "item_completed") continue;
+    if (kind !== "item_completed") return;
 
     const item = payload?.item;
     const itemType = String(item?.type ?? "").toLowerCase();
@@ -121,30 +133,52 @@ export function parseCodexRollout(contents: string, threadId: string): { id: str
       const clientId = String(item?.client_id ?? item?.clientId ?? "");
       if (clientId) draft.clientId = clientId;
       draft.startedAt = draft.startedAt ?? timeOf(payload.started_at_ms, record.timestamp);
-      continue;
+      return;
     }
     if (itemType === "agentmessage") {
       const draft = draftFor(turnId);
       const text = textOf(item?.content);
       if (text) draft.lastAgentText = text;
     }
-  }
+  };
 
-  const turns: CodexRolloutTurn[] = [];
-  for (const draft of [...drafts.values()].sort((a, b) => a.order - b.order)) {
-    if (!draft.userTexts.length) continue;
-    const items: Array<Record<string, unknown>> = [{
-      type: "userMessage",
-      text: draft.userTexts.join("\n\n"),
-      ...(draft.clientId ? { clientId: draft.clientId } : {}),
-    }];
-    // Only a completed turn gets a final answer. An interrupted turn keeps its
-    // last commentary so the card shows what was produced, tagged as partial.
-    if (draft.finalAnswer) items.push({ type: "agentMessage", phase: "final_answer", text: draft.finalAnswer });
-    else if (draft.lastAgentText && draft.status !== "running") items.push({ type: "agentMessage", phase: "partial_answer", text: draft.lastAgentText });
-    turns.push({ id: draft.id, status: draft.status, startedAt: draft.startedAt, completedAt: draft.completedAt, items });
+  const finish = (): CodexRolloutThread => {
+    const turns: CodexRolloutTurn[] = [];
+    for (const draft of [...drafts.values()].sort((a, b) => a.order - b.order)) {
+      if (!draft.userTexts.length) continue;
+      const items: Array<Record<string, unknown>> = [{
+        type: "userMessage",
+        text: draft.userTexts.join("\n\n"),
+        ...(draft.clientId ? { clientId: draft.clientId } : {}),
+      }];
+      // Only a completed turn gets a final answer. An interrupted turn keeps its
+      // last commentary so the card shows what was produced, tagged as partial.
+      if (draft.finalAnswer) items.push({ type: "agentMessage", phase: "final_answer", text: draft.finalAnswer });
+      else if (draft.lastAgentText && draft.status !== "running") items.push({ type: "agentMessage", phase: "partial_answer", text: draft.lastAgentText });
+      turns.push({ id: draft.id, status: draft.status, startedAt: draft.startedAt, completedAt: draft.completedAt, items });
+    }
+    return { id: threadId, sessionId: threadId, turns };
+  };
+
+  return { push, finish };
+}
+
+export function parseCodexRollout(contents: string, threadId: string): CodexRolloutThread {
+  const parser = createRolloutParser(threadId);
+  for (const line of contents.split(/\r?\n/)) parser.push(line);
+  return parser.finish();
+}
+
+/** The same parse, fed from disk, so file size bounds the time it takes and not the memory it needs. */
+export async function readCodexRollout(file: string, threadId: string): Promise<CodexRolloutThread> {
+  const parser = createRolloutParser(threadId);
+  const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
+  try {
+    for await (const line of lines) parser.push(line);
+  } finally {
+    lines.close();
   }
-  return { id: threadId, sessionId: threadId, turns };
+  return parser.finish();
 }
 
 export async function locateCodexRollout(threadId: string, hintedPath?: string | null): Promise<string | null> {
@@ -192,6 +226,29 @@ export async function withCodexRolloutTurns(thread: any, threadId: string): Prom
   try {
     const file = await locateCodexRollout(threadId, typeof thread?.path === "string" ? thread.path : null);
     if (!file) return thread;
-    return mergeRolloutTurns(thread, parseCodexRollout(await fs.readFile(file, "utf8"), threadId).turns);
+    return mergeRolloutTurns(thread, (await readCodexRollout(file, threadId)).turns);
   } catch { return thread; }
+}
+
+export type CodexHistoryRpc = {
+  readThread(threadId: string, timeoutMs?: number): Promise<any>;
+  readThreadSummary(threadId: string, timeoutMs?: number): Promise<any>;
+};
+
+/**
+ * History for a thread, taking the rollout first and the App Server only as a
+ * fallback.
+ *
+ * `thread/read` with `includeTurns` returns the entire conversation in one
+ * WebSocket frame, so its cost grows without bound while the fields syncHistory
+ * actually uses -- the prompt text, its client id, and the final answer -- are
+ * all recoverable from the rollout on disk. Asking for the summary instead
+ * keeps that transfer flat, and the projection is still consulted for a thread
+ * whose rollout has not been written yet, which is the one case the file cannot
+ * answer.
+ */
+export async function readCodexThreadForHistory(rpc: CodexHistoryRpc, threadId: string): Promise<any> {
+  const fromRollout = await withCodexRolloutTurns(historyThreadFromResponse(await rpc.readThreadSummary(threadId)), threadId);
+  if (Array.isArray(fromRollout?.turns) && fromRollout.turns.length) return fromRollout;
+  return withCodexRolloutTurns(historyThreadFromResponse(await rpc.readThread(threadId)), threadId);
 }

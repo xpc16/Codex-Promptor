@@ -23,7 +23,7 @@ import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorH
 import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
-import { withCodexRolloutTurns } from "./codex-history.js";
+import { readCodexThreadForHistory } from "./codex-history.js";
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
 import { entityTag, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
@@ -709,7 +709,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await pty.start(tabId, tab.session.workingDirectory, tuiUrl, { mode: "resume", threadId: tab.session.threadId }, theme);
       await waitForThreadLoaded(rpc, tab.session.threadId, 30_000, 200, () => pty.startupError(tabId));
       await rpc.resumeThread(tab.session.threadId, tab.session.workingDirectory);
-      await syncHistory(storage, tabId, await withCodexRolloutTurns(historyThreadFromResponse(await rpc.readThread(tab.session.threadId)), tab.session.threadId));
+      await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, tab.session.threadId));
       await storage.updateTab(tabId, (current) => ({
         ...current,
         session: { ...current.session, state: "ready", reopenOnLaunch: true, connectedAt: isoNow(), lastError: null },
@@ -1348,7 +1348,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       let threadId = "";
       let report: unknown = null;
       if (mode === "resume") {
-        thread = historyThreadFromResponse(await rpc.readThread(resumeId));
+        // Only the id is taken from this, and `resumeId` already supplies it if
+        // the response does not. Reading the summary rather than the whole
+        // conversation keeps opening a long thread as cheap as opening a short
+        // one; its history arrives from the rollout below.
+        thread = historyThreadFromResponse(await rpc.readThreadSummary(resumeId));
         threadId = String(thread?.id ?? thread?.threadId ?? resumeId);
       }
       if (mode === "resume" && !threadId) throw new Error("THREAD_ID_MISSING");
@@ -1389,7 +1393,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       } else {
         await waitForThreadLoaded(rpc, threadId, 30_000, 200, () => pty.startupError(tabId));
         thread = historyThreadFromResponse(await rpc.resumeThread(threadId, cwd));
-        report = await syncHistory(storage, tabId, await withCodexRolloutTurns(historyThreadFromResponse(await rpc.readThread(threadId)), threadId));
+        report = await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, threadId));
       }
       await storage.updateTab(tabId, (current) => ({
         ...current,
@@ -1450,7 +1454,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         return reply.send({ data: { report: result.report, bundle: await readClientTab(tabId) } });
       }
       const rpc = await codex.get(tabId).ensureReady();
-      const thread = await withCodexRolloutTurns(historyThreadFromResponse(await rpc.readThread(tab.session.threadId)), tab.session.threadId);
+      const thread = await readCodexThreadForHistory(rpc, tab.session.threadId);
       const report = await syncHistory(storage, tabId, thread);
       return reply.send({ data: { report, bundle: await readClientTab(tabId) } });
     } catch (error) { return apiError(reply, 502, "HISTORY_SYNC_FAILED", error instanceof Error ? error.message : String(error), true); }

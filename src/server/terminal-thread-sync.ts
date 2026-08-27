@@ -1,10 +1,12 @@
 import { isoNow } from "../shared/schemas.js";
-import { historyThreadFromResponse, syncHistory, type HistoryReport } from "./history.js";
+import { readCodexThreadForHistory } from "./codex-history.js";
+import { syncHistory, type HistoryReport } from "./history.js";
 import type { StorageService } from "./storage.js";
 import type { TuiThreadSelection } from "./tui-protocol.js";
 
 export type TerminalThreadRpc = {
-  readThread(threadId: string): Promise<any>;
+  readThread(threadId: string, timeoutMs?: number): Promise<any>;
+  readThreadSummary(threadId: string, timeoutMs?: number): Promise<any>;
   resumeThread(threadId: string, cwd: string): Promise<any>;
 };
 
@@ -79,7 +81,7 @@ export async function syncTerminalThreadSelection(options: {
     rebound = true;
 
     await rpc.resumeThread(targetThreadId, announcedCwd);
-    const storedThread = historyThreadFromResponse(await rpc.readThread(targetThreadId));
+    const storedThread = await readCodexThreadForHistory(rpc, targetThreadId);
     const returnedThreadId = nonEmptyString(storedThread?.id ?? storedThread?.threadId);
     if (returnedThreadId && returnedThreadId !== targetThreadId) throw new Error(`TUI_THREAD_ID_MISMATCH:${returnedThreadId}`);
 
