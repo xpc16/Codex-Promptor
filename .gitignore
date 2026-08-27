@@ -12,7 +12,9 @@ data/tabs/*
 data/backups/*
 data/trash/*
 data/private/*
+data/diagnostics/*
 !data/tabs/.gitkeep
 !data/backups/.gitkeep
 !data/trash/.gitkeep
+!data/diagnostics/.gitkeep
 claude_code_sessions_exports.md

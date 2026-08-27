@@ -40,6 +40,8 @@ import {
   type TerminalTrafficKind,
 } from "./terminal-transport.js";
 import { defaultProjectionSchedulerConfig, fullTerminalScreenFrame, TerminalProjectionScheduler } from "./terminal-projection.js";
+import { createTrafficLedger, rollupBuckets, type TrafficLedger } from "./traffic-ledger.js";
+import { createTrafficLog } from "./traffic-log.js";
 import { syncTerminalThreadSelection } from "./terminal-thread-sync.js";
 import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionHandler } from "./tui-protocol.js";
 import { TuiProxyPool } from "./tui-proxy.js";
@@ -123,6 +125,26 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const transportConfig = terminalTransportConfigFromEnv();
   const traffic = new TerminalTrafficMeter();
   const socketSender = new BoundedWebSocketSender(traffic, transportConfig);
+  // What this service sends and receives, by kind, minute by minute. The live
+  // meter above answers "what is this connection doing now"; this answers
+  // "what did we spend bytes on all week", which is the question that decides
+  // what to cut. Disable with CODEX_PROMPTOR_TRAFFIC_LOG=0.
+  const trafficLoggingEnabled = process.env.CODEX_PROMPTOR_TRAFFIC_LOG !== "0";
+  const ledger: TrafficLedger = createTrafficLedger({
+    bucketMs: boundedInteger(process.env.CODEX_PROMPTOR_TRAFFIC_BUCKET_MS, 5_000, 3_600_000, 60_000),
+  });
+  const trafficLog = createTrafficLog(storage.dataDir, {
+    retainedDays: boundedInteger(process.env.CODEX_PROMPTOR_TRAFFIC_RETAIN_DAYS, 1, 365, 14),
+  });
+  const recordTraffic = (
+    direction: "out" | "in",
+    channel: "ws" | "http",
+    type: string,
+    bytes: number,
+    rawBytes?: number,
+  ): void => {
+    if (trafficLoggingEnabled) ledger.record(direction, channel, type, bytes, rawBytes);
+  };
   const terminalResyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const rawResponderOwners = new Map<string, string>();
   const responderLeaseEpochs = new Map<string, number>();
@@ -147,9 +169,14 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
   await recoverTerminalRuntime(storage);
 
-  const sendClient = (client: Client, message: Record<string, unknown>, kind: TerminalTrafficKind): boolean => (
-    socketSender.send(client.id, client.socket, JSON.stringify(message), kind)
-  );
+  const sendClient = (client: Client, message: Record<string, unknown>, kind: TerminalTrafficKind): boolean => {
+    const payload = JSON.stringify(message);
+    const sent = socketSender.send(client.id, client.socket, payload, kind);
+    // Counted only when it actually left: a frame dropped for backpressure
+    // costs no bandwidth, and counting it would hide the drop.
+    if (sent) recordTraffic("out", "ws", String(message.type ?? kind), Buffer.byteLength(payload, "utf8"));
+    return sent;
+  };
 
   const projectionScheduler = new TerminalProjectionScheduler(
     (tabId, viewportRows) => pty.screenSnapshot(tabId, viewportRows),
@@ -740,7 +767,27 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return restoreOpenSessionsPromise;
   };
 
+  // Sealed buckets are appended once a minute, off the hot path. `unref` so a
+  // measurement timer never keeps the process alive on its own.
+  const flushTraffic = async (): Promise<void> => {
+    if (!trafficLoggingEnabled) return;
+    await trafficLog.append(ledger.drain());
+  };
+  const trafficFlushTimer = trafficLoggingEnabled
+    ? setInterval(() => { void flushTraffic(); }, 60_000)
+    : null;
+  trafficFlushTimer?.unref?.();
+  const trafficPruneTimer = trafficLoggingEnabled
+    ? setInterval(() => { void trafficLog.prune(); }, 6 * 60 * 60 * 1_000)
+    : null;
+  trafficPruneTimer?.unref?.();
+  if (trafficLoggingEnabled) void trafficLog.prune();
+
   app.promptor = { storage, codex, claude, cursor, pty, runners, ui, traffic, documents, token, restoreOpenSessions, close: async () => {
+    if (trafficFlushTimer) clearInterval(trafficFlushTimer);
+    if (trafficPruneTimer) clearInterval(trafficPruneTimer);
+    // Seal the minute in progress so a restart does not lose it.
+    await trafficLog.append(ledger.drain(Date.now() + 60_000)).catch(() => undefined);
     ui.stop();
     rawBatcher.close(false);
     projectionScheduler.close();
@@ -767,6 +814,62 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       return reply.code(401).send({ error: { code: "UNAUTHORIZED", message: "Open http://127.0.0.1:4317/ in the local browser." } });
     }
   };
+
+  const payloadBytes = (payload: unknown): number | null => {
+    if (payload === null || payload === undefined) return 0;
+    if (typeof payload === "string") return Buffer.byteLength(payload, "utf8");
+    if (Buffer.isBuffer(payload)) return payload.length;
+    // A stream (a static asset) has no length to read here without consuming
+    // it; the socket delta below still measures it.
+    return null;
+  };
+
+  /**
+   * Roughly what the status line and headers cost. A 304 has no body at all,
+   * so without this it would look free -- and the saving it represents would
+   * be overstated every time it is compared against the 200 it replaced.
+   */
+  const headerBytes = (reply: FastifyReply): number => {
+    let total = 16; // "HTTP/1.1 200 OK\r\n" and the blank line that ends the block
+    for (const [name, value] of Object.entries(reply.getHeaders())) {
+      total += name.length + 4;
+      total += Array.isArray(value) ? value.join(", ").length : String(value ?? "").length;
+    }
+    return total;
+  };
+
+  // Measured on the socket rather than from the payload, because the payload
+  // this hook chain sees is the one *before* @fastify/compress rewrites it:
+  // plugin hooks are added when the plugin loads, not when register() is
+  // called, so hook order cannot be relied on to see the compressed bytes.
+  app.addHook("onRequest", async (request) => {
+    (request as any).trafficSocketStart = Number((request.raw.socket as any)?.bytesWritten ?? Number.NaN);
+  });
+
+  app.addHook("onSend", async (request, _reply, payload) => {
+    (request as any).trafficRawBytes = payloadBytes(payload);
+    return payload;
+  });
+
+  app.addHook("onResponse", async (request, reply) => {
+    if (!trafficLoggingEnabled) return;
+    const route = request.routeOptions?.url ?? request.url.split("?")[0];
+    const start = (request as any).trafficSocketStart;
+    const written = Number((request.raw.socket as any)?.bytesWritten ?? Number.NaN);
+    const raw = (request as any).trafficRawBytes;
+    const body = typeof raw === "number" ? raw : 0;
+    // The socket delta is the truth when it is available: it counts headers,
+    // compression and chunk framing. `inject()` has no real socket, so fall
+    // back to headers plus the uncompressed body.
+    const delta = Number.isFinite(start) && Number.isFinite(written) ? written - start : Number.NaN;
+    const wire = Number.isFinite(delta) && delta > 0 ? delta : headerBytes(reply) + body;
+    recordTraffic("out", "http", `${request.method} ${route} ${reply.statusCode}`, wire, headerBytes(reply) + body);
+
+    const requestBytes = Number(request.headers["content-length"]);
+    if (Number.isFinite(requestBytes) && requestBytes > 0) {
+      recordTraffic("in", "http", `${request.method} ${route}`, requestBytes);
+    }
+  });
 
   await app.register(fastifyCompress, {
     global: true,
@@ -879,6 +982,42 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   });
 
   app.get("/api/diagnostics/terminal-traffic", async (_request, reply) => reply.send({ data: traffic.snapshot() }));
+
+  /**
+   * What this service spent bytes on, by kind.
+   *
+   * `?hours=` selects the window (default 24, max 720). `?buckets=1` adds the
+   * per-minute series behind the rollup for plotting. Anything older than the
+   * in-memory window is read from the daily files, so a week-old question is
+   * still answerable after restarts.
+   */
+  app.get("/api/diagnostics/traffic", async (request, reply) => {
+    const query = (request.query ?? {}) as any;
+    const hours = boundedInteger(query.hours, 1, 720, 24);
+    const sinceMs = hours * 60 * 60 * 1_000;
+    const now = Date.now();
+    const stored = await trafficLog.read(sinceMs, now);
+    const live = ledger.buckets();
+    // A bucket can be in both places: it was appended a minute ago and is
+    // still inside the memory window. Later wins, and both copies are equal.
+    const byStart = new Map(stored.map((bucket) => [bucket.startedAt, bucket]));
+    for (const bucket of live) byStart.set(bucket.startedAt, bucket);
+    const merged = [...byStart.values()]
+      .filter((bucket) => Date.parse(bucket.startedAt) >= now - sinceMs)
+      .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+    return reply.send({ data: {
+      enabled: trafficLoggingEnabled,
+      window: { hours, buckets: merged.length },
+      rollup: rollupBuckets(merged),
+      ...(query.buckets === "1" ? { buckets: merged } : {}),
+    } });
+  });
+
+  app.post("/api/diagnostics/traffic/reset", async (_request, reply) => {
+    ledger.reset();
+    await trafficLog.clear();
+    return reply.send({ data: { cleared: true } });
+  });
 
   app.post("/api/diagnostics/terminal-traffic/reset", async (_request, reply) => {
     traffic.reset();
@@ -1521,6 +1660,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     socket.on("message", async (raw: Buffer) => {
       try {
         const message = JSON.parse(raw.toString()) as any;
+        // Inbound was never measured before. It is small per message but
+        // keystrokes are frequent, and "frequent and small" is exactly the
+        // shape that hides in a total.
+        recordTraffic("in", "ws", String(message?.type ?? "unparsed"), raw.length);
         if (message.type === "subscribe") {
           const previousRawTabs = [...client.terminalSubscriptions.entries()]
             .filter(([, stream]) => stream.mode === "raw")
@@ -1537,7 +1680,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             const subscription = projectionScheduler.subscribe(client.id, tabId, stream, {
               isOpen: () => client.socket.readyState === 1,
               bufferedAmount: () => Number(client.socket.bufferedAmount ?? 0),
-              send: (payload) => socketSender.sendProjection(client.id, client.socket, payload),
+              send: (payload) => {
+                const result = socketSender.sendProjection(client.id, client.socket, payload);
+                if (result === "sent") recordTraffic("out", "ws", "terminal.screen", Buffer.byteLength(payload, "utf8"));
+                return result;
+              },
               dropped: () => traffic.recordProjectionCandidateDropped(client.id, Number(client.socket.bufferedAmount ?? 0)),
             });
             stream.streamId = subscription.streamId;
