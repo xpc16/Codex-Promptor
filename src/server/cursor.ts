@@ -382,12 +382,12 @@ export async function ensureCursorHookBridge(rootDir: string, backupsDir: string
   return { hooksPath, changed: true };
 }
 
-export function buildCursorCommand(cwd: string, launch: CursorLaunch, theme: TerminalTheme = "light"): string {
+export function buildCursorCommand(cwd: string, launch: CursorLaunch, theme: TerminalTheme = "light", exitMarker = CURSOR_EXIT_MARKER): string {
   const foreground = theme === "light" ? "Black" : "Gray";
   const background = theme === "light" ? "White" : "Black";
   const ansi = theme === "light" ? "30;47" : "37;40";
   const resume = launch.mode === "resume" ? ` --resume=${quotePowerShellArg(launch.sessionId)}` : "";
-  return `$env:NO_COLOR = "1"; Set-Location -LiteralPath ${quotePowerShellArg(cwd)}; $Host.UI.RawUI.ForegroundColor = "${foreground}"; $Host.UI.RawUI.BackgroundColor = "${background}"; $promptorEsc = [char]27; Write-Host -NoNewline "$promptorEsc[${ansi}m"; Clear-Host; & agent${resume}; $promptorCursorOk = $?; $promptorCursorExit = $LASTEXITCODE; if ($null -eq $promptorCursorExit) { if ($promptorCursorOk) { $promptorCursorExit = 0 } else { $promptorCursorExit = 1 } }; Write-Output "${CURSOR_EXIT_MARKER}$promptorCursorExit"`;
+  return `$env:NO_COLOR = "1"; Set-Location -LiteralPath ${quotePowerShellArg(cwd)}; $Host.UI.RawUI.ForegroundColor = "${foreground}"; $Host.UI.RawUI.BackgroundColor = "${background}"; $promptorEsc = [char]27; Write-Host -NoNewline "$promptorEsc[${ansi}m"; Clear-Host; & agent${resume}; $promptorCursorOk = $?; $promptorCursorExit = $LASTEXITCODE; if ($null -eq $promptorCursorExit) { if ($promptorCursorOk) { $promptorCursorExit = 0 } else { $promptorCursorExit = 1 } }; Write-Output "${exitMarker}$promptorCursorExit"`;
 }
 
 export async function probeCursorVersion(): Promise<{ available: boolean; version: string | null; error: string | null }> {

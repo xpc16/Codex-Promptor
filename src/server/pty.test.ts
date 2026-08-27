@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildRemoteCodexCommand, parseCodexExitCode, sliceTerminalBuffer, terminalStartupError } from "./pty.js";
+import { buildRemoteCodexCommand, CODEX_EXIT_MARKER, parseAgentExitCode, parseCodexExitCode, sessionExitMarker, sliceTerminalBuffer, terminalStartupError } from "./pty.js";
 
 describe("remote Codex terminal command", () => {
   it("resumes the selected remote thread in the selected working directory", () => {
@@ -27,6 +27,38 @@ describe("remote Codex terminal command", () => {
   it("reads a split-buffer exit marker only after the exit code arrives", () => {
     expect(parseCodexExitCode("output __CODEX_PROMPTOR_EXIT__:")).toBeNull();
     expect(parseCodexExitCode("output __CODEX_PROMPTOR_EXIT__:17\r\nPS>")).toBe(17);
+  });
+
+  it("cannot be told the agent exited by something the agent merely displayed", () => {
+    const marker = sessionExitMarker(CODEX_EXIT_MARKER);
+    // This repository's own sources contain the fixed marker followed by a
+    // number, so an agent working here that shows one of them used to report
+    // itself dead: the banner stuck, and prompt submission stopped.
+    const shownInTheTui = `expect(parseCodexExitCode("output ${CODEX_EXIT_MARKER}17\r\nPS>")).toBe(17);`;
+    expect(parseAgentExitCode(shownInTheTui, marker)).toBeNull();
+    expect(parseAgentExitCode(`${shownInTheTui}\r\n${marker}17\r\n`, marker)).toBe(17);
+  });
+
+  it("gives each session a marker nothing written earlier can contain", () => {
+    const first = sessionExitMarker(CODEX_EXIT_MARKER);
+    const second = sessionExitMarker(CODEX_EXIT_MARKER);
+    expect(first.startsWith(CODEX_EXIT_MARKER)).toBe(true);
+    expect(first).not.toBe(second);
+    expect(parseAgentExitCode(`${first}0\r\n`, second)).toBeNull();
+  });
+
+  it("puts the session marker into the command that will announce it", () => {
+    const marker = sessionExitMarker(CODEX_EXIT_MARKER);
+    const command = buildRemoteCodexCommand("ws://127.0.0.1:4500", { mode: "new" }, "C:\\work", "light", marker);
+    expect(command).toContain(`Write-Output "${marker}$promptorCodexExit"`);
+  });
+
+  it("waits for the number to be finished before believing it", () => {
+    const marker = sessionExitMarker(CODEX_EXIT_MARKER);
+    // A read that ends mid-number would otherwise settle as 1 and latch there,
+    // leaving the real code 17 unreported.
+    expect(parseAgentExitCode(`${marker}1`, marker)).toBeNull();
+    expect(parseAgentExitCode(`${marker}17\r\n`, marker)).toBe(17);
   });
 
   it("surfaces an active writer failure while waiting for the TUI to attach", () => {

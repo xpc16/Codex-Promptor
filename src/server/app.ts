@@ -27,7 +27,7 @@ import { readCodexThreadForHistory } from "./codex-history.js";
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
 import { entityTag, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
-import { CLAUDE_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, type TerminalCursor } from "./pty.js";
+import { CLAUDE_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
 import { RunnerManager } from "./queue.js";
 import { StorageService } from "./storage.js";
 import {
@@ -508,9 +508,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const theme = (await storage.readIndex()).ui.theme;
     const settingsPath = path.join(storage.tabDir(tabId), "cache", "claude-hooks.settings.json");
     const hookScriptPath = path.join(rootDir, "scripts", "claude-hook.mjs");
-    const command = await manager.beginLaunch({ cwd, launch, hookScriptPath, settingsPath, theme });
+    const exitMarker = sessionExitMarker(CLAUDE_EXIT_MARKER);
+    const command = await manager.beginLaunch({ cwd, launch, hookScriptPath, settingsPath, theme, exitMarker });
     await restoreTerminalSize(storage, pty, tabId);
-    await pty.startCommand(tabId, cwd, command, "Claude Code", CLAUDE_EXIT_MARKER, {
+    await pty.startCommand(tabId, cwd, command, "Claude Code", exitMarker, {
       CODEX_PROMPTOR_CLAUDE_HOOK_URL: claudeHookUrl(tabId),
     }, theme);
     const session = await manager.waitForSession(30_000, () => pty.startupError(tabId));
@@ -532,12 +533,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     manager.beginLaunch(cwd);
     const theme = (await storage.readIndex()).ui.theme;
     await restoreTerminalSize(storage, pty, tabId);
+    const exitMarker = sessionExitMarker(CURSOR_EXIT_MARKER);
     await pty.startCommand(
       tabId,
       cwd,
-      buildCursorCommand(cwd, launch, theme),
+      buildCursorCommand(cwd, launch, theme, exitMarker),
       "Cursor CLI",
-      CURSOR_EXIT_MARKER,
+      exitMarker,
       { CODEX_PROMPTOR_CURSOR_HOOK_URL: cursorHookUrl(tabId) },
       theme,
     );

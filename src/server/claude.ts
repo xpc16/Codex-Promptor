@@ -106,13 +106,14 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
     hookScriptPath: string;
     settingsPath: string;
     theme: TerminalTheme;
+    exitMarker: string;
   }): Promise<string> {
     this.reset("Claude Code session is restarting.");
     this.launchReady = deferred<ClaudeSessionInfo>();
     await fs.access(options.hookScriptPath);
     await fs.mkdir(path.dirname(options.settingsPath), { recursive: true });
     await fs.writeFile(options.settingsPath, `${JSON.stringify(buildClaudeHookSettings(options.hookScriptPath), null, 2)}\n`, "utf8");
-    return buildClaudeCommand(options.cwd, options.settingsPath, options.launch, options.theme);
+    return buildClaudeCommand(options.cwd, options.settingsPath, options.launch, options.theme, options.exitMarker);
   }
 
   async waitForSession(timeoutMs = 30_000, startupError?: () => string | null): Promise<ClaudeSessionInfo> {
@@ -407,7 +408,7 @@ export function buildClaudeHookSettings(hookScriptPath: string, nodePath = proce
   };
 }
 
-export function buildClaudeCommand(cwd: string, settingsPath: string, launch: ClaudeLaunch, theme: TerminalTheme = "light"): string {
+export function buildClaudeCommand(cwd: string, settingsPath: string, launch: ClaudeLaunch, theme: TerminalTheme = "light", exitMarker = CLAUDE_EXIT_MARKER): string {
   const foreground = theme === "light" ? "Black" : "Gray";
   const background = theme === "light" ? "White" : "Black";
   const ansi = theme === "light" ? "30;47" : "37;40";
@@ -416,7 +417,7 @@ export function buildClaudeCommand(cwd: string, settingsPath: string, launch: Cl
   // Claude's fullscreen renderer uses the terminal alternate screen, whose
   // contents never enter xterm's native scrollback. Promptor is itself the
   // terminal emulator, so keep Claude on the classic main-screen renderer.
-  return `$env:NO_COLOR = "1"; $env:CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN = "1"; Set-Location -LiteralPath ${quotePowerShellArg(cwd)}; $Host.UI.RawUI.ForegroundColor = "${foreground}"; $Host.UI.RawUI.BackgroundColor = "${background}"; $promptorEsc = [char]27; Write-Host -NoNewline "$promptorEsc[${ansi}m"; Clear-Host; ${invocation}; $promptorClaudeOk = $?; $promptorClaudeExit = $LASTEXITCODE; if ($null -eq $promptorClaudeExit) { if ($promptorClaudeOk) { $promptorClaudeExit = 0 } else { $promptorClaudeExit = 1 } }; Write-Output "${CLAUDE_EXIT_MARKER}$promptorClaudeExit"`;
+  return `$env:NO_COLOR = "1"; $env:CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN = "1"; Set-Location -LiteralPath ${quotePowerShellArg(cwd)}; $Host.UI.RawUI.ForegroundColor = "${foreground}"; $Host.UI.RawUI.BackgroundColor = "${background}"; $promptorEsc = [char]27; Write-Host -NoNewline "$promptorEsc[${ansi}m"; Clear-Host; ${invocation}; $promptorClaudeOk = $?; $promptorClaudeExit = $LASTEXITCODE; if ($null -eq $promptorClaudeExit) { if ($promptorClaudeOk) { $promptorClaudeExit = 0 } else { $promptorClaudeExit = 1 } }; Write-Output "${exitMarker}$promptorClaudeExit"`;
 }
 
 export async function probeClaudeVersion(): Promise<{ available: boolean; version: string | null; error: string | null }> {

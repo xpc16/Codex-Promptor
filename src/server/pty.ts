@@ -15,7 +15,7 @@ export type TerminalLaunch =
 
 type TerminalBuffer = { generation: string; buffer: Buffer; bufferStart: number; nextOffset: number; exitMarker?: string; agentLabel?: string };
 type TerminalSize = { cols: number; rows: number };
-type Session = TerminalBuffer & TerminalSize & { process: pty.IPty; agentExited: boolean; inputPrimed: boolean };
+type Session = TerminalBuffer & TerminalSize & { process: pty.IPty; agentExited: boolean; inputPrimed: boolean; exitScanTail: string };
 
 export type TerminalCursor = { generation?: string | null; nextOffset?: number | null; maxCatchUpBytes?: number | null };
 export type TerminalSnapshot = {
@@ -34,6 +34,24 @@ export const CURSOR_EXIT_MARKER = "__CURSOR_PROMPTOR_EXIT__:";
 // exists only because startCommand takes a marker; matching it would mean the
 // shell announced its own death, which the PTY exit handler reports anyway.
 export const SHELL_EXIT_MARKER = "__SHELL_PROMPTOR_NEVER_EXITS__:";
+
+/**
+ * A sentinel only this PTY session can produce.
+ *
+ * The agent's exit is detected by watching terminal output for a marker that
+ * the surrounding PowerShell prints once the agent returns. Anything else the
+ * terminal ever shows is scanned too, so a fixed marker is forgeable by the
+ * agent's own output: displaying a file that contains it -- this repository's
+ * own sources do -- reports the running agent as dead, silences prompt
+ * submission for the tab, and leaves an error that nothing clears. A fresh id
+ * per session cannot be present in anything written before the session began.
+ */
+export function sessionExitMarker(prefix: string): string {
+  return `${prefix}${randomUUID()}:`;
+}
+
+/** Carried between reads so a marker split across two of them is still matched. */
+const EXIT_SCAN_OVERLAP = 32;
 // Gap between the pasted prompt text and the Enter that submits it, so the
 // agent TUI has a separate read to commit the paste before the key arrives.
 const SUBMIT_ENTER_DELAY_MS = 90;
@@ -48,11 +66,12 @@ export class PtyManager extends EventEmitter {
   private readonly screens = new Map<string, TerminalScreenModel>();
 
   async start(tabId: string, cwd: string, remoteUrl: string, launch: TerminalLaunch, theme: TerminalTheme = "light"): Promise<void> {
-    return this.startCommand(tabId, cwd, buildRemoteCodexCommand(remoteUrl, launch, cwd, theme), "Codex", CODEX_EXIT_MARKER, {}, theme);
+    const exitMarker = sessionExitMarker(CODEX_EXIT_MARKER);
+    return this.startCommand(tabId, cwd, buildRemoteCodexCommand(remoteUrl, launch, cwd, theme, exitMarker), "Codex", exitMarker, {}, theme);
   }
   /** A conversation that is only a PowerShell: no agent, no TUI, no App Server. */
   async startShell(tabId: string, cwd: string, theme: TerminalTheme = "light"): Promise<void> {
-    return this.startCommand(tabId, cwd, buildShellCommand(cwd, theme), "PowerShell", SHELL_EXIT_MARKER, {}, theme);
+    return this.startCommand(tabId, cwd, buildShellCommand(cwd, theme), "PowerShell", sessionExitMarker(SHELL_EXIT_MARKER), {}, theme);
   }
 
   async startCommand(
@@ -104,6 +123,7 @@ export class PtyManager extends EventEmitter {
         rows: initialSize.rows,
         agentExited: false,
         inputPrimed: false,
+        exitScanTail: "",
         exitMarker,
         agentLabel,
       };
@@ -123,12 +143,20 @@ export class PtyManager extends EventEmitter {
           session.bufferStart += overflow;
         }
         this.emitEvent({ tabId, type: "output", generation: session.generation, startOffset, endOffset: session.nextOffset, dataBase64: bytes.toString("base64") });
-        const exitCode = parseAgentExitCode(session.buffer.toString("utf8"), exitMarker);
-        if (exitCode !== null && !session.agentExited) {
-          session.agentExited = true;
-          this.emitEvent(exitCode === 0
-            ? { tabId, type: "state", state: "exited", exitCode }
-            : { tabId, type: "state", state: "error", exitCode, message: `${agentLabel} TUI exited with code ${exitCode}. PowerShell remains available.` });
+        if (!session.agentExited) {
+          // Only the bytes that just arrived, plus enough of the previous read
+          // to span a split marker. Re-scanning the whole rolling buffer made
+          // every byte the terminal had shown in the last megabyte a candidate,
+          // so one glimpse of the marker kept announcing an exit.
+          const scanned = session.exitScanTail + data;
+          session.exitScanTail = scanned.slice(-(exitMarker.length + EXIT_SCAN_OVERLAP));
+          const exitCode = parseAgentExitCode(scanned, exitMarker);
+          if (exitCode !== null) {
+            session.agentExited = true;
+            this.emitEvent(exitCode === 0
+              ? { tabId, type: "state", state: "exited", exitCode }
+              : { tabId, type: "state", state: "error", exitCode, message: `${agentLabel} TUI exited with code ${exitCode}. PowerShell remains available.` });
+          }
         }
       });
       child.onExit(({ exitCode }) => {
@@ -285,14 +313,14 @@ function copyBuffer(source: TerminalBuffer): TerminalBuffer {
   };
 }
 
-export function buildRemoteCodexCommand(remoteUrl: string, launch: TerminalLaunch, cwd: string, theme: TerminalTheme = "light"): string {
+export function buildRemoteCodexCommand(remoteUrl: string, launch: TerminalLaunch, cwd: string, theme: TerminalTheme = "light", exitMarker = CODEX_EXIT_MARKER): string {
   const foreground = theme === "light" ? "Black" : "Gray";
   const background = theme === "light" ? "White" : "Black";
   const ansi = theme === "light" ? "30;47" : "37;40";
   const invocation = launch.mode === "resume"
     ? `& codex resume ${quoteArg(launch.threadId)} --remote ${quoteArg(remoteUrl)} --no-alt-screen -C ${quoteArg(cwd)} -c check_for_update_on_startup=false`
     : `& codex --remote ${quoteArg(remoteUrl)} --no-alt-screen -C ${quoteArg(cwd)} -c check_for_update_on_startup=false`;
-  return `$env:NO_COLOR = \"1\"; Set-Location -LiteralPath ${quoteArg(cwd)}; $Host.UI.RawUI.ForegroundColor = \"${foreground}\"; $Host.UI.RawUI.BackgroundColor = \"${background}\"; $promptorEsc = [char]27; Write-Host -NoNewline \"$promptorEsc[${ansi}m\"; Clear-Host; ${invocation}; $promptorCodexOk = $?; $promptorCodexExit = $LASTEXITCODE; if ($null -eq $promptorCodexExit) { if ($promptorCodexOk) { $promptorCodexExit = 0 } else { $promptorCodexExit = 1 } }; Write-Output \"${CODEX_EXIT_MARKER}$promptorCodexExit\"`;
+  return `$env:NO_COLOR = \"1\"; Set-Location -LiteralPath ${quoteArg(cwd)}; $Host.UI.RawUI.ForegroundColor = \"${foreground}\"; $Host.UI.RawUI.BackgroundColor = \"${background}\"; $promptorEsc = [char]27; Write-Host -NoNewline \"$promptorEsc[${ansi}m\"; Clear-Host; ${invocation}; $promptorCodexOk = $?; $promptorCodexExit = $LASTEXITCODE; if ($null -eq $promptorCodexExit) { if ($promptorCodexOk) { $promptorCodexExit = 0 } else { $promptorCodexExit = 1 } }; Write-Output \"${exitMarker}$promptorCodexExit\"`;
 }
 
 /**
@@ -313,7 +341,9 @@ export function parseCodexExitCode(value: string): number | null {
 
 export function parseAgentExitCode(value: string, marker: string): number | null {
   const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = value.match(new RegExp(`${escaped}(-?\\d+)`));
+  // The trailing non-digit matters: PowerShell writes the code as a whole line,
+  // and a read that ends mid-number would otherwise be believed as "17" -> 1.
+  const match = value.match(new RegExp(`${escaped}(-?\\d+)[^\\d]`));
   if (!match) return null;
   const parsed = Number(match[1]);
   return Number.isSafeInteger(parsed) ? parsed : null;

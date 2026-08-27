@@ -39,6 +39,7 @@ describe("Claude Code provider", () => {
       hookScriptPath: path.join(process.cwd(), "scripts", "claude-hook.mjs"),
       settingsPath: path.join(directory, "settings.json"),
       theme: "light",
+      exitMarker: "__CLAUDE_PROMPTOR_EXIT__:test:",
     });
     await manager.handleHook({ hook_event_name: "SessionStart", session_id: "session-1", cwd: directory, transcript_path: path.join(directory, "session-1.jsonl") });
     expect((await manager.waitForSession()).sessionId).toBe("session-1");
