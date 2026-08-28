@@ -265,7 +265,7 @@ input, textarea, select { color: var(--text); }
 .interrupt-button:hover:not(:disabled) { filter: brightness(.94); }
 .queue-card > .runner-error { flex: none; margin: 8px 0 0; overflow-wrap: anywhere; }
 .status-dot.running { background: var(--primary); box-shadow: 0 0 8px color-mix(in srgb, var(--primary) 55%, transparent); }
-.prompt-list { flex: 1; min-height: 0; overflow-y: auto; display: grid; align-content: start; gap: 8px; margin-top: 10px; padding-right: 3px; overscroll-behavior: contain; }
+.prompt-list { flex: 1; min-height: 0; overflow-y: auto; display: grid; align-content: start; gap: 8px; margin-top: 10px; padding-right: 3px; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .prompt-row { display: grid; grid-template-columns: 24px 18px minmax(0, 1fr) auto; gap: 7px; align-items: start; padding: 10px 9px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel-soft); transition: .14s; }
 .prompt-row:hover { border-color: var(--border-strong); }
 .prompt-row.completed { opacity: .65; background: var(--panel-strong); }
@@ -303,7 +303,10 @@ input, textarea, select { color: var(--text); }
  * two lines up the row is already tall enough to stack them, which keeps the
  * text column wide instead of spending the extra width on buttons.
  */
-.prompt-icon-group { display: flex; align-items: center; gap: 6px; }
+/* Keep the outer footprint identical when multiline switches the buttons from
+   a row (24 + 6 + 24) to a column. Otherwise that switch widens the textarea,
+   which can make it one line again and start a ResizeObserver feedback loop. */
+.prompt-icon-group { width: 54px; flex: 0 0 54px; display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .prompt-row.multiline .prompt-icon-group { flex-direction: column; align-items: flex-end; }
 .add-prompt { flex: none; display: flex; gap: 8px; align-items: stretch; margin-top: 10px; }
 .add-prompt textarea { min-height: 50px; max-height: 110px; resize: vertical; }
