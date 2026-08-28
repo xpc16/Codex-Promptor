@@ -29,7 +29,7 @@ import { MOBILE_PANES, type MobilePane } from "./mobile-pane.js";
 import { dialogSurvivesIndex, nextSelectedTabId, shouldAdoptIndexRevision } from "./index-sync.js";
 import { applyTabMessage } from "./tab-bundle-delta.js";
 import { forgetCachedTab, readCachedTab, rememberTab, retainCachedTabs, windowLimits } from "./tab-cache.js";
-import { CONSOLE_WIDTH, conversationSplit, readPaneSize, readStoredPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
+import { CONSOLE_WIDTH, conversationSplit, queueTerminalSplit, readPaneSize, readStoredPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
 import { isAtBottom, isNearTop, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
 import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
 import { autoSizedHeight, readTextareaMetrics } from "./textarea-autosize.js";
@@ -720,6 +720,11 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
   const sessionSpec = useMemo(() => conversationSplit(tab.id), [tab.id]);
   const [sessionHeight, setSessionHeight] = useState<number | null>(() => readStoredPaneSize(sessionSpec));
   const conversation = useRef<HTMLElement>(null);
+  // The queue/terminal balance belongs to this browser origin. In particular,
+  // dragging it through a tunnel cannot overwrite the loopback layout.
+  const queueTerminalSpec = useMemo(() => queueTerminalSplit(tab.id), [tab.id]);
+  const [queueHeight, setQueueHeight] = useState(() => readPaneSize(queueTerminalSpec));
+  const queuePane = useRef<HTMLElement>(null);
   const [reopening, setReopening] = useState(false);
   const [documentIntent, setDocumentIntent] = useState<DocumentOpenIntent | null>(null);
   const documentIntentId = useRef(0);
@@ -867,6 +872,31 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
     window.addEventListener("pointerup", release, { once: true });
     window.addEventListener("pointercancel", release, { once: true });
   };
+  const dragQueueTerminalHeight = (event: PointerEvent<HTMLDivElement>) => {
+    const pane = queuePane.current;
+    if (!pane) return;
+    const rect = pane.getBoundingClientRect();
+    if (rect.height <= 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    let latest = queueHeight;
+    let released = false;
+    const move = (moveEvent: globalThis.PointerEvent) => {
+      latest = Math.max(queueTerminalSpec.min, Math.min(queueTerminalSpec.max, ((moveEvent.clientY - rect.top) / rect.height) * 100));
+      setQueueHeight(latest);
+    };
+    const release = () => {
+      if (released) return;
+      released = true;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", release);
+      window.removeEventListener("pointercancel", release);
+      writePaneSize(queueTerminalSpec, latest);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", release, { once: true });
+    window.addEventListener("pointercancel", release, { once: true });
+  };
   if (!bundle) return <div className={`tab-view ${active ? "" : "tab-view-hidden"}`} aria-hidden={!active}><div className="loading-pane">{loadError ? <><strong>{t("conversation.loadFailed")}</strong><span>{i18n.errorText(loadError)}</span><button className="ghost" onClick={() => void load()}>{t("action.retry")}</button></> : <><div className="spinner" />{t("conversation.loading")}</>}</div></div>;
   const closed = bundle.tab.session.state === "closed";
   const runnable = bundle.tab.session.state === "ready" && Boolean(bundle.tab.session.threadId);
@@ -909,7 +939,7 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
   return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspace} style={{ gridTemplateColumns: `${leftWidth}fr 7px ${100 - leftWidth}fr` }}>
     <section className="conversation-pane" ref={conversation}>{active && <><SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} onReopen={reopen} onBundle={applyBundle} onError={onError} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
     <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) dragging.current = true; }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
-    <section className="queue-pane">{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} terminalPreference={terminalPreference} projectionSupported={projectionSupported} onTerminalPreferenceChange={onTerminalPreferenceChange} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
+    <section className="queue-pane" ref={queuePane} style={{ gridTemplateRows: `minmax(0, ${queueHeight}fr) 14px minmax(0, ${100 - queueHeight}fr)` }}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} aria-valuenow={Math.round(queueHeight)} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} /><TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} terminalPreference={terminalPreference} projectionSupported={projectionSupported} onTerminalPreferenceChange={onTerminalPreferenceChange} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
   </div></div>;
 }
 

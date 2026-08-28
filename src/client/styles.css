@@ -158,11 +158,12 @@ input, textarea, select { color: var(--text); }
 .tab-view-hidden { visibility: hidden; pointer-events: none; }
 .tab-workspace { width: 100%; height: 100%; min-height: 0; display: grid; overflow: hidden; padding: 16px; }
 .conversation-pane, .queue-pane { min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
-.conversation-pane { display: flex; flex-direction: column; gap: 14px; padding-right: 11px; }
-.queue-pane { display: grid; grid-template-rows: minmax(250px, 1.08fr) minmax(220px, .92fr); gap: 14px; padding-left: 11px; }
+.conversation-pane { display: flex; flex-direction: column; gap: 0; padding-right: 11px; }
+.queue-pane { display: grid; gap: 0; padding-left: 11px; }
 .splitter { width: 7px; height: 100%; border-left: 2px solid transparent; border-right: 2px solid transparent; }
 .splitter.disabled { cursor: not-allowed; opacity: .38; }
 .splitter.disabled:hover, .splitter.disabled:active { background: transparent; border-color: transparent; }
+.queue-terminal-splitter { min-height: 14px; cursor: row-resize; touch-action: none; }
 
 .session-card, .answers, .queue-card, .terminal-card { min-width: 0; min-height: 0; border: 1px solid var(--border); border-radius: 13px; background: var(--panel); box-shadow: var(--shadow); }
 .session-card { flex: none; max-height: 47%; overflow-x: hidden; overflow-y: auto; padding: 17px; }
@@ -201,11 +202,9 @@ input, textarea, select { color: var(--text); }
 .danger-action { padding: 8px 12px; border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--danger) 9%, var(--panel)); color: var(--danger); font-weight: 700; }
 .danger-action:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 16%, var(--panel)); }
 
-/* The session card sizes itself to its content until this is dragged, at which
-   point App.tsx sets an explicit height from this browser's own storage. */
-.session-splitter { flex: none; height: 9px; margin: -9px 0 -8px; border-radius: 5px; cursor: row-resize; touch-action: none; }
-.session-splitter::after { content: ""; display: block; width: 46px; height: 3px; margin: 3px auto; border-radius: 3px; background: var(--border-strong); transition: background .14s; }
-.session-splitter:hover::after, .session-splitter:active::after { background: var(--primary); }
+/* These transparent gaps are the drag targets. They deliberately have no
+   centered dash: the adjacent cards already make the split unambiguous. */
+.session-splitter { flex: none; height: 14px; cursor: row-resize; touch-action: none; }
 
 .answers { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .answers-heading { flex: none; display: flex; align-items: center; gap: 8px; padding: 13px 15px 10px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
@@ -491,7 +490,8 @@ input, textarea, select { color: var(--text); }
   .tab-workspace { grid-template-columns: 1fr !important; grid-template-rows: minmax(0, 1fr); padding: 10px; }
   .tab-workspace > .splitter { display: none; }
   .conversation-pane, .queue-pane { grid-area: 1 / 1; padding: 0; }
-  .queue-pane { grid-template-rows: minmax(0, 1fr); }
+  .queue-pane { grid-template-rows: minmax(0, 1fr) !important; }
+  .queue-terminal-splitter { display: none; }
   .queue-card, .terminal-card { grid-area: 1 / 1; min-height: 0; }
   .app-shell[data-mobile-pane="queue"] .conversation-pane,
   .app-shell[data-mobile-pane="terminal"] .conversation-pane,

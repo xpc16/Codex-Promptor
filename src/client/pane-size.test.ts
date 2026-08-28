@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampPaneSize, CONSOLE_WIDTH, readPaneSize, workspaceSplit, writePaneSize, type PaneStore } from "./pane-size.js";
+import { clampPaneSize, CONSOLE_WIDTH, queueTerminalSplit, readPaneSize, workspaceSplit, writePaneSize, type PaneStore } from "./pane-size.js";
 
 function fakeStore(initial: Record<string, string> = {}): PaneStore & { map: Map<string, string> } {
   const map = new Map(Object.entries(initial));
@@ -38,6 +38,19 @@ describe("browser-local pane sizes", () => {
     writePaneSize(first, 30, store);
     expect(readPaneSize(first, store)).toBe(30);
     expect(readPaneSize(second, store)).toBe(60);
+  });
+
+  it("keeps queue and terminal heights local to each browser and conversation", () => {
+    const localStore = fakeStore();
+    const remoteStore = fakeStore();
+    const first = queueTerminalSplit("tab-1");
+    const second = queueTerminalSplit("tab-2");
+
+    writePaneSize(first, 67, remoteStore);
+
+    expect(readPaneSize(first, remoteStore)).toBe(67);
+    expect(readPaneSize(first, localStore)).toBe(54);
+    expect(readPaneSize(second, remoteStore)).toBe(54);
   });
 
   it("degrades to the default when the browser denies storage", () => {

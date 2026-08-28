@@ -30,6 +30,17 @@ export function conversationSplit(tabId: string): PaneSizeSpec {
   return { key: `${KEY_PREFIX}session.${tabId}`, fallback: 38, min: 12, max: 80 };
 }
 
+/**
+ * How much of the right column belongs to the prompt queue.
+ *
+ * Like the other pane dimensions, this is intentionally browser-local. A
+ * tunnel viewer can make room for a phone-sized terminal without changing the
+ * layout seen at the loopback URL on the workstation.
+ */
+export function queueTerminalSplit(tabId: string): PaneSizeSpec {
+  return { key: `${KEY_PREFIX}queue-terminal.${tabId}`, fallback: 54, min: 20, max: 80 };
+}
+
 export function clampPaneSize(value: number, spec: PaneSizeSpec): number {
   if (!Number.isFinite(value)) return spec.fallback;
   return Math.max(spec.min, Math.min(spec.max, value));
