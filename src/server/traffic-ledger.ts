@@ -15,17 +15,39 @@
  */
 
 export type TrafficDirection = "out" | "in";
-export type TrafficChannel = "ws" | "http";
+/**
+ * `ws` and `http` count application messages; `wire` counts what a socket
+ * actually wrote or read over an interval.
+ *
+ * They are separate channels because they answer different questions and are
+ * measured differently. A `ws` entry has `rawBytes === bytes` by construction
+ * -- the sender knows one number, the serialized payload -- so its ratio is
+ * always 1 and means nothing. Only a `wire` entry carries a real compression
+ * ratio, because there `bytes` is the socket delta and `rawBytes` is the sum
+ * of the payloads that produced it.
+ */
+export type TrafficChannel = "ws" | "http" | "wire";
+
+/** Fixed size classes, in bytes. Upper bound of each class; the last is unbounded. */
+export const SIZE_CLASSES = [256, 1024, 4096, 16_384, 65_536, 262_144, 1_048_576, Number.POSITIVE_INFINITY] as const;
 
 export type TrafficEntry = {
   /** Messages or responses. */
   count: number;
   /** Bytes as they left this process: post-compression for HTTP, pre-deflate for WebSocket. */
   bytes: number;
-  /** Bytes before any compression, so the ratio is visible. */
+  /** Bytes before any compression, so the ratio is visible. Meaningful on the `wire` channel only. */
   rawBytes: number;
   /** The single largest one seen, which is how outliers get found. */
   max: number;
+  /**
+   * How many fell into each size class, aligned with SIZE_CLASSES.
+   *
+   * A mean hides the shape that matters most here: 500 MB can be a million
+   * small frames or four hundred snapshots, and the two call for opposite
+   * fixes. Optional so buckets written before this existed still parse.
+   */
+  sizes?: number[];
 };
 
 export type TrafficBucket = {
@@ -43,8 +65,8 @@ export type TrafficRollup = {
 };
 
 export const DEFAULT_BUCKET_MS = 60_000;
-/** Route patterns and message types are a small fixed set; this only guards a bug. */
-export const DEFAULT_MAX_KEYS = 250;
+/** Route patterns, message types and three network scopes are a small fixed set; this only guards a bug. */
+export const DEFAULT_MAX_KEYS = 400;
 /** 24h of one-minute buckets, so a day is always answerable without reading files. */
 export const DEFAULT_RETAINED_BUCKETS = 1_440;
 
@@ -57,7 +79,7 @@ export type TrafficLedgerOptions = {
 };
 
 export type TrafficLedger = {
-  record(direction: TrafficDirection, channel: TrafficChannel, type: string, bytes: number, rawBytes?: number, at?: number): void;
+  record(direction: TrafficDirection, channel: TrafficChannel, type: string, bytes: number, options?: TrafficRecordOptions): void;
   /** Buckets that are complete as of `at`, removed from the pending set so a writer can append them once. */
   drain(at?: number): TrafficBucket[];
   /** The rolling in-memory window, oldest first, including the bucket still filling. */
@@ -66,9 +88,29 @@ export type TrafficLedger = {
   reset(): void;
 };
 
-export function trafficKey(direction: TrafficDirection, channel: TrafficChannel, type: string): string {
+export type TrafficRecordOptions = {
+  /** Bytes before compression. Defaults to `bytes`; only the `wire` channel has a different value. */
+  rawBytes?: number;
+  /** Which link this travelled over. Omitted for records that are not per-connection. */
+  scope?: string;
+  at?: number;
+};
+
+export function trafficKey(direction: TrafficDirection, channel: TrafficChannel, type: string, scope?: string): string {
   const cleaned = String(type).trim().replace(/\s+/g, " ").slice(0, 120) || "unknown";
-  return `${direction}:${channel}:${cleaned}`;
+  const link = scope ? `${String(scope).trim().slice(0, 16)}:` : "";
+  return `${direction}:${channel}:${link}${cleaned}`;
+}
+
+export function sizeClassIndex(bytes: number): number {
+  for (let index = 0; index < SIZE_CLASSES.length; index += 1) {
+    if (bytes <= SIZE_CLASSES[index]) return index;
+  }
+  return SIZE_CLASSES.length - 1;
+}
+
+function emptySizes(): number[] {
+  return new Array(SIZE_CLASSES.length).fill(0);
 }
 
 export function createTrafficLedger(options: TrafficLedgerOptions = {}): TrafficLedger {
@@ -104,15 +146,16 @@ export function createTrafficLedger(options: TrafficLedgerOptions = {}): Traffic
 
   const toBucket = (start: number, entries: Map<string, TrafficEntry>): TrafficBucket => ({
     startedAt: new Date(start).toISOString(),
-    entries: Object.fromEntries([...entries.entries()].map(([key, entry]) => [key, { ...entry }])),
+    entries: Object.fromEntries([...entries.entries()].map(([key, entry]) => [key, { ...entry, ...(entry.sizes ? { sizes: [...entry.sizes] } : {}) }])),
   });
 
   return {
-    record(direction, channel, type, bytes, rawBytes, at = Date.now()) {
+    record(direction, channel, type, bytes, options = {}) {
+      const { rawBytes, scope, at = Date.now() } = options;
       const size = Number.isFinite(bytes) ? Math.max(0, Math.trunc(bytes)) : 0;
       const raw = Number.isFinite(rawBytes as number) ? Math.max(0, Math.trunc(rawBytes as number)) : size;
       const entries = entriesFor(at);
-      const wanted = trafficKey(direction, channel, type);
+      const wanted = trafficKey(direction, channel, type, scope);
       // Once the key space is full, further kinds fold into one bucket rather
       // than letting an unexpected high-cardinality key grow without bound.
       const key = entries.has(wanted) || entries.size < maxKeys ? wanted : trafficKey(direction, channel, OVERFLOW_KEY);
@@ -122,8 +165,11 @@ export function createTrafficLedger(options: TrafficLedgerOptions = {}): Traffic
         entry.bytes += size;
         entry.rawBytes += raw;
         entry.max = Math.max(entry.max, size);
+        (entry.sizes ??= emptySizes())[sizeClassIndex(size)] += 1;
       } else {
-        entries.set(key, { count: 1, bytes: size, rawBytes: raw, max: size });
+        const sizes = emptySizes();
+        sizes[sizeClassIndex(size)] = 1;
+        entries.set(key, { count: 1, bytes: size, rawBytes: raw, max: size, sizes });
       }
       trim();
     },
@@ -199,4 +245,9 @@ function addInto(target: TrafficEntry, entry: TrafficEntry): void {
   target.bytes += entry.bytes;
   target.rawBytes += entry.rawBytes;
   target.max = Math.max(target.max, entry.max);
+  if (!entry.sizes) return;
+  target.sizes ??= new Array(SIZE_CLASSES.length).fill(0);
+  for (let index = 0; index < entry.sizes.length && index < target.sizes.length; index += 1) {
+    target.sizes[index] += entry.sizes[index] ?? 0;
+  }
 }

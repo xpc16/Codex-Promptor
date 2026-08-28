@@ -42,6 +42,7 @@ import {
 } from "./terminal-transport.js";
 import { defaultProjectionSchedulerConfig, fullTerminalScreenFrame, TerminalProjectionScheduler } from "./terminal-projection.js";
 import { createTrafficLedger, rollupBuckets, type TrafficLedger } from "./traffic-ledger.js";
+import { classifyNetworkScope, type NetworkScope } from "./traffic-scope.js";
 import { createTrafficLog } from "./traffic-log.js";
 import { syncTerminalThreadSelection } from "./terminal-thread-sync.js";
 import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionHandler } from "./tui-protocol.js";
@@ -78,6 +79,16 @@ type Client = {
   terminalSubscriptions: Map<string, TerminalStream>;
   wantsIndex: boolean;
   wantsDetails: boolean;
+  /** Which link this connection is on, decided once from the socket and the Host it arrived under. */
+  scope: NetworkScope;
+  /** The socket underneath the WebSocket, where the only real byte counters live. */
+  netSocket: { bytesWritten?: number; bytesRead?: number } | null;
+  /** Counter values at the last sample, so each interval is attributed to its own bucket. */
+  wireOutAt: number;
+  wireInAt: number;
+  /** Serialized payload sent since the last sample, which is the numerator of the compression ratio. */
+  payloadOut: number;
+  payloadIn: number;
 };
 
 export type RestoreOpenSessionsSummary = {
@@ -140,12 +151,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   });
   const recordTraffic = (
     direction: "out" | "in",
-    channel: "ws" | "http",
+    channel: "ws" | "http" | "wire",
     type: string,
     bytes: number,
-    rawBytes?: number,
+    options: { rawBytes?: number; scope?: NetworkScope } = {},
   ): void => {
-    if (trafficLoggingEnabled) ledger.record(direction, channel, type, bytes, rawBytes);
+    if (trafficLoggingEnabled) ledger.record(direction, channel, type, bytes, options);
   };
   const terminalResyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const rawResponderOwners = new Map<string, string>();
@@ -171,13 +182,59 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
   await recoverTerminalRuntime(storage);
 
+  /**
+   * The ledger key for one outbound message.
+   *
+   * `terminal.output` used to cover both live PTY bytes and a full buffer
+   * replay, which put 97% of a day's bytes behind one name that answered
+   * nothing. The sender already knows which it is -- it passes the kind -- so
+   * the two now separate, and a projection frame says whether it is a full
+   * repaint or a delta.
+   */
+  const trafficTypeOf = (message: Record<string, unknown>, kind: TerminalTrafficKind): string => {
+    const type = String(message.type ?? kind);
+    if (type === "terminal.output") return kind === "terminal.snapshot" ? "terminal.output.snapshot" : "terminal.output.live";
+    if (type === "terminal.screen") return message.full === true ? "terminal.screen.full" : "terminal.screen.delta";
+    return type;
+  };
+
   const sendClient = (client: Client, message: Record<string, unknown>, kind: TerminalTrafficKind): boolean => {
     const payload = JSON.stringify(message);
     const sent = socketSender.send(client.id, client.socket, payload, kind);
     // Counted only when it actually left: a frame dropped for backpressure
     // costs no bandwidth, and counting it would hide the drop.
-    if (sent) recordTraffic("out", "ws", String(message.type ?? kind), Buffer.byteLength(payload, "utf8"));
+    if (sent) {
+      const bytes = Buffer.byteLength(payload, "utf8");
+      client.payloadOut += bytes;
+      recordTraffic("out", "ws", trafficTypeOf(message, kind), bytes, { scope: client.scope });
+    }
     return sent;
+  };
+
+  /**
+   * What a connection actually put on the wire since the last sample.
+   *
+   * Per-message wire attribution is not possible: several messages share a TLS
+   * record, and with context takeover a frame's compressed size depends on the
+   * frames before it. The connection boundary is where the question can be
+   * answered honestly, so `bytes` here is the socket delta and `rawBytes` is
+   * the payload that produced it -- their ratio is the only real compression
+   * ratio this service records.
+   */
+  const sampleConnectionWire = (client: Client): void => {
+    if (!trafficLoggingEnabled) return;
+    const written = Number(client.netSocket?.bytesWritten ?? Number.NaN);
+    const read = Number(client.netSocket?.bytesRead ?? Number.NaN);
+    if (Number.isFinite(written) && written > client.wireOutAt) {
+      recordTraffic("out", "wire", "socket", written - client.wireOutAt, { rawBytes: client.payloadOut, scope: client.scope });
+      client.wireOutAt = written;
+      client.payloadOut = 0;
+    }
+    if (Number.isFinite(read) && read > client.wireInAt) {
+      recordTraffic("in", "wire", "socket", read - client.wireInAt, { rawBytes: client.payloadIn, scope: client.scope });
+      client.wireInAt = read;
+      client.payloadIn = 0;
+    }
   };
 
   const projectionScheduler = new TerminalProjectionScheduler(
@@ -780,6 +837,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   // measurement timer never keeps the process alive on its own.
   const flushTraffic = async (): Promise<void> => {
     if (!trafficLoggingEnabled) return;
+    // Sample before draining: a connection open for hours would otherwise
+    // contribute nothing until it closed, and then land in the wrong minute.
+    for (const client of clients) sampleConnectionWire(client);
     await trafficLog.append(ledger.drain());
   };
   const trafficFlushTimer = trafficLoggingEnabled
@@ -873,11 +933,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     // back to headers plus the uncompressed body.
     const delta = Number.isFinite(start) && Number.isFinite(written) ? written - start : Number.NaN;
     const wire = Number.isFinite(delta) && delta > 0 ? delta : headerBytes(reply) + body;
-    recordTraffic("out", "http", `${request.method} ${route} ${reply.statusCode}`, wire, headerBytes(reply) + body);
+    const scope = classifyNetworkScope(request.raw.socket?.remoteAddress, request.headers.host);
+    recordTraffic("out", "http", `${request.method} ${route} ${reply.statusCode}`, wire, { rawBytes: headerBytes(reply) + body, scope });
 
     const requestBytes = Number(request.headers["content-length"]);
     if (Number.isFinite(requestBytes) && requestBytes > 0) {
-      recordTraffic("in", "http", `${request.method} ${route}`, requestBytes);
+      recordTraffic("in", "http", `${request.method} ${route}`, requestBytes, { scope });
     }
   });
 
@@ -1093,9 +1154,27 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const merged = [...byStart.values()]
       .filter((bucket) => Date.parse(bucket.startedAt) >= now - sinceMs)
       .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+    const observedBucketSeconds = merged.length * 60;
     return reply.send({ data: {
+      // Bumped when a field changes meaning. v1 pooled every connection into
+      // one total and reported rates over the minutes that happened to have
+      // records, which read like a wall-clock average and was not one.
+      schemaVersion: 2,
       enabled: trafficLoggingEnabled,
-      window: { hours, buckets: merged.length },
+      generatedAt: new Date(now).toISOString(),
+      requestedSeconds: Math.round(sinceMs / 1_000),
+      observedBucketSeconds,
+      processUptimeSeconds: Math.round(process.uptime()),
+      // `bytesPerSecond` divides by the minutes that carried records, not by
+      // the requested window. A service that was idle or down contributed no
+      // minutes, so the two differ and only this one is a per-active-minute rate.
+      rateBasis: "observed-buckets",
+      window: {
+        hours,
+        buckets: merged.length,
+        requestedSeconds: Math.round(sinceMs / 1_000),
+        observedSeconds: observedBucketSeconds,
+      },
       rollup: rollupBuckets(merged),
       ...(query.buckets === "1" ? { buckets: merged } : {}),
     } });
@@ -1736,6 +1815,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   app.get("/ws", { websocket: true }, (socket, request) => {
     const queryToken = (request.query as any)?.token;
     if (!noAuth && queryToken !== token && !isTrustedBrowserRequest(request.headers, trustedHosts)) { socket.close(1008, "Unauthorized"); return; }
+    // The peer address comes from the socket and cannot be forged; the Host
+    // header only splits the loopback half, because a relay on this machine
+    // reaches the origin from 127.0.0.1 exactly like the local browser does.
+    const netSocket = (socket as any)?._socket ?? request.raw?.socket ?? null;
     const client: Client = {
       id: traffic.register(socket),
       socket,
@@ -1743,11 +1826,19 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       terminalSubscriptions: new Map(),
       wantsIndex: false,
       wantsDetails: true,
+      scope: classifyNetworkScope(netSocket?.remoteAddress, request.headers?.host),
+      netSocket,
+      wireOutAt: Number(netSocket?.bytesWritten ?? 0),
+      wireInAt: Number(netSocket?.bytesRead ?? 0),
+      payloadOut: 0,
+      payloadIn: 0,
     };
     clients.add(client);
     ui.connect();
     socket.on("close", () => {
       if (!clients.delete(client)) return;
+      // A connection that lived and died between two flushes still spent bytes.
+      sampleConnectionWire(client);
       const rawTabs = [...client.terminalSubscriptions.entries()]
         .filter(([, stream]) => stream.mode === "raw")
         .map(([tabId]) => tabId);
@@ -1762,7 +1853,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         // Inbound was never measured before. It is small per message but
         // keystrokes are frequent, and "frequent and small" is exactly the
         // shape that hides in a total.
-        recordTraffic("in", "ws", String(message?.type ?? "unparsed"), raw.length);
+        client.payloadIn += raw.length;
+        recordTraffic("in", "ws", String(message?.type ?? "unparsed"), raw.length, { scope: client.scope });
         if (message.type === "subscribe") {
           const previousRawTabs = [...client.terminalSubscriptions.entries()]
             .filter(([, stream]) => stream.mode === "raw")
@@ -1781,7 +1873,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
               bufferedAmount: () => Number(client.socket.bufferedAmount ?? 0),
               send: (payload) => {
                 const result = socketSender.sendProjection(client.id, client.socket, payload);
-                if (result === "sent") recordTraffic("out", "ws", "terminal.screen", Buffer.byteLength(payload, "utf8"));
+                if (result === "sent") {
+                  const bytes = Buffer.byteLength(payload, "utf8");
+                  client.payloadOut += bytes;
+                  recordTraffic("out", "ws", payload.includes('"full":true') ? "terminal.screen.full" : "terminal.screen.delta", bytes, { scope: client.scope });
+                }
                 return result;
               },
               dropped: () => traffic.recordProjectionCandidateDropped(client.id, Number(client.socket.bufferedAmount ?? 0)),
