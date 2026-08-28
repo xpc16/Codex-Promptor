@@ -295,9 +295,16 @@ input, textarea, select { color: var(--text); }
 .delete-button:hover { color: var(--danger); }
 .link-button { color: var(--primary); font-size: 11px; }
 .link-button:hover { text-decoration: underline; }
-.prompt-edit-button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 1px solid var(--border); border-radius: 5px; background: var(--panel); color: var(--primary); font-size: 15px; line-height: 1; }
-.prompt-edit-button:hover:not(:disabled) { border-color: var(--primary); background: var(--primary-soft); }
-.insert-now-button { font-weight: 700; }
+.prompt-edit-button, .prompt-send-button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 1px solid var(--border); border-radius: 5px; background: var(--panel); color: var(--primary); font-size: 15px; line-height: 1; }
+.prompt-edit-button:hover:not(:disabled), .prompt-send-button:hover:not(:disabled) { border-color: var(--primary); background: var(--primary-soft); }
+.send-icon { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+/*
+ * One line leaves no vertical room, so the two controls sit side by side. From
+ * two lines up the row is already tall enough to stack them, which keeps the
+ * text column wide instead of spending the extra width on buttons.
+ */
+.prompt-icon-group { display: flex; align-items: center; gap: 6px; }
+.prompt-row.multiline .prompt-icon-group { flex-direction: column; align-items: flex-end; }
 .add-prompt { flex: none; display: flex; gap: 8px; align-items: stretch; margin-top: 10px; }
 .add-prompt textarea { min-height: 50px; max-height: 110px; resize: vertical; }
 .compose-tools { display: grid; grid-template-rows: 1fr 1fr; gap: 5px; }
@@ -398,10 +405,11 @@ input, textarea, select { color: var(--text); }
 .document-link { color: var(--primary); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; cursor: pointer; }
 .blocked-link { color: var(--danger); text-decoration: line-through; }
 .document-view { position: absolute; inset: 0; z-index: 4; display: flex; min-width: 0; min-height: 0; flex-direction: column; background: var(--panel); color: var(--text); }
-.document-toolbar { flex: none; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--border); background: var(--panel-strong); }
+.document-toolbar { flex: none; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, max-content) max-content; align-items: center; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--border); background: var(--panel-strong); }
 .document-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 750; }
-.document-progress { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.document-progress { min-width: 0; overflow: hidden; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
 .document-toolbar .compact { padding: 5px 8px; font-size: 11px; }
+.document-close { position: relative; z-index: 1; min-width: max-content; justify-self: end; white-space: nowrap; }
 .document-scroll { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 15px 17px 22px; background: var(--panel); }
 .document-text, .document-markdown-pending { margin: 0; color: var(--text); font: 13px/1.62 "Cascadia Code", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .document-markdown { font-size: 14px; }

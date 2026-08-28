@@ -32,7 +32,7 @@ import { forgetCachedTab, readCachedTab, rememberTab, retainCachedTabs, windowLi
 import { CONSOLE_WIDTH, conversationSplit, queueTerminalSplit, readPaneSize, readStoredPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
 import { isAtBottom, isNearTop, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
 import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
-import { autoSizedHeight, readTextareaMetrics } from "./textarea-autosize.js";
+import { autoSizedHeight, autoSizedLines, readTextareaMetrics } from "./textarea-autosize.js";
 import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenState } from "./terminal-projection.js";
 import { readTerminalTransportPreference, resolveTerminalTransportPreference, writeTerminalTransportPreference } from "./terminal-preference.js";
 import { createConnectionAlarm, reconnectDelay } from "./socket-retry.js";
@@ -1152,13 +1152,33 @@ function LazyDialogFallback({ label }: { label: string }) {
  * the column is resized. The observer compares widths only: reacting to the
  * height it just set would loop.
  */
-function useAutoSizedTextarea(ref: { current: HTMLTextAreaElement | null }, text: string, editing: boolean) {
+/**
+ * Sizes the box to its content and reports how many lines that came to, so the
+ * row can lay its controls out around a one-line prompt differently from a
+ * wrapped one.
+ */
+/**
+ * Send: a right-pointing arrow whose tail is notched inward, with a short
+ * stroke running right out of that notch. The queue's other control is a
+ * glyph, so this is drawn as strokes at the same weight rather than filled.
+ */
+function SendIcon() {
+  return <svg className="send-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+    <path d="M3.4 3.6 20.6 12 3.4 20.4 6.4 12Z" />
+    <path d="M6.4 12h6.2" />
+  </svg>;
+}
+
+function useAutoSizedTextarea(ref: { current: HTMLTextAreaElement | null }, text: string, editing: boolean): number {
   const measuredWidth = useRef(0);
+  const [lines, setLines] = useState(1);
   const resize = useCallback(() => {
     const element = ref.current;
     if (!element) return;
     element.style.height = "auto";
-    element.style.height = `${autoSizedHeight(readTextareaMetrics(element))}px`;
+    const metrics = readTextareaMetrics(element);
+    element.style.height = `${autoSizedHeight(metrics)}px`;
+    setLines(autoSizedLines(metrics));
   }, [ref]);
   useLayoutEffect(() => { resize(); }, [resize, text, editing]);
   useEffect(() => {
@@ -1174,6 +1194,7 @@ function useAutoSizedTextarea(ref: { current: HTMLTextAreaElement | null }, text
     observer.observe(element);
     return () => observer.disconnect();
   }, [ref, resize]);
+  return lines;
 }
 
 /**
@@ -1203,7 +1224,7 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
   const [editing, setEditing] = useState(false);
   const [insertingNow, setInsertingNow] = useState(false);
   const editor = useRef<HTMLTextAreaElement>(null);
-  useAutoSizedTextarea(editor, text, editing);
+  const promptLines = useAutoSizedTextarea(editor, text, editing);
   useEffect(() => { setText(prompt.text); setEditing(false); }, [prompt.text, prompt.status]);
   const beginEdit = () => { if (!editable) return; setEditing(true); requestAnimationFrame(() => { editor.current?.focus({ preventScroll: true }); editor.current?.select(); }); };
   const save = async () => {
@@ -1236,7 +1257,7 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", release, { once: true });
   };
   const nativeDragStart = (event: DragEvent<HTMLDivElement>) => { if ((event.target as HTMLElement).closest("textarea, button")) { event.preventDefault(); return; } event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", prompt.id); onNativeDragStart(prompt.id); };
-  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button>}{pendingStatus && <button className="link-button insert-now-button" disabled={locked || insertingNow || editing} title={t("queue.insertNowHelp")} onClick={() => void insertNow()}>{t(insertingNow ? "queue.insertingNow" : "queue.insertNow")}</button>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
+  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""} ${promptLines > 1 ? "multiline" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || insertingNow || editing} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
 function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, terminalPreference, projectionSupported, onTerminalPreferenceChange, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; terminalPreference: TerminalTransportPreference; projectionSupported: boolean; onTerminalPreferenceChange: (value: TerminalTransportPreference) => void; onBundle: (bundle: TabBundle) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {
@@ -1304,6 +1325,18 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     const term = new Terminal({ ...(initialSize ?? (projectionMode ? { cols: 80, rows: 20 } : {})), cursorBlink: false, cursorStyle: "block", cursorInactiveStyle: "none", fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 14, lineHeight: 1.18, theme: getTerminalTheme(themeRef.current), scrollback: projectionMode ? 0 : 5000, allowProposedApi: false });
     host.current.classList.toggle("projection", projectionMode);
     const fit = new FitAddon(); term.loadAddon(fit); term.open(host.current); term.blur(); terminal.current = term;
+    // A wheel event can become a terminal input event when the running TUI
+    // enables mouse tracking, when xterm is in its alternate buffer, or in
+    // projection mode where there is no local scrollback. Keep command history
+    // keyboard-only: ordinary raw-buffer scrolling is still handled locally.
+    term.attachCustomWheelEventHandler((event) => {
+      const mouseTrackingActive = term.modes.mouseTrackingMode !== "none";
+      const alternateBufferActive = term.buffer.active.type === "alternate";
+      if (!projectionMode && !mouseTrackingActive && !alternateBufferActive) return true;
+      event.preventDefault();
+      event.stopPropagation();
+      return false;
+    });
     const cursorQuietScheduler = new TerminalCursorQuietScheduler((suppressed) => {
       host.current?.classList.toggle("terminal-updating", suppressed);
     });

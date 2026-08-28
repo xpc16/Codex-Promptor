@@ -21,12 +21,23 @@ export type TextareaMetrics = {
   maxLines?: number;
 };
 
-export function autoSizedHeight({ scrollHeight, lineHeight, padding, border, maxLines = PROMPT_ROW_MAX_LINES }: TextareaMetrics): number {
+/**
+ * How many lines the box will show, capped.
+ *
+ * The row's controls arrange themselves around this: one line leaves no room
+ * beside the text for two buttons side by side, two or three lines do.
+ */
+export function autoSizedLines({ scrollHeight, lineHeight, padding, maxLines = PROMPT_ROW_MAX_LINES }: TextareaMetrics): number {
   const cap = Math.max(1, Math.trunc(maxLines));
-  if (!Number.isFinite(lineHeight) || lineHeight <= 0) return Math.max(0, scrollHeight) + Math.max(0, border);
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0) return 1;
   const content = Math.max(0, (Number.isFinite(scrollHeight) ? scrollHeight : 0) - Math.max(0, padding));
-  const lines = Math.min(cap, Math.max(1, Math.round(content / lineHeight)));
-  return Math.round(lines * lineHeight + Math.max(0, padding) + Math.max(0, border));
+  return Math.min(cap, Math.max(1, Math.round(content / lineHeight)));
+}
+
+export function autoSizedHeight(metrics: TextareaMetrics): number {
+  const { scrollHeight, lineHeight, padding, border } = metrics;
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0) return Math.max(0, scrollHeight) + Math.max(0, border);
+  return Math.round(autoSizedLines(metrics) * lineHeight + Math.max(0, padding) + Math.max(0, border));
 }
 
 /** The vertical metrics of a laid-out text box, read once per measurement. */
