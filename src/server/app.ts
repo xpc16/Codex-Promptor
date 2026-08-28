@@ -43,6 +43,7 @@ import {
 import { defaultProjectionSchedulerConfig, fullTerminalScreenFrame, TerminalProjectionScheduler } from "./terminal-projection.js";
 import { createTrafficLedger, rollupBuckets, type TrafficLedger } from "./traffic-ledger.js";
 import { classifyNetworkScope, type NetworkScope } from "./traffic-scope.js";
+import { buildIndexDelta, indexDeltaIsEmpty } from "../shared/index-delta.js";
 import { createTrafficLog } from "./traffic-log.js";
 import { syncTerminalThreadSelection } from "./terminal-thread-sync.js";
 import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionHandler } from "./tui-protocol.js";
@@ -89,6 +90,8 @@ type Client = {
   /** Serialized payload sent since the last sample, which is the numerator of the compression ratio. */
   payloadOut: number;
   payloadIn: number;
+  /** The index revision this client was last sent, so the next one can be a delta. */
+  indexRevision: number | null;
 };
 
 export type RestoreOpenSessionsSummary = {
@@ -321,10 +324,35 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   // group move or reorder made in one browser has to reach all the others —
   // otherwise a phone and the desktop drift apart until someone reloads, and
   // the stale one can overwrite the fresh one on the next reorder.
+  // The index carries every tab's metadata, so one tab's timestamp moving used
+  // to resend all of them -- 13.5KB a time, 88 times in a measured hour, 10% of
+  // everything crossing the tunnel. A client that is holding the previous
+  // revision gets only what changed; anyone else still gets the whole thing.
+  let previousIndex: IndexFile | null = null;
+  const sendIndex = (client: Client, index: IndexFile): void => {
+    const base = previousIndex;
+    if (base && base.revision === client.indexRevision && index.revision !== base.revision) {
+      const delta = buildIndexDelta(base, index);
+      // A write that changed nothing viewers can see is not worth a frame,
+      // but the client's revision still has to move or it falls back to full.
+      if (indexDeltaIsEmpty(delta)) { client.indexRevision = index.revision; return; }
+      // A delta is not smaller by definition: on a two-tab index its
+      // bookkeeping costs more than the tabs it avoids repeating. Send
+      // whichever encoding actually is, so this can never make things worse.
+      const asDelta = { type: "index.changed", delta };
+      const smaller = JSON.stringify(asDelta).length < JSON.stringify({ type: "index.changed", index }).length
+        ? asDelta
+        : { type: "index.changed", index };
+      if (sendClient(client, smaller, "index")) client.indexRevision = index.revision;
+      return;
+    }
+    if (sendClient(client, { type: "index.changed", index }, "index")) client.indexRevision = index.revision;
+  };
   const broadcastIndex = (index: IndexFile) => {
     for (const client of clients) {
-      if (client.wantsIndex) sendClient(client, { type: "index.changed", index }, "index");
+      if (client.wantsIndex) sendIndex(client, index);
     }
+    previousIndex = index;
   };
   storage.onIndexChanged(broadcastIndex);
   storage.onTabChanged((tabId, tab) => emit(tabId, { type: "tab.changed", tab }, true));
@@ -967,7 +995,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         serverNoContextTakeover: true,
         clientNoContextTakeover: true,
         concurrencyLimit: 4,
-        threshold: 1024,
+        // Below this a message is sent uncompressed. At 1024 the tunnel's main
+        // traffic fell entirely underneath it: 80% of projection deltas over a
+        // measured hour were under 1KiB, so that link ran at 1.53x while the
+        // local one -- which carries a few large snapshots -- reached 3.12x.
+        // The bench puts 512 at 1.6-1.9x on exactly those shapes. Tune with
+        // CODEX_PROMPTOR_WS_DEFLATE_THRESHOLD to A/B it against real traffic.
+        threshold: boundedInteger(process.env.CODEX_PROMPTOR_WS_DEFLATE_THRESHOLD, 0, 65_536, 512),
         zlibDeflateOptions: { level: 3, memLevel: 7 },
       } : false,
     },
@@ -1832,6 +1866,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       wireInAt: Number(netSocket?.bytesRead ?? 0),
       payloadOut: 0,
       payloadIn: 0,
+      indexRevision: null,
     };
     clients.add(client);
     ui.connect();
@@ -1861,7 +1896,14 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             .map(([tabId]) => tabId);
           projectionScheduler.unsubscribeClient(client.id);
           client.stateSubscriptions = parseTabSubscriptions(message.tabIds);
-          client.terminalSubscriptions = parseTerminalSubscriptions(message.terminals);
+          // A remote catch-up has no business replaying the whole ring buffer:
+          // that is the 1.33MB message the ledger kept finding. The cap already
+          // existed but only applied when the client asked for it, and the one
+          // path that needs it most -- a reconnect -- never did.
+          client.terminalSubscriptions = parseTerminalSubscriptions(
+            message.terminals,
+            client.scope === "local" ? null : REMOTE_RAW_CATCH_UP_BYTES,
+          );
           client.wantsIndex = message.index === true;
           client.wantsDetails = message.details !== false;
           traffic.setRole(client.id, client.stateSubscriptions.size > 0 || client.wantsIndex, client.terminalSubscriptions.size > 0);
@@ -1912,7 +1954,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           // A reconnecting page missed every change made while it was away
           // (a phone that slept, a tunnel that dropped). Replay current
           // navigation on subscribe so it resyncs without a reload.
-          if (client.wantsIndex) sendClient(client, { type: "index.changed", index: await storage.readIndex() }, "index");
+          // Subscribe always replays the whole index: this is the path a
+          // reconnecting page uses precisely because it cannot know what it missed.
+          if (client.wantsIndex) {
+            const index = await storage.readIndex();
+            if (sendClient(client, { type: "index.changed", index }, "index")) client.indexRevision = index.revision;
+          }
           if (message.snapshots !== false) {
             for (const tabId of client.stateSubscriptions) {
               try {
@@ -2087,7 +2134,10 @@ function parseTabSubscriptions(value: unknown): Set<string> {
   return new Set(ids);
 }
 
-function parseTerminalSubscriptions(value: unknown): Map<string, TerminalStream> {
+/** What a non-local reconnect may replay at most when it does not ask for less. */
+const REMOTE_RAW_CATCH_UP_BYTES = 64 * 1024;
+
+export function parseTerminalSubscriptions(value: unknown, defaultCatchUpBytes: number | null = null): Map<string, TerminalStream> {
   const result = new Map<string, TerminalStream>();
   if (!value || typeof value !== "object" || Array.isArray(value)) return result;
   for (const [tabId, rawConfig] of Object.entries(value).slice(0, 64)) {
@@ -2112,7 +2162,7 @@ function parseTerminalSubscriptions(value: unknown): Map<string, TerminalStream>
         nextOffset: Number.isSafeInteger(nextOffset) && nextOffset >= 0 ? nextOffset : null,
         ...(Number.isSafeInteger(maxCatchUpBytes) && maxCatchUpBytes >= 0
           ? { maxCatchUpBytes: Math.min(64 * 1024, maxCatchUpBytes) }
-          : {}),
+          : defaultCatchUpBytes !== null ? { maxCatchUpBytes: defaultCatchUpBytes } : {}),
       },
       streamId: randomUUID(),
       sequence: 0,

@@ -33,6 +33,8 @@ import { CONSOLE_WIDTH, conversationSplit, queueTerminalSplit, readPaneSize, rea
 import { isAtBottom, isNearTop, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
 import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
 import { autoSizedHeight, autoSizedLines, readTextareaMetrics } from "./textarea-autosize.js";
+import { createInputCoalescer } from "./input-coalescer.js";
+import { applyIndexDelta } from "../shared/index-delta.js";
 import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenState } from "./terminal-projection.js";
 import { readTerminalTransportPreference, resolveTerminalTransportPreference, writeTerminalTransportPreference } from "./terminal-preference.js";
 import { createConnectionAlarm, reconnectDelay } from "./socket-retry.js";
@@ -120,6 +122,7 @@ type AppDialog =
 
 export function App() {
   const [index, setIndex] = useState<IndexFile | null>(null);
+  const indexRef = useRef<IndexFile | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [service, setService] = useState<any>(null);
   const [error, setError] = useState<unknown | null>(null);
@@ -177,6 +180,9 @@ export function App() {
   const adoptIndex = useCallback((next: IndexFile) => {
     if (!shouldAdoptIndexRevision(next.revision, appliedRevision.current)) return;
     appliedRevision.current = next.revision;
+    // The socket effect does not re-run when the index changes, so an index
+    // delta has to read the current one from a ref rather than from state.
+    indexRef.current = next;
     // Pane widths are deliberately absent here: they live in this browser's own
     // storage, so a push from another viewer never resizes what you are using.
     setIndex(next);
@@ -276,8 +282,16 @@ export function App() {
           markRecentCompletion(tabId, completedAt, true);
         } else if (message.type === "service.changed") {
           setService((current: any) => ({ ...(current ?? {}), codex: message.codex }));
-        } else if (message.type === "index.changed" && message.index) {
-          adoptIndex(message.index as IndexFile);
+        } else if (message.type === "index.changed") {
+          if (message.index) adoptIndex(message.index as IndexFile);
+          else if (message.delta) {
+            // A delta that does not line up with what this page holds cannot be
+            // applied halfway. Re-subscribing is the existing path that replays
+            // the whole index, so ask for that instead of guessing.
+            const next = indexRef.current ? applyIndexDelta(indexRef.current, message.delta) : null;
+            if (next) adoptIndex(next);
+            else socket?.send(JSON.stringify({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {} }));
+          }
         }
       };
       socket.onclose = () => {
@@ -298,7 +312,11 @@ export function App() {
   }, []);
 
   const updatePreferences = useCallback(async (patch: Partial<IndexFile["ui"]>) => {
-    setIndex((current) => current ? { ...current, ui: { ...current.ui, ...patch } } : current);
+    setIndex((current) => {
+      const next = current ? { ...current, ui: { ...current.ui, ...patch } } : current;
+      indexRef.current = next;
+      return next;
+    });
     try { adoptIndex(await api<IndexFile>("/api/preferences", { method: "PATCH", body: JSON.stringify(patch) })); }
     catch (reason) { setError(reason); await refresh(); }
   }, [adoptIndex, refresh]);
@@ -1411,10 +1429,18 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       }).catch(() => finishTerminalUpdate(sequence));
     };
     const protocol = location.protocol === "https:" ? "wss" : "ws";
-    const sendInputNow = (data: string) => {
+    const writeInput = (data: string) => {
       const ws = socket.current;
-      if (documentVisibleRef.current || (!projectionMode && !rawLeaseWritable)) return;
       if (!closedRef.current && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "terminal.input", tabId, dataBase64: encodeBase64(data) }));
+    };
+    // One frame per character: 3,682 of them in a measured hour, all 92 bytes,
+    // none compressed. Typed characters are batched for less time than the gap
+    // between keystrokes; anything that is a command rather than a character
+    // goes out with whatever is buffered, in order.
+    const inputCoalescer = createInputCoalescer(writeInput);
+    const sendInputNow = (data: string) => {
+      if (documentVisibleRef.current || (!projectionMode && !rawLeaseWritable)) return;
+      inputCoalescer.push(data);
     };
     const flushProjectionInput = () => {
       if (projectionRenderPending > 0 || pendingProjectionInput.length === 0) return;
@@ -1746,6 +1772,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       terminalWriteSequence += 1;
       observer.disconnect();
       inputDisposable.dispose(); foregroundQuery.dispose(); backgroundQuery.dispose(); colorSchemeQuery.dispose(); cursorBlinkOn.dispose(); cursorBlinkOff.dispose();
+      inputCoalescer.flush(); inputCoalescer.dispose();
       closeSocketQuietly(socket.current); term.dispose(); terminal.current = null; socket.current = null;
     };
   }, [tabId, transportMode]);
