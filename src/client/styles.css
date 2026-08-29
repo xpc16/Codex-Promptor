@@ -326,7 +326,11 @@ input, textarea, select { color: var(--text); }
 .prompt-icon-group { width: 54px; flex: 0 0 54px; display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .prompt-row.multiline .prompt-icon-group { flex-direction: column; align-items: flex-end; }
 .add-prompt { flex: none; display: flex; gap: 8px; align-items: stretch; margin-top: 10px; }
-.add-prompt textarea { height: 50px; min-height: 50px; max-height: min(45vh, 420px); resize: vertical; overflow-y: auto; }
+.prompt-composer { position: relative; flex: 1 1 auto; min-width: 0; height: 50px; min-height: 50px; max-height: min(45vh, 420px); }
+.prompt-composer textarea { display: block; width: 100%; height: 100%; min-height: 0; max-height: none; resize: none; overflow-y: auto; }
+.prompt-composer-resizer { position: absolute; z-index: 2; top: -5px; right: 0; left: 0; height: 10px; cursor: ns-resize; touch-action: none; outline: 0; }
+.prompt-composer-resizer::after { content: ""; position: absolute; top: 4px; right: 8px; left: 8px; height: 2px; border-radius: 2px; background: transparent; }
+.prompt-composer-resizer:hover::after, .prompt-composer-resizer:focus-visible::after { background: color-mix(in srgb, var(--primary) 58%, transparent); }
 .compose-tools { display: grid; grid-template-rows: 1fr 1fr; gap: 5px; }
 .compose-tool { width: 34px; min-height: 0; display: grid; place-items: center; padding: 4px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--panel-soft); color: var(--muted); }
 .compose-tool:hover { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); }
