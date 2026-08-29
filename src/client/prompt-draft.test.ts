@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { clearPromptDraft, createDraftStore, MAX_DRAFT_LENGTH, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
+import {
+  clearPromptDraft,
+  createDraftStore,
+  createSessionFormDraftStore,
+  MAX_DRAFT_LENGTH,
+  readPromptDraft,
+  readSessionFormDraft,
+  writePromptDraft,
+  writeSessionFormDraft,
+} from "./prompt-draft.js";
 
 describe("prompt composer drafts", () => {
   it("survives the queue remounting when another page is opened", () => {
@@ -50,5 +59,21 @@ describe("prompt composer drafts", () => {
     const store = createDraftStore();
     writePromptDraft("", "orphan", store);
     expect(readPromptDraft("", store)).toBe("");
+  });
+});
+
+describe("session setup page cache", () => {
+  it("keeps setup fields per conversation without browser or server storage", () => {
+    const store = createSessionFormDraftStore();
+    const fallback = { provider: "codex" as const, mode: "new" as const, workingDirectory: "", resumeId: "" };
+    writeSessionFormDraft("tab-1", { provider: "claude", mode: "resume", workingDirectory: "D:\\work", resumeId: "session-1" }, store);
+
+    expect(readSessionFormDraft("tab-1", fallback, store)).toEqual({
+      provider: "claude",
+      mode: "resume",
+      workingDirectory: "D:\\work",
+      resumeId: "session-1",
+    });
+    expect(readSessionFormDraft("tab-2", fallback, store)).toEqual(fallback);
   });
 });

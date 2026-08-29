@@ -32,7 +32,7 @@ import { forgetCachedTab, readCachedTab, rememberTab, retainCachedTabs, windowLi
 import { clampPaneSize, CONSOLE_WIDTH, conversationSplit, queueTerminalSplit, readPaneSize, readStoredPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
 import { onPaneDragEnd, PaneDrag, paneDragActive } from "./pane-drag.js";
 import { isAtBottom, isNearTop, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
-import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
+import { clearPromptDraft, readPromptDraft, readSessionFormDraft, writePromptDraft, writeSessionFormDraft } from "./prompt-draft.js";
 import { autoSizedHeight, autoSizedLines, readTextareaMetrics } from "./textarea-autosize.js";
 import { createInputCoalescer } from "./input-coalescer.js";
 import { applyIndexDelta } from "../shared/index-delta.js";
@@ -997,54 +997,28 @@ function orderedTabIds(tabs: TabMeta[], groupId: string | null): string[] {
 function SessionPanel({ bundle, height, reopening, onReopen, onBundle, onError }: { bundle: TabBundle; height: number | null; reopening: boolean; onReopen: () => Promise<void>; onBundle: (bundle: TabBundle) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
-  const [cwd, setCwd] = useState(bundle.tab.session.workingDirectory ?? "");
-  const [mode, setMode] = useState<"new" | "resume">(bundle.tab.session.launchMode);
-  const [provider, setProvider] = useState<AgentProvider>(bundle.tab.session.provider);
-  const [resumeId, setResumeId] = useState(bundle.tab.session.threadId ? "" : bundle.tab.session.sessionId ?? "");
+  const session = bundle.tab.session;
+  const initialDraft = useRef(readSessionFormDraft(bundle.tab.id, {
+    provider: session.state === "unconfigured" ? "codex" : session.provider,
+    mode: "new",
+    workingDirectory: session.state === "unconfigured" ? "" : session.workingDirectory ?? "",
+    resumeId: "",
+  })).current;
+  const [cwd, setCwd] = useState(initialDraft.workingDirectory);
+  const [mode, setMode] = useState<"new" | "resume">(initialDraft.mode);
+  const [provider, setProvider] = useState<AgentProvider>(initialDraft.provider);
+  const [resumeId, setResumeId] = useState(initialDraft.resumeId);
   const [busy, setBusy] = useState(false);
   const [browsing, setBrowsing] = useState(false);
-  const session = bundle.tab.session;
   const restoring = session.state === "connecting" && Boolean(session.threadId && session.workingDirectory);
   const connected = session.state === "ready" || session.state === "closed" || restoring;
   const localFolderPicker = isLoopbackHostname(location.hostname);
-  const draftRef = useRef({ provider, mode, workingDirectory: cwd, resumeId });
-  draftRef.current = { provider, mode, workingDirectory: cwd, resumeId };
-  const savedDraftKey = useRef(JSON.stringify(draftRef.current));
-  const queuedDraftKey = useRef(savedDraftKey.current);
-  const draftSave = useRef<Promise<void>>(Promise.resolve());
-  const connectedRef = useRef(connected);
-  connectedRef.current = connected;
-  const persistDraft = useCallback((draft = draftRef.current): Promise<void> => {
-    const key = JSON.stringify(draft);
-    if (key === queuedDraftKey.current) return draftSave.current;
-    queuedDraftKey.current = key;
-    // Serialize small draft writes so network reordering cannot restore an old
-    // path or provider after a newer choice.
-    draftSave.current = draftSave.current.then(async () => {
-      try {
-        await api(`/api/tabs/${bundle.tab.id}`, { method: "PATCH", body: JSON.stringify({ sessionDraft: draft }) });
-        savedDraftKey.current = key;
-      } catch (reason) {
-        if (queuedDraftKey.current === key) queuedDraftKey.current = savedDraftKey.current;
-        onError(reason);
-      }
-    });
-    return draftSave.current;
-  }, [bundle.tab.id, onError]);
-  // Coalesce typing into one small update; selection changes and blur flush it
-  // immediately below. The unmount flush also covers switching conversations.
   useEffect(() => {
-    if (connected || JSON.stringify(draftRef.current) === queuedDraftKey.current) return;
-    const timer = window.setTimeout(() => { void persistDraft(); }, 650);
-    return () => window.clearTimeout(timer);
-  }, [connected, cwd, mode, persistDraft, provider, resumeId]);
-  useEffect(() => () => {
-    if (!connectedRef.current) void persistDraft(draftRef.current);
-  }, [persistDraft]);
+    writeSessionFormDraft(bundle.tab.id, { provider, mode, workingDirectory: cwd, resumeId });
+  }, [bundle.tab.id, cwd, mode, provider, resumeId]);
   const connect = async () => {
     setBusy(true);
     try {
-      await persistDraft();
       const result = await api<{ bundle: TabBundle }>(`/api/tabs/${bundle.tab.id}/session`, jsonBody({ provider, mode, workingDirectory: cwd, resumeId }));
       onBundle(result.bundle);
     }
@@ -1056,10 +1030,7 @@ function SessionPanel({ bundle, height, reopening, onReopen, onBundle, onError }
     setBrowsing(true);
     try {
       const result = await api<{ path: string | null }>("/api/dialog/select-directory", jsonBody({ initialPath: cwd }));
-      if (result.path) {
-        setCwd(result.path);
-        void persistDraft({ ...draftRef.current, workingDirectory: result.path });
-      }
+      if (result.path) setCwd(result.path);
     } catch (reason) { onError(reason); }
     finally { setBrowsing(false); }
   };
@@ -1083,10 +1054,10 @@ function SessionPanel({ bundle, height, reopening, onReopen, onBundle, onError }
   return <div className="session-card" style={height === null ? undefined : { height: `${height}%`, maxHeight: "none" }}>
     <div className="section-title"><span className="section-icon">◌</span><div><strong>{sessionTitle}</strong><small>{sessionHelp}</small></div></div>
     {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t("session.workingDirectory")}</span><code>{session.workingDirectory}</code></div>{session.provider !== "shell" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <button className="danger-action" disabled={busy} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>}</div></div> : <>
-      <label className="field-label">{t(localFolderPicker ? "session.localPath" : "session.remotePath")}</label><div className={`path-row ${localFolderPicker ? "" : "remote"}`}><input value={cwd} title={cwd} onChange={(event) => setCwd(event.target.value)} onBlur={() => void persistDraft()} placeholder={t("session.pathExample")} />{localFolderPicker && <button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button>}</div>{!localFolderPicker && <small className="field-hint">{t("session.remotePathHint")}</small>}{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}
-      {!isShell && <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => { setMode("new"); void persistDraft({ ...draftRef.current, mode: "new" }); }}>{t("session.createNew")}</button><button className={mode === "resume" ? "active" : ""} onClick={() => { setMode("resume"); void persistDraft({ ...draftRef.current, mode: "resume" }); }}>{t("session.resumeOld")}</button></div>}
-      {!isShell && mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} onBlur={() => void persistDraft()} placeholder={t("session.resumePlaceholder")} />}
-      <div className="connect-row"><button className="primary connect" disabled={busy || (!isShell && !cwd.trim())} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button><select value={provider} disabled={busy} onChange={(event) => { const next = event.target.value as AgentProvider; setProvider(next); void persistDraft({ ...draftRef.current, provider: next }); }} aria-label={providerName}><option value="codex">{t("provider.codex")}</option><option value="claude">{t("provider.claude")}</option><option value="cursor">{t("provider.cursor")}</option><option value="shell">{t("provider.shell")}</option></select></div>
+      <label className="field-label">{t(localFolderPicker ? "session.localPath" : "session.remotePath")}</label><div className={`path-row ${localFolderPicker ? "" : "remote"}`}><input value={cwd} title={cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t("session.pathExample")} />{localFolderPicker && <button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button>}</div>{!localFolderPicker && <small className="field-hint">{t("session.remotePathHint")}</small>}{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}
+      {!isShell && <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => setMode("new")}>{t("session.createNew")}</button><button className={mode === "resume" ? "active" : ""} onClick={() => setMode("resume")}>{t("session.resumeOld")}</button></div>}
+      {!isShell && mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} placeholder={t("session.resumePlaceholder")} />}
+      <div className="connect-row"><button className="primary connect" disabled={busy || (!isShell && !cwd.trim())} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button><select value={provider} disabled={busy} onChange={(event) => setProvider(event.target.value as AgentProvider)} aria-label={providerName}><option value="codex">{t("provider.codex")}</option><option value="claude">{t("provider.claude")}</option><option value="cursor">{t("provider.cursor")}</option><option value="shell">{t("provider.shell")}</option></select></div>
     </>}
     {session.lastError && <div className="inline-error">{i18n.errorText(session.lastError)}</div>}
   </div>;
@@ -1139,6 +1110,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   const [adding, setAdding] = useState(false);
   const [runnerAction, setRunnerAction] = useState<"start" | "pause" | "interrupt" | null>(null);
   const nativeDragSource = useRef<string | null>(null);
+  const nativeDragTarget = useRef<string | null>(null);
   const reorderInFlight = useRef(false);
   const threadId = bundle.tab.session.threadId;
   const currentAnswerPromptIds = new Set(bundle.answers.answers
@@ -1194,7 +1166,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     reorderInFlight.current = true;
     try { onChanged(await api(`/api/tabs/${bundle.tab.id}/prompts/order`, { method: "PUT", body: JSON.stringify({ sourceId, targetId }) })); }
     catch (reason) { onError(reason); }
-    finally { reorderInFlight.current = false; nativeDragSource.current = null; }
+    finally { reorderInFlight.current = false; nativeDragSource.current = null; nativeDragTarget.current = null; }
   };
   const runnerState = runnerLabel(i18n, runtime);
   const completedCount = bundle.window?.prompts.completed ?? prompts.filter((item) => item.status === "completed").length;
@@ -1218,7 +1190,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   };
   return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : runnerIsWorking(runtime.runner.state) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "start"} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
-    <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t(notebookOnly ? "queue.notebookEmpty" : "queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} executionDisabled={!runnable} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
+    <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t(notebookOnly ? "queue.notebookEmpty" : "queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} executionDisabled={!runnable} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; if (!sourceId) nativeDragTarget.current = null; }} onNativeDragTarget={(targetId) => { if (nativeDragSource.current) nativeDragTarget.current = targetId; }} onNativeDrop={() => { const sourceId = nativeDragSource.current; const targetId = nativeDragTarget.current; nativeDragSource.current = null; nativeDragTarget.current = null; if (sourceId && targetId) void reorder(sourceId, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}
     <div className="add-prompt"><textarea ref={composer} disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><div className="compose-tools"><button className="compose-tool" disabled={!runnable} title={t(runnable ? "queue.timers" : "queue.connectForTimers")} aria-label={t("queue.timers")} onClick={() => { if (!runnable) return; setTimerMounted(true); setTimerOpen(true); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3 4 6M17 3l3 3M5.5 11a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm6.5-3v3.5l2.2 1.4M8 19l-1.5 2M16 19l1.5 2" /></svg></button><button className="compose-tool" title={t("queue.commonPrompts")} aria-label={t("queue.commonPrompts")} onClick={openCommonPrompts}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></svg></button></div><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
     {timerMounted && <Suspense fallback={timerOpen ? <LazyDialogFallback label={t("queue.timers")} /> : null}><TimerDialog open={timerOpen} tabId={tabId} sessionReady={runnable && !isShell} currentThreadId={bundle.tab.session.threadId} provider={bundle.tab.session.provider} onClose={() => setTimerOpen(false)} onError={onError} /></Suspense>}
@@ -1303,7 +1275,7 @@ function handoffPromptTextareaWheel(event: ReactWheelEvent<HTMLDivElement>) {
   promptList.scrollTop += delta;
 }
 
-function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, onNativeDragStart, onNativeDragEnter, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; executionDisabled: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragEnter: (targetId: string) => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
+function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, onNativeDragStart, onNativeDragTarget, onNativeDrop, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; executionDisabled: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragTarget: (targetId: string) => void; onNativeDrop: () => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   const editable = !locked && !["completed", "running", "dispatching"].includes(prompt.status);
@@ -1338,14 +1310,12 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
   const pointerUp = (event: PointerEvent<HTMLDivElement>) => { if (event.pointerType === "mouse") return; event.currentTarget.classList.remove("dragging"); if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); const targetId = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>(".prompt-row.pending")?.dataset.promptId; if (pending && targetId) onDrop(prompt.id, targetId); };
   const mouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (!pending || event.button !== 0 || (event.target as HTMLElement).closest("textarea, button")) return;
-    const handle = event.currentTarget.querySelector<HTMLElement>(".drag-handle") ?? event.currentTarget; handle.classList.add("dragging"); let completed = false;
-    const cleanup = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", release); handle.classList.remove("dragging"); };
-    const move = (moveEvent: globalThis.MouseEvent) => { const targetId = document.elementFromPoint(moveEvent.clientX, moveEvent.clientY)?.closest<HTMLElement>(".prompt-row.pending")?.dataset.promptId; if (targetId && targetId !== prompt.id && !completed) { completed = true; cleanup(); onDrop(prompt.id, targetId); } };
-    const release = (releaseEvent: globalThis.MouseEvent) => { if (!completed) { const targetId = document.elementFromPoint(releaseEvent.clientX, releaseEvent.clientY)?.closest<HTMLElement>(".prompt-row.pending")?.dataset.promptId; if (targetId && targetId !== prompt.id) onDrop(prompt.id, targetId); } cleanup(); };
-    window.addEventListener("mousemove", move); window.addEventListener("mouseup", release, { once: true });
+    const handle = event.currentTarget.querySelector<HTMLElement>(".drag-handle") ?? event.currentTarget; handle.classList.add("dragging");
+    const release = (releaseEvent: globalThis.MouseEvent) => { const targetId = document.elementFromPoint(releaseEvent.clientX, releaseEvent.clientY)?.closest<HTMLElement>(".prompt-row.pending")?.dataset.promptId; handle.classList.remove("dragging"); if (targetId && targetId !== prompt.id) onDrop(prompt.id, targetId); };
+    window.addEventListener("mouseup", release, { once: true });
   };
   const nativeDragStart = (event: DragEvent<HTMLDivElement>) => { if ((event.target as HTMLElement).closest("textarea, button")) { event.preventDefault(); return; } event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", prompt.id); onNativeDragStart(prompt.id); };
-  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""} ${promptMultiline ? "multiline" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || executionDisabled || insertingNow || editing} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked || executionDisabled} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked || executionDisabled} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
+  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""} ${promptMultiline ? "multiline" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDragOver={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDrop={(event) => { if (!pending) return; event.preventDefault(); event.stopPropagation(); onNativeDrop(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || executionDisabled || insertingNow || editing} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked || executionDisabled} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked || executionDisabled} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
 function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, terminalPreference, projectionSupported, onTerminalPreferenceChange, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; terminalPreference: TerminalTransportPreference; projectionSupported: boolean; onTerminalPreferenceChange: (value: TerminalTransportPreference) => void; onBundle: (bundle: TabBundle) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {

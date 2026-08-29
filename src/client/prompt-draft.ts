@@ -1,3 +1,5 @@
+import type { AgentProvider } from "../shared/schemas.js";
+
 /**
  * A prompt typed but not yet queued is unsaved work, and it used to live only
  * in React state -- switching conversations unmounts the queue, so the text was
@@ -32,6 +34,43 @@ export function createDraftStore(): DraftStore {
 
 /** The store backing the composer for this page. */
 const pageDrafts = createDraftStore();
+
+export type SessionFormDraft = {
+  provider: AgentProvider;
+  mode: "new" | "resume";
+  workingDirectory: string;
+  resumeId: string;
+};
+
+export type SessionFormDraftStore = Map<string, SessionFormDraft>;
+
+/** Setup fields have the same lifetime as a composer draft: this page only. */
+export function createSessionFormDraftStore(): SessionFormDraftStore {
+  return new Map();
+}
+
+const pageSessionFormDrafts = createSessionFormDraftStore();
+
+export function readSessionFormDraft(
+  tabId: string,
+  fallback: SessionFormDraft,
+  store: SessionFormDraftStore = pageSessionFormDrafts,
+): SessionFormDraft {
+  return tabId && store.has(tabId) ? { ...store.get(tabId)! } : { ...fallback };
+}
+
+export function writeSessionFormDraft(
+  tabId: string,
+  draft: SessionFormDraft,
+  store: SessionFormDraftStore = pageSessionFormDrafts,
+): void {
+  if (!tabId) return;
+  store.set(tabId, {
+    ...draft,
+    workingDirectory: draft.workingDirectory.slice(0, 2_048),
+    resumeId: draft.resumeId.slice(0, 512),
+  });
+}
 
 export function readPromptDraft(tabId: string, store: DraftStore = pageDrafts): string {
   return tabId ? store.get(tabId) : "";
