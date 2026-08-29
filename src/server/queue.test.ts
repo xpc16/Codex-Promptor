@@ -432,13 +432,13 @@ describe("insert now", () => {
       } as unknown as AppServerManager;
       const runner = new QueueRunner(tab.id, storage, codex);
 
-      const result = await runner.insertNow(pending.id);
+      const result = await runner.insertNow(pending.id, "  修改后的追加要求  ");
       const updated = (await storage.readTab(tab.id)).prompts.prompts[0];
 
       expect(result).toEqual({ mode: "steered", turnId: "turn-active" });
       expect(calls).toHaveLength(1);
-      expect(calls[0]?.slice(0, 3)).toEqual(["thread-steer", "turn-active", "追加要求"]);
-      expect(updated).toMatchObject({ status: "running", threadId: "thread-steer", codexTurnId: "turn-active" });
+      expect(calls[0]?.slice(0, 3)).toEqual(["thread-steer", "turn-active", "修改后的追加要求"]);
+      expect(updated).toMatchObject({ text: "修改后的追加要求", status: "running", threadId: "thread-steer", codexTurnId: "turn-active" });
       expect(updated.attempts[0]).toMatchObject({ status: "running", delivery: "steer", codexTurnId: "turn-active" });
       await runner.stop();
     } finally {
@@ -492,9 +492,9 @@ describe("insert now", () => {
       } as unknown as AppServerManager;
       const runner = new QueueRunner(tab.id, storage, codex);
 
-      expect(await runner.insertNow(selected.id)).toEqual({ mode: "started", turnId: null });
+      expect(await runner.insertNow(selected.id, "  修改后只运行这一条  ")).toEqual({ mode: "started", turnId: null });
       await waitUntil(async () => calls.length === 1);
-      expect(calls).toEqual(["只运行这一条"]);
+      expect(calls).toEqual(["修改后只运行这一条"]);
       // Mid-turn, with the prompt dispatched and the answer not back yet: the
       // queue still reads as the user set it, never as rolling.
       const midTurn = await storage.readTab(tab.id);
@@ -505,7 +505,7 @@ describe("insert now", () => {
 
       const finished = await storage.readTab(tab.id);
       expect(finished.runtime.runner.desiredState).toBe(after);
-      expect(finished.prompts.prompts.find((item) => item.id === selected.id)?.status).toBe("completed");
+      expect(finished.prompts.prompts.find((item) => item.id === selected.id)).toMatchObject({ text: "修改后只运行这一条", status: "completed" });
       expect(finished.prompts.prompts.find((item) => item.id === earlier.id)?.status).toBe("pending");
       expect(finished.answers.answers).toHaveLength(1);
       await runner.stop();

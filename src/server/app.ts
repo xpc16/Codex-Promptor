@@ -1904,7 +1904,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     try {
       const tabId = String((request.params as any).tabId);
       assertQueueUsable(await storage.readTab(tabId));
-      const result = await runners.get(tabId).insertNow(String((request.params as any).promptId));
+      const body = (request.body ?? {}) as any;
+      const result = await runners.get(tabId).insertNow(
+        String((request.params as any).promptId),
+        body.text === undefined ? undefined : String(body.text),
+      );
       return reply.send({ data: { ...result, runtime: await storage.readRuntime(tabId) } });
     } catch (error) {
       return apiError(reply, 400, "PROMPT_INSERT_NOW_FAILED", error instanceof Error ? error.message : String(error));

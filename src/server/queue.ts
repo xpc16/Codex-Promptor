@@ -123,7 +123,9 @@ export class QueueRunner extends EventEmitter {
     return this.updateRuntime((runtime) => ({ ...runtime, queueConfig: { onFailure } }));
   }
 
-  async insertNow(promptId: string): Promise<InsertNowResult> {
+  async insertNow(promptId: string, editedText?: string): Promise<InsertNowResult> {
+    const replacementText = editedText === undefined ? undefined : editedText.trim();
+    if (editedText !== undefined && !replacementText) throw new Error("PROMPT_EMPTY");
     const initial = await this.storage.readTab(this.tabId);
     const threadId = initial.tab.session.threadId;
     if (initial.tab.session.state !== "ready" || !threadId || !initial.tab.session.workingDirectory) throw new Error("SESSION_NOT_READY");
@@ -137,7 +139,7 @@ export class QueueRunner extends EventEmitter {
       : activeTurnIds.at(-1) ?? null;
     if (activeTurnId) {
       try {
-        await this.steerPendingPrompt(promptId, threadId, activeTurnId);
+        await this.steerPendingPrompt(promptId, threadId, activeTurnId, replacementText);
         return { mode: "steered", turnId: activeTurnId };
       } catch (error) {
         // The active turn can finish between discovery and turn/steer. In that
@@ -145,7 +147,7 @@ export class QueueRunner extends EventEmitter {
         if (this.agent().rpc.activeTurnIds(threadId).length) throw error;
       }
     }
-    return this.startPendingPromptNow(promptId, threadId);
+    return this.startPendingPromptNow(promptId, threadId, replacementText);
   }
 
   async retry(promptId: string): Promise<void> {
@@ -317,7 +319,7 @@ export class QueueRunner extends EventEmitter {
     });
   }
 
-  private async startPendingPromptNow(promptId: string, threadId: string): Promise<InsertNowResult> {
+  private async startPendingPromptNow(promptId: string, threadId: string, replacementText?: string): Promise<InsertNowResult> {
     const continueQueue = await this.storage.withTabLock(this.tabId, async () => {
       const bundle = await this.storage.readTab(this.tabId);
       if (bundle.tab.session.state !== "ready" || bundle.tab.session.threadId !== threadId) throw new Error("SESSION_NOT_READY");
@@ -326,11 +328,20 @@ export class QueueRunner extends EventEmitter {
       if (targetIndex < 0 || !target) throw new Error("PROMPT_NOT_FOUND");
       if (target.status !== "pending" || (target.threadId && target.threadId !== threadId)) throw new Error("PROMPT_NOT_PENDING");
       const wasRunning = bundle.runtime.runner.desiredState === "running";
+      let changed = false;
+      if (replacementText !== undefined && replacementText !== target.text) {
+        target.text = replacementText;
+        target.updatedAt = isoNow();
+        changed = true;
+      }
       const firstPendingIndex = bundle.prompts.prompts.findIndex((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId));
       if (firstPendingIndex >= 0 && firstPendingIndex !== targetIndex) {
         bundle.prompts.prompts.splice(targetIndex, 1);
         const insertionIndex = bundle.prompts.prompts.findIndex((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId));
         bundle.prompts.prompts.splice(insertionIndex < 0 ? bundle.prompts.prompts.length : insertionIndex, 0, target);
+        changed = true;
+      }
+      if (changed) {
         bundle.prompts.revision += 1;
         bundle.prompts.updatedAt = isoNow();
         await this.storage.writePrompts(this.tabId, bundle.prompts);
@@ -352,7 +363,7 @@ export class QueueRunner extends EventEmitter {
     return { mode: "started", turnId: null };
   }
 
-  private async steerPendingPrompt(promptId: string, threadId: string, turnId: string): Promise<void> {
+  private async steerPendingPrompt(promptId: string, threadId: string, turnId: string, replacementText?: string): Promise<void> {
     const clientUserMessageId = `codex-promptor-${randomUUID()}`;
     const reserved = await this.storage.withTabLock(this.tabId, async () => {
       const bundle = await this.storage.readTab(this.tabId);
@@ -360,6 +371,7 @@ export class QueueRunner extends EventEmitter {
       const prompt = bundle.prompts.prompts.find((item) => item.id === promptId);
       if (!prompt) throw new Error("PROMPT_NOT_FOUND");
       if (prompt.status !== "pending" || (prompt.threadId && prompt.threadId !== threadId)) throw new Error("PROMPT_NOT_PENDING");
+      if (replacementText !== undefined) prompt.text = replacementText;
       const previous = {
         threadId: prompt.threadId,
         startedAt: prompt.startedAt,
