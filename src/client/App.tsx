@@ -55,6 +55,7 @@ import { api, jsonBody, promptorToken as token } from "./api-client.js";
 import { SafeMarkdown } from "./safe-markdown.js";
 import { DocumentView, useDocumentViewer, type DocumentOpenIntent } from "./document-viewer.js";
 import { insertCommonPrompt, type DraftSelection } from "./prompt-insertion.js";
+import { placeGroupAfter, placeTab } from "./navigation-placement.js";
 
 const TimerDialog = lazy(async () => ({ default: (await import("./timer-dialog.js")).TimerDialog }));
 const CommonPromptDialog = lazy(async () => ({ default: (await import("./common-prompt-dialog.js")).CommonPromptDialog }));
@@ -156,6 +157,7 @@ export function App() {
   const appliedRevision = useRef(-1);
   const navigationBusy = useRef(false);
   const dragItem = useRef<{ type: "group" | "tab"; id: string } | null>(null);
+  const [navigationDropTarget, setNavigationDropTarget] = useState<string | null>(null);
   const completionTimers = useRef(new Map<string, number>());
   const completionExpiries = useRef(new Map<string, number>());
   const locale: Locale = index?.ui.locale ?? "zh-CN";
@@ -387,7 +389,11 @@ export function App() {
   const openTab = (tabId: string) => { setSelectedId(tabId); setMobilePane("conversation"); };
 
   const createTab = async () => {
-    try { const tab = await api<TabMeta>("/api/tabs", jsonBody({ name: t("dialog.defaultConversationName") })); await refresh(); openTab(tab.id); }
+    try {
+      const tab = await api<TabMeta>("/api/tabs", jsonBody({ name: t("dialog.defaultConversationName"), afterTabId: selected?.id ?? null }));
+      await refresh();
+      openTab(tab.id);
+    }
     catch (reason) { setError(reason); }
   };
 
@@ -434,29 +440,15 @@ export function App() {
   };
 
   const moveGroup = (sourceId: string, targetId: string) => {
-    if (!index || sourceId === targetId) return;
-    const ordered = [...groups];
-    const from = ordered.findIndex((group) => group.id === sourceId);
-    const to = ordered.findIndex((group) => group.id === targetId);
-    if (from < 0 || to < 0) return;
-    const [moved] = ordered.splice(from, 1);
-    ordered.splice(to, 0, moved);
-    void persistNavigation(ordered.map((group, order) => ({ ...group, order })), index.tabs);
+    if (!index) return;
+    const nextGroups = placeGroupAfter(groups, sourceId, targetId);
+    if (nextGroups) void persistNavigation(nextGroups, index.tabs);
   };
 
   const moveTab = (sourceId: string, targetId: string | null, groupId: string | null) => {
     if (!index) return;
-    const source = index.tabs.find((tab) => tab.id === sourceId);
-    if (!source || (targetId === sourceId && source.groupId === groupId)) return;
-    const groupKeys: Array<string | null> = [...groups.map((group) => group.id), null];
-    const idsByGroup = new Map(groupKeys.map((key) => [key, orderedTabIds(index.tabs, key).filter((id) => id !== sourceId)]));
-    const targetIds = idsByGroup.get(groupId);
-    if (!targetIds) return;
-    const targetIndex = targetId ? targetIds.indexOf(targetId) : -1;
-    targetIds.splice(targetIndex >= 0 ? targetIndex : targetIds.length, 0, sourceId);
-    const byId = new Map(index.tabs.map((tab) => [tab.id, tab]));
-    const nextTabs = groupKeys.flatMap((key) => (idsByGroup.get(key) ?? []).map((id, order) => ({ ...byId.get(id)!, groupId: key, order })));
-    void persistNavigation(groups, nextTabs);
+    const nextTabs = placeTab(index.tabs, groups.map((group) => group.id), sourceId, targetId, groupId);
+    if (nextTabs) void persistNavigation(groups, nextTabs);
   };
 
   const toggleGroup = async (group: Group) => {
@@ -485,17 +477,17 @@ export function App() {
         {groups.map((group) => {
           const groupTabs = index.tabs.filter((tab) => tab.groupId === group.id).sort((a, b) => a.order - b.order);
           return <div className="group" key={group.id}>
-            <div className="group-heading" draggable onDragStart={() => { dragItem.current = { type: "group", id: group.id }; }} onDragEnd={() => { dragItem.current = null; }} onDragEnter={(event) => { event.preventDefault(); if (dragItem.current?.type === "group") moveGroup(dragItem.current.id, group.id); else if (dragItem.current?.type === "tab" && groupTabs.length === 0) moveTab(dragItem.current.id, null, group.id); }}>
+            <div className={`group-heading ${navigationDropTarget === `group:${group.id}` ? "navigation-drop-target" : ""}`} draggable onDragStart={(event) => { dragItem.current = { type: "group", id: group.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", group.id); }} onDragEnd={() => { dragItem.current = null; setNavigationDropTarget(null); }} onDragOver={(event) => { if (!dragItem.current) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setNavigationDropTarget(`group:${group.id}`); }} onDrop={(event) => { event.preventDefault(); const item = dragItem.current; dragItem.current = null; setNavigationDropTarget(null); if (item?.type === "group") moveGroup(item.id, group.id); else if (item?.type === "tab") moveTab(item.id, null, group.id); }}>
               <button className="collapse-button" aria-label={t(group.collapsed ? "nav.expand" : "nav.collapse", { name: group.name })} onClick={() => void toggleGroup(group)}>{group.collapsed ? "▸" : "▾"}</button><span className="group-name">{group.name}</span><em>{groupTabs.length}</em><RowActionsMenu subject={t("nav.groupSubject", { name: group.name })} deleteTitle={t("nav.deleteGroupHint")} onEdit={() => setDialog({ kind: "rename-group", groupId: group.id, initialValue: group.name })} onDelete={() => setDialog({ kind: "delete-group", groupId: group.id, name: group.name, tabCount: groupTabs.length })} />
             </div>
-            {!group.collapsed && groupTabs.map((tab) => <ConsoleTabRow key={tab.id} tab={tab} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletionExpiries[tab.id])} selected={tab.id === selectedId} onClick={() => openTab(tab.id)} onRename={() => setDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => setDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={() => { dragItem.current = { type: "tab", id: tab.id }; }} onDragEnd={() => { dragItem.current = null; }} onDragEnter={() => { if (dragItem.current?.type === "tab") moveTab(dragItem.current.id, tab.id, group.id); }} />)}
+            {!group.collapsed && groupTabs.map((tab) => <ConsoleTabRow key={tab.id} tab={tab} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletionExpiries[tab.id])} selected={tab.id === selectedId} dropTarget={navigationDropTarget === `tab:${tab.id}`} onClick={() => openTab(tab.id)} onRename={() => setDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => setDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={(event) => { dragItem.current = { type: "tab", id: tab.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", tab.id); }} onDragEnd={() => { dragItem.current = null; setNavigationDropTarget(null); }} onDragOver={() => { if (dragItem.current?.type !== "tab") return false; setNavigationDropTarget(`tab:${tab.id}`); return true; }} onDrop={() => { const item = dragItem.current; dragItem.current = null; setNavigationDropTarget(null); if (item?.type === "tab") moveTab(item.id, tab.id, group.id); }} />)}
           </div>;
         })}
         <div className="group ungrouped-group">
-          <div className="group-heading" onDragEnter={(event) => { event.preventDefault(); if (dragItem.current?.type === "tab" && ungrouped.length === 0) moveTab(dragItem.current.id, null, null); }}>
+          <div className={`group-heading ${navigationDropTarget === "group:__ungrouped" ? "navigation-drop-target" : ""}`} onDragOver={(event) => { if (dragItem.current?.type !== "tab") return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setNavigationDropTarget("group:__ungrouped"); }} onDrop={(event) => { event.preventDefault(); const item = dragItem.current; dragItem.current = null; setNavigationDropTarget(null); if (item?.type === "tab") moveTab(item.id, null, null); }}>
             <button className="collapse-button" aria-label={t(index.ui.ungroupedCollapsed ? "nav.expand" : "nav.collapse", { name: t("nav.ungrouped") })} onClick={() => void updatePreferences({ ungroupedCollapsed: !index.ui.ungroupedCollapsed })}>{index.ui.ungroupedCollapsed ? "▸" : "▾"}</button><span className="group-name">{t("nav.ungrouped")}</span><em>{ungrouped.length}</em>
           </div>
-          {!index.ui.ungroupedCollapsed && ungrouped.map((tab) => <ConsoleTabRow key={tab.id} tab={tab} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletionExpiries[tab.id])} selected={tab.id === selectedId} onClick={() => openTab(tab.id)} onRename={() => setDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => setDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={() => { dragItem.current = { type: "tab", id: tab.id }; }} onDragEnd={() => { dragItem.current = null; }} onDragEnter={() => { if (dragItem.current?.type === "tab") moveTab(dragItem.current.id, tab.id, null); }} />)}
+          {!index.ui.ungroupedCollapsed && ungrouped.map((tab) => <ConsoleTabRow key={tab.id} tab={tab} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletionExpiries[tab.id])} selected={tab.id === selectedId} dropTarget={navigationDropTarget === `tab:${tab.id}`} onClick={() => openTab(tab.id)} onRename={() => setDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => setDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={(event) => { dragItem.current = { type: "tab", id: tab.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", tab.id); }} onDragEnd={() => { dragItem.current = null; setNavigationDropTarget(null); }} onDragOver={() => { if (dragItem.current?.type !== "tab") return false; setNavigationDropTarget(`tab:${tab.id}`); return true; }} onDrop={() => { const item = dragItem.current; dragItem.current = null; setNavigationDropTarget(null); if (item?.type === "tab") moveTab(item.id, tab.id, null); }} />)}
         </div>
         {!groups.length && !ungrouped.length && <div className="empty-sidebar">{t("nav.empty")}<br /><span>{t("nav.emptyHint")}</span></div>}
       </div>
@@ -638,7 +630,7 @@ function RowActionsMenu({ subject, deleteTitle, onEdit, onDelete }: { subject: s
   </span>;
 }
 
-function ConsoleTabRow({ tab, activity, recentlyCompleted, selected, onClick, onRename, onDelete, onDragStart, onDragEnd, onDragEnter }: { tab: TabMeta; activity?: TabActivitySummary; recentlyCompleted: boolean; selected: boolean; onClick: () => void; onRename: () => void; onDelete: () => void; onDragStart: () => void; onDragEnd: () => void; onDragEnter: () => void }) {
+function ConsoleTabRow({ tab, activity, recentlyCompleted, selected, dropTarget, onClick, onRename, onDelete, onDragStart, onDragEnd, onDragOver, onDrop }: { tab: TabMeta; activity?: TabActivitySummary; recentlyCompleted: boolean; selected: boolean; dropTarget: boolean; onClick: () => void; onRename: () => void; onDelete: () => void; onDragStart: (event: DragEvent<HTMLDivElement>) => void; onDragEnd: () => void; onDragOver: () => boolean; onDrop: () => void }) {
   const { t } = useI18n();
   const visualState = tabVisualState(tab.session.state, activity);
   const tabStatus = visualState === "closed"
@@ -650,7 +642,7 @@ function ConsoleTabRow({ tab, activity, recentlyCompleted, selected, onClick, on
         : visualState === "error"
           ? t("tab.error")
           : t("tab.unconfigured");
-  return <div className={`tab-row ${selected ? "selected" : ""}`} draggable onDragStart={onDragStart} onDragEnd={onDragEnd} onDragEnter={(event) => { event.preventDefault(); onDragEnter(); }}>
+  return <div className={`tab-row ${selected ? "selected" : ""} ${dropTarget ? "navigation-drop-target" : ""}`} data-provider={tab.session.provider} draggable onDragStart={onDragStart} onDragEnd={onDragEnd} onDragOver={(event) => { if (!onDragOver()) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => { event.preventDefault(); event.stopPropagation(); onDrop(); }}>
     <span className="console-drag" title={t("nav.dragConversation")}>⠿</span><button className="tab-button" onClick={onClick}><span className="tab-label">{tab.name}</span><span className="tab-status-cluster">{recentlyCompleted && <span className="tab-completion-bell" role="img" aria-label={t("tab.justCompleted")} title={t("tab.justCompletedRecent")}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg></span>}<span className={`tab-status-indicator ${visualState}`} role="img" aria-label={tabStatus} title={tabStatus} /></span></button><RowActionsMenu subject={t("nav.conversationSubject", { name: tab.name })} onEdit={onRename} onDelete={onDelete} />
   </div>;
 }
@@ -1006,17 +998,53 @@ function SessionPanel({ bundle, height, reopening, onReopen, onBundle, onError }
   const i18n = useI18n();
   const { t } = i18n;
   const [cwd, setCwd] = useState(bundle.tab.session.workingDirectory ?? "");
-  const [mode, setMode] = useState<"new" | "resume">("new");
+  const [mode, setMode] = useState<"new" | "resume">(bundle.tab.session.launchMode);
   const [provider, setProvider] = useState<AgentProvider>(bundle.tab.session.provider);
-  const [resumeId, setResumeId] = useState("");
+  const [resumeId, setResumeId] = useState(bundle.tab.session.threadId ? "" : bundle.tab.session.sessionId ?? "");
   const [busy, setBusy] = useState(false);
   const [browsing, setBrowsing] = useState(false);
   const session = bundle.tab.session;
   const restoring = session.state === "connecting" && Boolean(session.threadId && session.workingDirectory);
   const connected = session.state === "ready" || session.state === "closed" || restoring;
+  const localFolderPicker = isLoopbackHostname(location.hostname);
+  const draftRef = useRef({ provider, mode, workingDirectory: cwd, resumeId });
+  draftRef.current = { provider, mode, workingDirectory: cwd, resumeId };
+  const savedDraftKey = useRef(JSON.stringify(draftRef.current));
+  const queuedDraftKey = useRef(savedDraftKey.current);
+  const draftSave = useRef<Promise<void>>(Promise.resolve());
+  const connectedRef = useRef(connected);
+  connectedRef.current = connected;
+  const persistDraft = useCallback((draft = draftRef.current): Promise<void> => {
+    const key = JSON.stringify(draft);
+    if (key === queuedDraftKey.current) return draftSave.current;
+    queuedDraftKey.current = key;
+    // Serialize small draft writes so network reordering cannot restore an old
+    // path or provider after a newer choice.
+    draftSave.current = draftSave.current.then(async () => {
+      try {
+        await api(`/api/tabs/${bundle.tab.id}`, { method: "PATCH", body: JSON.stringify({ sessionDraft: draft }) });
+        savedDraftKey.current = key;
+      } catch (reason) {
+        if (queuedDraftKey.current === key) queuedDraftKey.current = savedDraftKey.current;
+        onError(reason);
+      }
+    });
+    return draftSave.current;
+  }, [bundle.tab.id, onError]);
+  // Coalesce typing into one small update; selection changes and blur flush it
+  // immediately below. The unmount flush also covers switching conversations.
+  useEffect(() => {
+    if (connected || JSON.stringify(draftRef.current) === queuedDraftKey.current) return;
+    const timer = window.setTimeout(() => { void persistDraft(); }, 650);
+    return () => window.clearTimeout(timer);
+  }, [connected, cwd, mode, persistDraft, provider, resumeId]);
+  useEffect(() => () => {
+    if (!connectedRef.current) void persistDraft(draftRef.current);
+  }, [persistDraft]);
   const connect = async () => {
     setBusy(true);
     try {
+      await persistDraft();
       const result = await api<{ bundle: TabBundle }>(`/api/tabs/${bundle.tab.id}/session`, jsonBody({ provider, mode, workingDirectory: cwd, resumeId }));
       onBundle(result.bundle);
     }
@@ -1028,7 +1056,10 @@ function SessionPanel({ bundle, height, reopening, onReopen, onBundle, onError }
     setBrowsing(true);
     try {
       const result = await api<{ path: string | null }>("/api/dialog/select-directory", jsonBody({ initialPath: cwd }));
-      if (result.path) setCwd(result.path);
+      if (result.path) {
+        setCwd(result.path);
+        void persistDraft({ ...draftRef.current, workingDirectory: result.path });
+      }
     } catch (reason) { onError(reason); }
     finally { setBrowsing(false); }
   };
@@ -1052,10 +1083,10 @@ function SessionPanel({ bundle, height, reopening, onReopen, onBundle, onError }
   return <div className="session-card" style={height === null ? undefined : { height: `${height}%`, maxHeight: "none" }}>
     <div className="section-title"><span className="section-icon">◌</span><div><strong>{sessionTitle}</strong><small>{sessionHelp}</small></div></div>
     {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t("session.workingDirectory")}</span><code>{session.workingDirectory}</code></div>{session.provider !== "shell" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <button className="danger-action" disabled={busy} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>}</div></div> : <>
-      <label className="field-label">{t("session.localPath")}</label><div className="path-row"><input value={cwd} title={cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t("session.pathExample")} /><button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button></div>{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}
-      {!isShell && <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => setMode("new")}>{t("session.createNew")}</button><button className={mode === "resume" ? "active" : ""} onClick={() => setMode("resume")}>{t("session.resumeOld")}</button></div>}
-      {!isShell && mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} placeholder={t("session.resumePlaceholder")} />}
-      <div className="connect-row"><button className="primary connect" disabled={busy || (!isShell && !cwd.trim())} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button><select value={provider} disabled={busy} onChange={(event) => setProvider(event.target.value as AgentProvider)} aria-label={providerName}><option value="codex">{t("provider.codex")}</option><option value="claude">{t("provider.claude")}</option><option value="cursor">{t("provider.cursor")}</option><option value="shell">{t("provider.shell")}</option></select></div>
+      <label className="field-label">{t(localFolderPicker ? "session.localPath" : "session.remotePath")}</label><div className={`path-row ${localFolderPicker ? "" : "remote"}`}><input value={cwd} title={cwd} onChange={(event) => setCwd(event.target.value)} onBlur={() => void persistDraft()} placeholder={t("session.pathExample")} />{localFolderPicker && <button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button>}</div>{!localFolderPicker && <small className="field-hint">{t("session.remotePathHint")}</small>}{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}
+      {!isShell && <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => { setMode("new"); void persistDraft({ ...draftRef.current, mode: "new" }); }}>{t("session.createNew")}</button><button className={mode === "resume" ? "active" : ""} onClick={() => { setMode("resume"); void persistDraft({ ...draftRef.current, mode: "resume" }); }}>{t("session.resumeOld")}</button></div>}
+      {!isShell && mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} onBlur={() => void persistDraft()} placeholder={t("session.resumePlaceholder")} />}
+      <div className="connect-row"><button className="primary connect" disabled={busy || (!isShell && !cwd.trim())} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button><select value={provider} disabled={busy} onChange={(event) => { const next = event.target.value as AgentProvider; setProvider(next); void persistDraft({ ...draftRef.current, provider: next }); }} aria-label={providerName}><option value="codex">{t("provider.codex")}</option><option value="claude">{t("provider.claude")}</option><option value="cursor">{t("provider.cursor")}</option><option value="shell">{t("provider.shell")}</option></select></div>
     </>}
     {session.lastError && <div className="inline-error">{i18n.errorText(session.lastError)}</div>}
   </div>;
@@ -1131,6 +1162,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   // are already off (runnable needs a threadId); this closes the composer too
   // so nothing can be queued that could never run.
   const isShell = bundle.tab.session.provider === "shell";
+  const notebookOnly = !disabled && !isShell && !runnable;
   const runnerControlsDisabled = disabled || !runnable;
   const changeRunner = async (action: "start" | "pause" | "interrupt") => {
     if (runnerControlsDisabled || runnerAction) return;
@@ -1184,11 +1216,11 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     setCommonOpen(false);
     requestAnimationFrame(() => { composer.current?.focus(); composer.current?.setSelectionRange(inserted.cursor, inserted.cursor); });
   };
-  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : runnerIsWorking(runtime.runner.state) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "start"} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
+  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : runnerIsWorking(runtime.runner.state) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "start"} onClick={() => void changeRunner("start")}>{t(runnerAction === "start" ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
-    <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t("queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
+    <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t(notebookOnly ? "queue.notebookEmpty" : "queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} executionDisabled={!runnable} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; }} onNativeDragEnter={(targetId) => { if (nativeDragSource.current) void reorder(nativeDragSource.current, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}
-    <div className="add-prompt"><textarea ref={composer} disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><div className="compose-tools"><button className="compose-tool" title={t("queue.timers")} aria-label={t("queue.timers")} onClick={() => { setTimerMounted(true); setTimerOpen(true); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3 4 6M17 3l3 3M5.5 11a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm6.5-3v3.5l2.2 1.4M8 19l-1.5 2M16 19l1.5 2" /></svg></button><button className="compose-tool" title={t("queue.commonPrompts")} aria-label={t("queue.commonPrompts")} onClick={openCommonPrompts}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></svg></button></div><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
+    <div className="add-prompt"><textarea ref={composer} disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><div className="compose-tools"><button className="compose-tool" disabled={!runnable} title={t(runnable ? "queue.timers" : "queue.connectForTimers")} aria-label={t("queue.timers")} onClick={() => { if (!runnable) return; setTimerMounted(true); setTimerOpen(true); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3 4 6M17 3l3 3M5.5 11a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm6.5-3v3.5l2.2 1.4M8 19l-1.5 2M16 19l1.5 2" /></svg></button><button className="compose-tool" title={t("queue.commonPrompts")} aria-label={t("queue.commonPrompts")} onClick={openCommonPrompts}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></svg></button></div><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
     {timerMounted && <Suspense fallback={timerOpen ? <LazyDialogFallback label={t("queue.timers")} /> : null}><TimerDialog open={timerOpen} tabId={tabId} sessionReady={runnable && !isShell} currentThreadId={bundle.tab.session.threadId} provider={bundle.tab.session.provider} onClose={() => setTimerOpen(false)} onError={onError} /></Suspense>}
     {commonMounted && <Suspense fallback={commonOpen ? <LazyDialogFallback label={t("queue.commonPrompts")} /> : null}><CommonPromptDialog open={commonOpen} canInsert={!disabled && !isShell} onClose={() => setCommonOpen(false)} onInsert={insertFromLibrary} onError={onError} /></Suspense>}
   </div>;
@@ -1271,7 +1303,7 @@ function handoffPromptTextareaWheel(event: ReactWheelEvent<HTMLDivElement>) {
   promptList.scrollTop += delta;
 }
 
-function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, onNativeDragEnter, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragEnter: (targetId: string) => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
+function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, onNativeDragStart, onNativeDragEnter, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; executionDisabled: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragEnter: (targetId: string) => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   const editable = !locked && !["completed", "running", "dispatching"].includes(prompt.status);
@@ -1291,10 +1323,10 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
     catch (reason) { onError(reason); }
   };
   const remove = async () => { try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "DELETE" })); } catch (reason) { onError(reason); } };
-  const retry = async () => { try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/retry`, jsonBody({}))); } catch (reason) { onError(reason); } };
-  const skip = async () => { try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/skip`, jsonBody({}))); } catch (reason) { onError(reason); } };
+  const retry = async () => { if (executionDisabled) return; try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/retry`, jsonBody({}))); } catch (reason) { onError(reason); } };
+  const skip = async () => { if (executionDisabled) return; try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/skip`, jsonBody({}))); } catch (reason) { onError(reason); } };
   const insertNow = async () => {
-    if (locked || insertingNow || prompt.status !== "pending") return;
+    if (locked || executionDisabled || insertingNow || prompt.status !== "pending") return;
     setInsertingNow(true);
     try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/insert-now`, jsonBody({}))); }
     catch (reason) { onError(reason); }
@@ -1313,7 +1345,7 @@ function PromptRow({ prompt, index, tabId, locked, onDrop, onNativeDragStart, on
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", release, { once: true });
   };
   const nativeDragStart = (event: DragEvent<HTMLDivElement>) => { if ((event.target as HTMLElement).closest("textarea, button")) { event.preventDefault(); return; } event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", prompt.id); onNativeDragStart(prompt.id); };
-  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""} ${promptMultiline ? "multiline" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || insertingNow || editing} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
+  return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""} ${promptMultiline ? "multiline" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragEnter(prompt.id); } }} onDragOver={(event) => { if (pending) event.preventDefault(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || executionDisabled || insertingNow || editing} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked || executionDisabled} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked || executionDisabled} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
 function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, terminalPreference, projectionSupported, onTerminalPreferenceChange, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; terminalPreference: TerminalTransportPreference; projectionSupported: boolean; onTerminalPreferenceChange: (value: TerminalTransportPreference) => void; onBundle: (bundle: TabBundle) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {

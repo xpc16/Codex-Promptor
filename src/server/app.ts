@@ -1342,6 +1342,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   });
 
   app.post("/api/dialog/select-directory", async (request, reply) => {
+    if (!isLocalBrowserRequest(request.headers)) {
+      return apiError(reply, 403, "DIRECTORY_DIALOG_LOCAL_ONLY", "The native folder dialog is available only from a loopback browser.");
+    }
     if (process.platform !== "win32") return reply.code(400).send({ error: { code: "WINDOWS_ONLY", message: "Folder dialog is available on Windows." } });
     const body = (request.body ?? {}) as any;
     const initialPath = await validWorkingDirectory(body.initialPath)
@@ -1394,7 +1397,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
 
   app.post("/api/tabs", async (request, reply) => {
     const body = (request.body ?? {}) as any;
-    const tab = await storage.createTab(String(body.name ?? "未命名对话").trim().slice(0, 100) || "未命名对话");
+    const tab = await storage.createTab(
+      String(body.name ?? "未命名对话").trim().slice(0, 100) || "未命名对话",
+      { afterTabId: body.afterTabId ? String(body.afterTabId) : null },
+    );
     return reply.send({ data: tab });
   });
 
@@ -1402,14 +1408,29 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const tabId = String((request.params as any).tabId);
     const body = (request.body ?? {}) as any;
     try {
-      const tab = await storage.updateTab(tabId, (current) => ({
-        ...current,
-        ...(body.name !== undefined ? { name: String(body.name).trim().slice(0, 100) || current.name } : {}),
-        ...(body.groupId !== undefined ? { groupId: body.groupId === null ? null : String(body.groupId) } : {}),
-        ...(body.order !== undefined ? { order: Number(body.order) } : {}),
-        ...(body.layout?.leftWidthPercent !== undefined ? { layout: { leftWidthPercent: Math.max(20, Math.min(80, Number(body.layout.leftWidthPercent))) } } : {}),
-        updatedAt: isoNow(),
-      }));
+      const draft = body.sessionDraft && typeof body.sessionDraft === "object" ? body.sessionDraft : null;
+      const draftProvider = draft?.provider === undefined ? null : AgentProviderSchema.parse(draft.provider);
+      const tab = await storage.updateTab(tabId, (current) => {
+        // Once a thread is attached these fields describe the real session and
+        // may no longer be overwritten by a stale form save.
+        const maySaveDraft = Boolean(draft) && !current.session.threadId && current.session.state !== "ready" && current.session.state !== "closed";
+        const session = maySaveDraft ? {
+          ...current.session,
+          ...(draftProvider ? { provider: draftProvider } : {}),
+          ...(draft.workingDirectory !== undefined ? { workingDirectory: cleanDraftValue(draft.workingDirectory, 2_048) || null } : {}),
+          ...(draft.mode === "new" || draft.mode === "resume" ? { launchMode: draft.mode } : {}),
+          ...(draft.resumeId !== undefined ? { sessionId: cleanDraftValue(draft.resumeId, 512) || null } : {}),
+        } : current.session;
+        return {
+          ...current,
+          ...(body.name !== undefined ? { name: String(body.name).trim().slice(0, 100) || current.name } : {}),
+          ...(body.groupId !== undefined ? { groupId: body.groupId === null ? null : String(body.groupId) } : {}),
+          ...(body.order !== undefined ? { order: Number(body.order) } : {}),
+          ...(body.layout?.leftWidthPercent !== undefined ? { layout: { leftWidthPercent: Math.max(20, Math.min(80, Number(body.layout.leftWidthPercent))) } } : {}),
+          session,
+          updatedAt: isoNow(),
+        };
+      });
       return reply.send({ data: tab });
     } catch (error) { return apiError(reply, 404, "TAB_NOT_FOUND", error instanceof Error ? error.message : String(error)); }
   });
@@ -1505,7 +1526,19 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await cursor.stop(tabId);
       await claude.stop(tabId);
       await stopAppServer(storage, codex, tabId);
-      await storage.updateTab(tabId, (tab) => ({ ...tab, session: { ...tab.session, provider, state: "connecting", lastError: null }, updatedAt: isoNow() }));
+      await storage.updateTab(tabId, (tab) => ({
+        ...tab,
+        session: {
+          ...tab.session,
+          provider,
+          launchMode: mode,
+          state: "connecting",
+          workingDirectory: cwd,
+          ...(mode === "resume" ? { sessionId: resumeId } : {}),
+          lastError: null,
+        },
+        updatedAt: isoNow(),
+      }));
       if (provider === "shell") {
         const now = isoNow();
         await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null, appServer: null });
@@ -1516,6 +1549,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           session: {
             ...current.session,
             provider: "shell",
+            launchMode: "new",
             state: "ready",
             reopenOnLaunch: true,
             workingDirectory: cwd,
@@ -1548,6 +1582,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           ...current,
           session: {
             provider: "claude",
+            launchMode: mode,
             state: "ready",
             reopenOnLaunch: true,
             workingDirectory: cwd,
@@ -1578,6 +1613,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           ...current,
           session: {
             provider: "cursor",
+            launchMode: mode,
             state: "ready",
             reopenOnLaunch: true,
             workingDirectory: cwd,
@@ -1653,6 +1689,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         ...current,
         session: {
           provider: "codex",
+          launchMode: mode,
           state: "ready",
           reopenOnLaunch: true,
           workingDirectory: cwd,
@@ -1767,7 +1804,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const prompt = await storage.withTabLock(tabId, async () => {
         const bundle = await storage.readTab(tabId);
         assertQueueUsable(bundle);
-        armed = bundle.runtime.runner.desiredState === "armed";
+        armed = bundle.tab.session.state === "ready"
+          && Boolean(bundle.tab.session.threadId)
+          && bundle.runtime.runner.desiredState === "armed";
         const next = newPrompt(text, "queue");
         const beforeId = body.beforeId ? String(body.beforeId) : null;
         const afterId = body.afterId ? String(body.afterId) : null;
@@ -2533,6 +2572,10 @@ function assertQueueUsable(bundle: TabBundle): void {
   if (bundle.tab.session.provider === "shell") {
     throw new QueueUnavailableError(400, "SHELL_QUEUE_UNSUPPORTED", "终端对话不执行队列，请直接在终端里输入命令。");
   }
+}
+
+function cleanDraftValue(value: unknown, maxLength: number): string {
+  return String(value ?? "").replace(/[\u0000\r\n]/g, "").trim().slice(0, maxLength);
 }
 
 function isActiveWriterError(message: string): boolean {

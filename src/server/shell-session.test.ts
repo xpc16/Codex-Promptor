@@ -130,6 +130,7 @@ describe("terminal-only conversations", () => {
   it("restores a terminal on relaunch even though it has no thread", () => {
     const base: TabMeta["session"] = {
       provider: "shell",
+      launchMode: "new",
       state: "ready",
       reopenOnLaunch: true,
       workingDirectory: "D:\work",

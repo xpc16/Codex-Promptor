@@ -104,3 +104,27 @@ describe("bounded tab history", () => {
       .toEqual(["retried", "second", "third", "still queued"]);
   });
 });
+
+describe("new conversation placement", () => {
+  it("inherits the anchor group and is inserted immediately below it", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-storage-placement-"));
+    temporaryRoots.push(root);
+    const storage = new StorageService(root);
+    const anchor = await storage.createTab("anchor");
+    await storage.updateIndex((index) => ({
+      ...index,
+      groups: [{ id: "group", name: "Group", order: 0, collapsed: false }],
+    }));
+    await storage.updateTab(anchor.id, (tab) => ({ ...tab, groupId: "group", order: 0 }));
+    const formerSecond = await storage.createTab("former second", { afterTabId: anchor.id });
+
+    const inserted = await storage.createTab("inserted", { afterTabId: anchor.id });
+    const ordered = (await storage.readIndex()).tabs
+      .filter((tab) => tab.groupId === "group")
+      .sort((a, b) => a.order - b.order);
+
+    expect(inserted).toMatchObject({ groupId: "group", order: 1 });
+    expect(ordered.map((tab) => tab.id)).toEqual([anchor.id, inserted.id, formerSecond.id]);
+    expect((await storage.readTab(formerSecond.id)).tab.order).toBe(2);
+  });
+});

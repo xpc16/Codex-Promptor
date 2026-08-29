@@ -203,7 +203,7 @@ export class StorageService {
     });
   }
 
-  async createTab(name = "未命名对话"): Promise<TabMeta> {
+  async createTab(name = "未命名对话", placement: { afterTabId?: string | null } = {}): Promise<TabMeta> {
     const now = isoNow();
     const id = randomUUID();
     const tab: TabMeta = {
@@ -218,19 +218,40 @@ export class StorageService {
     };
     await this.mutex.run("index", async () => {
       const index = await this.readIndex();
-      tab.order = index.tabs.length;
+      const anchor = placement.afterTabId
+        ? index.tabs.find((item) => item.id === placement.afterTabId) ?? null
+        : null;
+      tab.groupId = anchor?.groupId ?? null;
+      const section = index.tabs
+        .filter((item) => item.groupId === tab.groupId)
+        .sort((a, b) => a.order - b.order);
+      const anchorIndex = anchor ? section.findIndex((item) => item.id === anchor.id) : -1;
+      tab.order = anchorIndex >= 0 ? anchorIndex + 1 : section.length;
+      const sectionOrder = new Map([
+        ...section.slice(0, tab.order).map((item, order) => [item.id, order] as const),
+        [tab.id, tab.order] as const,
+        ...section.slice(tab.order).map((item, offset) => [item.id, tab.order + offset + 1] as const),
+      ]);
+      const reorderedTabs = index.tabs.map((item) => {
+        const order = sectionOrder.get(item.id);
+        return order === undefined || order === item.order ? item : { ...item, order, updatedAt: now };
+      });
       await fs.mkdir(this.tabDir(id), { recursive: true });
       await Promise.all([
         this.writeFile(this.tabPath(id), tab),
         this.writeFile(this.promptPath(id), defaultPromptFile()),
         this.writeFile(this.answerPath(id), defaultAnswerFile()),
         this.writeFile(this.runtimePath(id), defaultRuntime()),
+        ...reorderedTabs.filter((item, indexAt) => item !== index.tabs[indexAt]).map((item) => this.writeFile(this.tabPath(item.id), item)),
       ]);
       const next = IndexFileSchema.parse({
         ...index,
         revision: index.revision + 1,
         updatedAt: now,
-        tabs: [...index.tabs, tab],
+        tabs: [
+          ...reorderedTabs,
+          tab,
+        ],
       });
       await this.writeIndex(next);
     });

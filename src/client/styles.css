@@ -19,6 +19,10 @@
   --success: #159d70;
   --notice: #b7791f;
   --danger: #d04f5f;
+  --provider-codex: #16836d;
+  --provider-claude: #bd6848;
+  --provider-cursor: #596ed0;
+  --provider-shell: #768398;
   --shadow: 0 8px 26px rgba(42, 55, 80, .09);
   background: var(--page);
   color: var(--text);
@@ -42,6 +46,10 @@
   --success: #54d5a5;
   --notice: #f2bb59;
   --danger: #ef818d;
+  --provider-codex: #55c8a7;
+  --provider-claude: #e59872;
+  --provider-cursor: #92a3ff;
+  --provider-shell: #9aa8bd;
   --shadow: 0 9px 30px rgba(0, 0, 0, .2);
 }
 
@@ -97,6 +105,11 @@ input, textarea, select { color: var(--text); }
 .tab-row:hover { background: var(--panel-strong); color: var(--text); }
 .tab-row.selected { background: var(--primary-soft); color: var(--text); box-shadow: inset 3px 0 var(--primary); }
 .console-drag { text-align: center; font-size: 13px; }
+.tab-row[data-provider="codex"] .console-drag { color: var(--provider-codex); }
+.tab-row[data-provider="claude"] .console-drag { color: var(--provider-claude); }
+.tab-row[data-provider="cursor"] .console-drag { color: var(--provider-cursor); }
+.tab-row[data-provider="shell"] .console-drag { color: var(--provider-shell); }
+.tab-row.navigation-drop-target, .group-heading.navigation-drop-target { background: var(--primary-soft); box-shadow: inset 0 -3px var(--primary); }
 .tab-button { min-width: 0; width: 100%; display: flex; align-items: center; gap: 8px; padding: 7px 3px; text-align: left; background: transparent; font-size: 14px; }
 .tab-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-actions-anchor { flex: none; width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; }
@@ -181,6 +194,7 @@ input, textarea, select { color: var(--text); }
 .section-icon { flex: none; width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border)); border-radius: 9px; background: var(--primary-soft); color: var(--primary); }
 .field-label { display: block; margin: 17px 0 7px; color: var(--muted); font-size: 12px; font-weight: 600; }
 .path-row { display: flex; gap: 7px; }
+.path-row.remote { display: block; }
 .path-row input, .resume-input, .add-prompt textarea { width: 100%; min-width: 0; padding: 10px 11px; border: 1px solid var(--border-strong); border-radius: 8px; outline: 0; background: var(--panel-soft); color: var(--text); font-size: 14px; }
 .path-row input:focus, .resume-input:focus, .add-prompt textarea:focus, .text-dialog input:focus, .text-dialog textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 15%, transparent); }
 .path-preview { display: block; margin-top: 7px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel-soft); color: var(--muted); font: 12px/1.5 "Cascadia Code", Consolas, monospace; overflow-wrap: anywhere; word-break: break-all; white-space: normal; }
@@ -312,7 +326,7 @@ input, textarea, select { color: var(--text); }
 .prompt-icon-group { width: 54px; flex: 0 0 54px; display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .prompt-row.multiline .prompt-icon-group { flex-direction: column; align-items: flex-end; }
 .add-prompt { flex: none; display: flex; gap: 8px; align-items: stretch; margin-top: 10px; }
-.add-prompt textarea { min-height: 50px; max-height: 110px; resize: vertical; }
+.add-prompt textarea { height: 50px; min-height: 50px; max-height: min(45vh, 420px); resize: vertical; overflow-y: auto; }
 .compose-tools { display: grid; grid-template-rows: 1fr 1fr; gap: 5px; }
 .compose-tool { width: 34px; min-height: 0; display: grid; place-items: center; padding: 4px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--panel-soft); color: var(--muted); }
 .compose-tool:hover { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); }

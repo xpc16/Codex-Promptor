@@ -71,6 +71,45 @@ describe("explicit queue start", () => {
     expect(bundle.runtime.runner.desiredState).toBe("armed");
   });
 
+  it("persists an unconnected setup draft and stores prompts without starting a runner", async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-notebook-"));
+    const staticRoot = path.join(root, "dist", "client");
+    await mkdir(staticRoot, { recursive: true });
+    await writeFile(path.join(staticRoot, "index.html"), "<!doctype html><title>test</title>", "utf8");
+    app = await createApp(root);
+    await app.ready();
+
+    const tab = await app.promptor.storage.createTab("notebook");
+    const start = vi.spyOn(app.promptor.runners.get(tab.id), "start").mockResolvedValue();
+    const draft = await app.inject({
+      method: "PATCH",
+      url: `/api/tabs/${tab.id}`,
+      headers: { "x-codex-promptor-token": app.promptor.token },
+      payload: {
+        sessionDraft: {
+          provider: "claude",
+          mode: "resume",
+          workingDirectory: "D:\\projects\\draft",
+          resumeId: "draft-session-id",
+        },
+      },
+    });
+    expect(draft.statusCode).toBe(200);
+
+    expect((await addPrompt(tab.id, "saved note")).statusCode).toBe(200);
+    expect(start).not.toHaveBeenCalled();
+    const bundle = await app.promptor.storage.readTab(tab.id);
+    expect(bundle.tab.session).toMatchObject({
+      provider: "claude",
+      launchMode: "resume",
+      workingDirectory: "D:\\projects\\draft",
+      sessionId: "draft-session-id",
+      threadId: null,
+    });
+    expect(bundle.prompts.prompts.map((prompt) => prompt.text)).toEqual(["saved note"]);
+    expect(bundle.prompts.prompts[0]?.status).toBe("pending");
+  });
+
   it.each([false, true])("does not start a paused queue when a prompt is added (existing pending: %s)", async (withExistingPending) => {
     root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-prompt-autostart-"));
     const staticRoot = path.join(root, "dist", "client");

@@ -98,6 +98,9 @@ export const SessionSchema = z.object({
   // Existing v1 tabs did not persist a provider and are Codex conversations.
   // The default keeps those files readable without a destructive migration.
   provider: AgentProviderSchema.default("codex"),
+  // Reuse sessionId for an unconnected resume draft; this one small field is
+  // enough to distinguish an empty "resume" form from a new-session form.
+  launchMode: z.enum(["new", "resume"]).default("new"),
   state: z.enum(["unconfigured", "connecting", "ready", "closed", "error"]),
   reopenOnLaunch: z.boolean().default(false),
   workingDirectory: z.string().nullable(),
@@ -327,6 +330,7 @@ export type TabRecordPage<T> = {
 
 export const defaultSession = (): Session => ({
   provider: "codex",
+  launchMode: "new",
   state: "unconfigured",
   reopenOnLaunch: false,
   workingDirectory: null,
