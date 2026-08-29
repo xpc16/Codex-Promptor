@@ -1,7 +1,6 @@
 import { createReadStream, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createInterface } from "node:readline";
 import { historyThreadFromResponse } from "./history.js";
 
 /**
@@ -27,6 +26,8 @@ export type CodexRolloutTurn = {
 
 type Draft = {
   id: string;
+  /** Byte offset of the line that first mentioned this turn, used as a resume point. */
+  startOffset: number;
   startedAt: string | null;
   completedAt: string | null;
   status: CodexRolloutTurn["status"];
@@ -61,7 +62,18 @@ function timeOf(...values: unknown[]): string | null {
   return null;
 }
 
-type RolloutParser = { push(line: string): void; finish(): CodexRolloutThread };
+type RolloutParser = {
+  push(line: string, startOffset?: number): void;
+  finish(): CodexRolloutThread;
+  /**
+   * Where a later read of the same rollout must resume so nothing that could
+   * still change is missed: the first byte of the earliest turn without a
+   * terminal event, or the end of what was read once every turn has finished.
+   * A turn left running forever pins this, which costs no more than the whole
+   * re-read costs today and can never lose a turn.
+   */
+  resumeOffset(endOffset: number): number;
+};
 
 /**
  * Consumes a rollout one line at a time so it never has to exist in memory as a
@@ -72,11 +84,13 @@ type RolloutParser = { push(line: string): void; finish(): CodexRolloutThread };
 function createRolloutParser(threadId: string): RolloutParser {
   const drafts = new Map<string, Draft>();
   let order = 0;
+  let lineOffset = 0;
   const draftFor = (turnId: string): Draft => {
     const existing = drafts.get(turnId);
     if (existing) return existing;
     const created: Draft = {
       id: turnId,
+      startOffset: lineOffset,
       startedAt: null,
       completedAt: null,
       // A turn with no terminal event is still in flight; syncHistory leaves
@@ -92,7 +106,8 @@ function createRolloutParser(threadId: string): RolloutParser {
     return created;
   };
 
-  const push = (line: string): void => {
+  const push = (line: string, startOffset = 0): void => {
+    lineOffset = startOffset;
     if (!line.trim()) return;
     let record: any;
     try { record = JSON.parse(line); } catch { return; }
@@ -160,25 +175,85 @@ function createRolloutParser(threadId: string): RolloutParser {
     return { id: threadId, sessionId: threadId, turns };
   };
 
-  return { push, finish };
+  const resumeOffset = (endOffset: number): number => {
+    let earliest = endOffset;
+    for (const draft of drafts.values()) {
+      if (draft.status === "running" && draft.startOffset < earliest) earliest = draft.startOffset;
+    }
+    return earliest;
+  };
+
+  return { push, finish, resumeOffset };
 }
 
 export function parseCodexRollout(contents: string, threadId: string): CodexRolloutThread {
   const parser = createRolloutParser(threadId);
-  for (const line of contents.split(/\r?\n/)) parser.push(line);
+  let offset = 0;
+  for (const line of contents.split(/\r?\n/)) {
+    parser.push(line, offset);
+    offset += Buffer.byteLength(line, "utf8") + 1;
+  }
   return parser.finish();
+}
+
+/**
+ * Feeds complete lines from a byte offset, reporting the offset just past the
+ * last complete one.
+ *
+ * Lines are split on the newline byte rather than through readline because the
+ * caller needs exact byte offsets to resume from and readline reports none. A
+ * 0x0A byte cannot occur inside a multi-byte UTF-8 sequence, so splitting
+ * before decoding is safe.
+ *
+ * A trailing line with no newline is still handed to the parser -- a rollout
+ * whose last record has no newline yet is complete data, and dropping it would
+ * lose the turn that settles a queue prompt -- but the returned offset stops
+ * before it, so the next read sees it again once it is terminated.
+ */
+async function feedRolloutLines(
+  file: string,
+  from: number,
+  push: (line: string, startOffset: number) => void,
+): Promise<number> {
+  let buffer: Buffer = Buffer.alloc(0);
+  let bufferStart = from;
+  const stream = createReadStream(file, { start: from });
+  for await (const chunk of stream as AsyncIterable<Buffer>) {
+    buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk;
+    let index = buffer.indexOf(0x0a);
+    while (index !== -1) {
+      const line = buffer.subarray(0, index).toString("utf8");
+      push(line.endsWith("\r") ? line.slice(0, -1) : line, bufferStart);
+      bufferStart += index + 1;
+      buffer = buffer.subarray(index + 1);
+      index = buffer.indexOf(0x0a);
+    }
+  }
+  if (buffer.length) {
+    const line = buffer.toString("utf8");
+    push(line.endsWith("\r") ? line.slice(0, -1) : line, bufferStart);
+  }
+  return bufferStart;
+}
+
+export type CodexRolloutSlice = {
+  turns: CodexRolloutTurn[];
+  /** Where the next read must start so no turn that could still change is missed. */
+  resumeOffset: number;
+  /** Offset just past the last complete line in the file. */
+  endOffset: number;
+};
+
+/** The turns a rollout records from a byte offset onwards. */
+export async function readCodexRolloutSlice(file: string, threadId: string, from = 0): Promise<CodexRolloutSlice> {
+  const parser = createRolloutParser(threadId);
+  const endOffset = await feedRolloutLines(file, from, (line, startOffset) => parser.push(line, startOffset));
+  return { turns: parser.finish().turns, resumeOffset: parser.resumeOffset(endOffset), endOffset };
 }
 
 /** The same parse, fed from disk, so file size bounds the time it takes and not the memory it needs. */
 export async function readCodexRollout(file: string, threadId: string): Promise<CodexRolloutThread> {
-  const parser = createRolloutParser(threadId);
-  const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
-  try {
-    for await (const line of lines) parser.push(line);
-  } finally {
-    lines.close();
-  }
-  return parser.finish();
+  return { id: threadId, sessionId: threadId, turns: (await readCodexRolloutSlice(file, threadId, 0)).turns };
 }
 
 export async function locateCodexRollout(threadId: string, hintedPath?: string | null): Promise<string | null> {
@@ -229,12 +304,23 @@ export async function readCodexRolloutThread(threadId: string, hintedPath: strin
  * Best effort by design: a rollout that cannot be found or read must never
  * break a sync that the App Server alone can already satisfy.
  */
-export async function withCodexRolloutTurns(thread: any, threadId: string): Promise<any> {
+/**
+ * How a rollout is turned into turns. The default reads the whole file, which
+ * is the only thing a caller with nowhere to keep a cache can do; a caller that
+ * owns a tab passes one that reads only the tail.
+ */
+export type RolloutReader = (file: string, threadId: string) => Promise<CodexRolloutThread>;
+
+export async function withCodexRolloutTurns(
+  thread: any,
+  threadId: string,
+  readRollout: RolloutReader = readCodexRollout,
+): Promise<any> {
   if (!threadId) return thread;
   try {
     const file = await locateCodexRollout(threadId, typeof thread?.path === "string" ? thread.path : null);
     if (!file) return thread;
-    return mergeRolloutTurns(thread, (await readCodexRollout(file, threadId)).turns);
+    return mergeRolloutTurns(thread, (await readRollout(file, threadId)).turns);
   } catch { return thread; }
 }
 
@@ -255,8 +341,12 @@ export type CodexHistoryRpc = {
  * whose rollout has not been written yet, which is the one case the file cannot
  * answer.
  */
-export async function readCodexThreadForHistory(rpc: CodexHistoryRpc, threadId: string): Promise<any> {
-  const fromRollout = await withCodexRolloutTurns(historyThreadFromResponse(await rpc.readThreadSummary(threadId)), threadId);
+export async function readCodexThreadForHistory(
+  rpc: CodexHistoryRpc,
+  threadId: string,
+  readRollout: RolloutReader = readCodexRollout,
+): Promise<any> {
+  const fromRollout = await withCodexRolloutTurns(historyThreadFromResponse(await rpc.readThreadSummary(threadId)), threadId, readRollout);
   if (Array.isArray(fromRollout?.turns) && fromRollout.turns.length) return fromRollout;
-  return withCodexRolloutTurns(historyThreadFromResponse(await rpc.readThread(threadId)), threadId);
+  return withCodexRolloutTurns(historyThreadFromResponse(await rpc.readThread(threadId)), threadId, readRollout);
 }

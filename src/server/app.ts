@@ -24,6 +24,9 @@ import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
 import { readCodexThreadForHistory } from "./codex-history.js";
+import { readCodexRolloutCached } from "./codex-rollout-cache.js";
+import { RESTORE_CONCURRENCY, restoreOrder, runRestoreQueue, type RestoreQueue } from "./restore-plan.js";
+import { createPhaseRecorder, formatRestoreTimings, type PhaseRecorder, type RestoreTrace } from "./restore-timing.js";
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
 import { entityTag, ifMatchSatisfied, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
@@ -97,6 +100,8 @@ type Client = {
 export type RestoreOpenSessionsSummary = {
   restored: string[];
   failed: Array<{ tabId: string; code: string; message: string }>;
+  /** Ready-to-print lines saying where the startup time went. */
+  timings: string[];
 };
 
 type TerminalReopenResult =
@@ -183,6 +188,20 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const documents = await DocumentService.create(rootDir, storage);
   const readClientTab = (tabId: string): Promise<TabBundle> => storage.readTabWindow(tabId, INITIAL_PROMPT_WINDOW, INITIAL_ANSWER_WINDOW);
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
+  /**
+   * Reads this tab's rollout incrementally. The five conversations open on the
+   * machine this was measured on come to roughly half a gigabyte of rollout,
+   * and every launch used to parse all of it from the first byte.
+   */
+  const cachedRollout = (tabId: string) => (file: string, threadId: string) =>
+    readCodexRolloutCached(file, threadId, storage.historyCachePath(tabId));
+  /**
+   * The tab a page last had open, remembered so the next launch restores it
+   * first. Only the selected TabView opens a terminal socket, so a terminal
+   * subscription is the selection.
+   */
+  let lastSelectedTabId: string | null = (await storage.readIndex()).ui.lastSelectedTabId;
+  let restoreQueue: RestoreQueue | null = null;
   await recoverTerminalRuntime(storage);
 
   /**
@@ -648,7 +667,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
   };
 
-  const performClaudeTerminalReopen = async (tab: TabMeta): Promise<TerminalReopenResult> => {
+  const performClaudeTerminalReopen = async (tab: TabMeta, recorder: PhaseRecorder = createPhaseRecorder()): Promise<TerminalReopenResult> => {
     const tabId = tab.id;
     try {
       if (!tab.session.threadId || !tab.session.workingDirectory) {
@@ -667,8 +686,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       }));
       await emitSnapshot(tabId);
       await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null, appServer: null });
-      const { manager, session } = await startClaudeTui(tabId, tab.session.workingDirectory, { mode: "resume", sessionId: tab.session.threadId });
-      await syncClaudeHistory(storage, tabId, session.sessionId, session.transcriptPath ?? manager.session?.transcriptPath);
+      const { manager, session } = await recorder.step("start", () => startClaudeTui(tabId, tab.session.workingDirectory!, { mode: "resume", sessionId: tab.session.threadId! }));
+      await recorder.step("history", () => syncClaudeHistory(storage, tabId, session.sessionId, session.transcriptPath ?? manager.session?.transcriptPath));
       await storage.updateTab(tabId, (current) => ({
         ...current,
         session: {
@@ -704,7 +723,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
   };
 
-  const performCursorTerminalReopen = async (tab: TabMeta): Promise<TerminalReopenResult> => {
+  const performCursorTerminalReopen = async (tab: TabMeta, recorder: PhaseRecorder = createPhaseRecorder()): Promise<TerminalReopenResult> => {
     const tabId = tab.id;
     try {
       if (!tab.session.threadId || !tab.session.workingDirectory) {
@@ -719,8 +738,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await storage.updateTab(tabId, (current) => ({ ...current, session: { ...current.session, state: "connecting", lastError: null }, updatedAt: now }));
       await emitSnapshot(tabId);
       await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null, appServer: null });
-      const { manager, session } = await startCursorTui(tabId, tab.session.workingDirectory, { mode: "resume", sessionId: tab.session.threadId });
-      await syncCursorHistoryIfAvailable(tabId, session.sessionId, session.transcriptPath ?? manager.session?.transcriptPath);
+      const { manager, session } = await recorder.step("start", () => startCursorTui(tabId, tab.session.workingDirectory!, { mode: "resume", sessionId: tab.session.threadId! }));
+      await recorder.step("history", () => syncCursorHistoryIfAvailable(tabId, session.sessionId, session.transcriptPath ?? manager.session?.transcriptPath));
       await storage.updateTab(tabId, (current) => ({
         ...current,
         session: { ...current.session, provider: "cursor", state: "ready", reopenOnLaunch: true, threadId: session.sessionId, sessionId: session.sessionId, connectedAt: isoNow(), lastError: null },
@@ -746,7 +765,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   // Reopening a terminal is just a fresh PowerShell in the same directory:
   // there is no thread to resume, no App Server to wait for, no history to
   // reconcile. It keeps its working directory, which is its whole identity.
-  const performShellTerminalReopen = async (tab: TabMeta): Promise<TerminalReopenResult> => {
+  const performShellTerminalReopen = async (tab: TabMeta, recorder: PhaseRecorder = createPhaseRecorder()): Promise<TerminalReopenResult> => {
     const cwd = tab.session.workingDirectory;
     if (!cwd) return { ok: false, statusCode: 400, code: "SESSION_NOT_READY", message: "This terminal has no working directory." };
     await pty.stop(tab.id, false);
@@ -759,7 +778,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     await emitSnapshot(tab.id);
     await updateTerminalRuntime(storage, tab.id, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null, appServer: null });
     await restoreTerminalSize(storage, pty, tab.id);
-    await pty.startShell(tab.id, cwd, (await storage.readIndex()).ui.theme);
+    await recorder.step("start", async () => pty.startShell(tab.id, cwd, (await storage.readIndex()).ui.theme));
     await storage.updateTab(tab.id, (current) => ({
       ...current,
       session: { ...current.session, state: "ready", reopenOnLaunch: true, connectedAt: isoNow(), lastError: null },
@@ -769,13 +788,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return { ok: true, bundle: await readClientTab(tab.id) };
   };
 
-  const performTerminalReopen = async (tabId: string): Promise<TerminalReopenResult> => {
+  const performTerminalReopen = async (tabId: string, recorder: PhaseRecorder = createPhaseRecorder()): Promise<TerminalReopenResult> => {
     try {
       await awaitThreadSwitch(tabId);
       const tab = await storage.getTabMeta(tabId);
-      if (tab.session.provider === "claude") return performClaudeTerminalReopen(tab);
-      if (tab.session.provider === "cursor") return performCursorTerminalReopen(tab);
-      if (tab.session.provider === "shell") return performShellTerminalReopen(tab);
+      if (tab.session.provider === "claude") return performClaudeTerminalReopen(tab, recorder);
+      if (tab.session.provider === "cursor") return performCursorTerminalReopen(tab, recorder);
+      if (tab.session.provider === "shell") return performShellTerminalReopen(tab, recorder);
       if (!tab.session.threadId || !tab.session.workingDirectory) {
         return { ok: false, statusCode: 400, code: "SESSION_NOT_READY", message: "This tab has no active session." };
       }
@@ -790,16 +809,18 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       }));
       await emitSnapshot(tabId);
       const manager = codex.get(tabId);
-      const rpc = await manager.ensureReady();
+      const rpc = await recorder.step("appServer", () => manager.ensureReady());
       await rememberAppServer(storage, tabId, manager);
       const theme = (await storage.readIndex()).ui.theme;
       await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null });
       const tuiUrl = await startTuiProxy(tabId, manager);
       await restoreTerminalSize(storage, pty, tabId);
-      await pty.start(tabId, tab.session.workingDirectory, tuiUrl, { mode: "resume", threadId: tab.session.threadId }, theme);
-      await waitForThreadLoaded(rpc, tab.session.threadId, 30_000, 200, () => pty.startupError(tabId));
-      await rpc.resumeThread(tab.session.threadId, tab.session.workingDirectory);
-      await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, tab.session.threadId));
+      await recorder.step("pty", () => pty.start(tabId, tab.session.workingDirectory!, tuiUrl, { mode: "resume", threadId: tab.session.threadId! }, theme));
+      await recorder.step("threadLoaded", () => waitForThreadLoaded(rpc, tab.session.threadId!, 30_000, 200, () => pty.startupError(tabId)));
+      await recorder.step("resume", () => rpc.resumeThread(tab.session.threadId!, tab.session.workingDirectory!));
+      await recorder.step("history", async () => {
+        await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, tab.session.threadId!, cachedRollout(tabId)));
+      });
       await storage.updateTab(tabId, (current) => ({
         ...current,
         session: { ...current.session, state: "ready", reopenOnLaunch: true, connectedAt: isoNow(), lastError: null },
@@ -835,10 +856,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   };
 
   const reopenTasks = new Map<string, Promise<TerminalReopenResult>>();
-  const reopenTerminal = (tabId: string): Promise<TerminalReopenResult> => {
+  const reopenTerminal = (tabId: string, recorder?: PhaseRecorder): Promise<TerminalReopenResult> => {
     const existing = reopenTasks.get(tabId);
+    // A caller that arrives while a reopen is already running joins it; its
+    // recorder would only time somebody else's work, so it is dropped.
     if (existing) return existing;
-    const task = performTerminalReopen(tabId);
+    const task = performTerminalReopen(tabId, recorder);
     reopenTasks.set(tabId, task);
     void task.then(() => {
       if (reopenTasks.get(tabId) === task) reopenTasks.delete(tabId);
@@ -849,15 +872,35 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   let restoreOpenSessionsPromise: Promise<RestoreOpenSessionsSummary> | null = null;
   const restoreOpenSessions = (): Promise<RestoreOpenSessionsSummary> => {
     if (restoreOpenSessionsPromise) return restoreOpenSessionsPromise;
-    restoreOpenSessionsPromise = Promise.all(startupOpenTabIds.map(async (tabId) => ({ tabId, result: await reopenTerminal(tabId) })))
-      .then((results) => ({
-        restored: results.filter((item) => item.result.ok).map((item) => item.tabId),
-        failed: results.flatMap((item) => item.result.ok ? [] : [{ tabId: item.tabId, code: item.result.code, message: item.result.message }]),
-      }))
-      .then(async (summary) => {
-        await timers.start();
-        return summary;
+    restoreOpenSessionsPromise = (async (): Promise<RestoreOpenSessionsSummary> => {
+      const startedAt = Date.now();
+      const tabs = await storage.listTabMeta();
+      const names = new Map(tabs.map((tab) => [tab.id, tab] as const));
+      const plan = restoreOrder(tabs, startupOpenTabIds, lastSelectedTabId);
+      const restored: string[] = [];
+      const failed: RestoreOpenSessionsSummary["failed"] = [];
+      const traces: RestoreTrace[] = [];
+      const queue = runRestoreQueue(plan, RESTORE_CONCURRENCY, async (tabId) => {
+        const recorder = createPhaseRecorder();
+        const result = await reopenTerminal(tabId, recorder);
+        if (result.ok) restored.push(tabId);
+        else failed.push({ tabId, code: result.code, message: result.message });
+        const tab = names.get(tabId);
+        traces.push({
+          tabId,
+          name: tab?.name ?? tabId,
+          provider: tab?.session.provider ?? "unknown",
+          ok: result.ok,
+          phases: recorder.phases(),
+          totalMs: recorder.totalMs(),
+        });
       });
+      restoreQueue = queue;
+      await queue.done;
+      restoreQueue = null;
+      await timers.start();
+      return { restored, failed, timings: formatRestoreTimings(traces, Date.now() - startedAt, RESTORE_CONCURRENCY) };
+    })();
     return restoreOpenSessionsPromise;
   };
 
@@ -896,6 +939,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     await Promise.allSettled([...reopenTasks.values()]);
     await Promise.allSettled([...threadSwitches.values()]);
     await recordOpenSessionsForNextLaunch(storage);
+    if (lastSelectedTabId) {
+      await storage.updateIndex((current) => ({ ...current, ui: { ...current.ui, lastSelectedTabId } })).catch(() => undefined);
+    }
     await runners.stopAll();
     await pty.stopAll();
     await tuiProxy.stopAll();
@@ -1601,7 +1647,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         // The resume response is the whole conversation and the only field ever
         // taken from it, `sessionId`, is already on the summary read above.
         await rpc.resumeThread(threadId, cwd);
-        report = await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, threadId));
+        report = await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, threadId, cachedRollout(tabId)));
       }
       await storage.updateTab(tabId, (current) => ({
         ...current,
@@ -1662,7 +1708,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         return reply.send({ data: { report: result.report, bundle: await readClientTab(tabId) } });
       }
       const rpc = await codex.get(tabId).ensureReady();
-      const thread = await readCodexThreadForHistory(rpc, tab.session.threadId);
+      const thread = await readCodexThreadForHistory(rpc, tab.session.threadId, cachedRollout(tabId));
       const report = await syncHistory(storage, tabId, thread);
       return reply.send({ data: { report, bundle: await readClientTab(tabId) } });
     } catch (error) { return apiError(reply, 502, "HISTORY_SYNC_FAILED", error instanceof Error ? error.message : String(error), true); }
@@ -1904,6 +1950,15 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             message.terminals,
             client.scope === "local" ? null : REMOTE_RAW_CATCH_UP_BYTES,
           );
+          // Only the selected TabView opens a terminal socket, so whatever a
+          // page is watching is what it has selected. Remembered for the next
+          // launch's restore order, and used right now to jump a session that
+          // is still queued to the front -- the remembered value is a guess and
+          // is allowed to be wrong.
+          for (const tabId of client.terminalSubscriptions.keys()) {
+            lastSelectedTabId = tabId;
+            restoreQueue?.promote(tabId);
+          }
           client.wantsIndex = message.index === true;
           client.wantsDetails = message.details !== false;
           traffic.setRole(client.id, client.stateSubscriptions.size > 0 || client.wantsIndex, client.terminalSubscriptions.size > 0);

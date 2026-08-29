@@ -207,7 +207,10 @@ export const IndexFileSchema = z.object({
     theme: z.enum(["light", "dark"]).default("light"),
     locale: z.enum(["zh-CN", "en"]).default("zh-CN"),
     ungroupedCollapsed: z.boolean().default(false),
-  }).default({ consoleWidth: 300, theme: "light", locale: "zh-CN", ungroupedCollapsed: false }),
+    // Written once, when the app shuts down, purely so the next launch knows
+    // which conversation to bring back first. Never read by the UI.
+    lastSelectedTabId: z.string().nullable().default(null),
+  }).default({ consoleWidth: 300, theme: "light", locale: "zh-CN", ungroupedCollapsed: false, lastSelectedTabId: null }),
 });
 export type IndexFile = z.infer<typeof IndexFileSchema>;
 

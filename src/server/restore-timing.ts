@@ -1,0 +1,65 @@
+/**
+ * Where the time goes when previously open conversations come back.
+ *
+ * Restoring one Codex conversation spawns an app-server, a PowerShell and a
+ * resuming TUI, waits for the thread to load, subscribes to it and reads its
+ * rollout. Any of those can dominate, and until they are measured separately
+ * every claim about startup cost is a guess -- so they are measured.
+ */
+export type RestorePhase = { phase: string; ms: number };
+
+export type PhaseRecorder = {
+  /** Times one awaited step. Failures are timed too: a slow failure is the interesting kind. */
+  step<T>(phase: string, run: () => Promise<T>): Promise<T>;
+  phases(): RestorePhase[];
+  totalMs(): number;
+};
+
+export function createPhaseRecorder(now: () => number = () => Date.now()): PhaseRecorder {
+  const phases: RestorePhase[] = [];
+  const startedAt = now();
+  return {
+    async step(phase, run) {
+      const from = now();
+      try {
+        return await run();
+      } finally {
+        phases.push({ phase, ms: now() - from });
+      }
+    },
+    phases: () => [...phases],
+    totalMs: () => now() - startedAt,
+  };
+}
+
+export type RestoreTrace = {
+  tabId: string;
+  name: string;
+  provider: string;
+  ok: boolean;
+  phases: RestorePhase[];
+  totalMs: number;
+};
+
+export function formatDuration(ms: number): string {
+  if (ms < 1_000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1_000).toFixed(1)}s`;
+}
+
+/**
+ * One line per conversation, slowest first, because the slowest is the one
+ * worth attacking and the phase split says what to attack.
+ */
+export function formatRestoreTimings(traces: readonly RestoreTrace[], wallMs: number, limit: number): string[] {
+  if (!traces.length) return [];
+  const sorted = [...traces].sort((left, right) => right.totalMs - left.totalMs);
+  const width = Math.max(...sorted.map((trace) => trace.name.length));
+  return [
+    `Restore timings: ${traces.length} conversation(s) in ${formatDuration(wallMs)}, ${limit} at a time`,
+    ...sorted.map((trace) => {
+      const phases = trace.phases.map((phase) => `${phase.phase} ${formatDuration(phase.ms)}`).join(" · ");
+      const failed = trace.ok ? "" : " [failed]";
+      return `  ${formatDuration(trace.totalMs).padStart(7)}  ${trace.provider.padEnd(6)} ${trace.name.padEnd(width)}  ${phases}${failed}`;
+    }),
+  ];
+}

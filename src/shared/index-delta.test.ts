@@ -23,7 +23,7 @@ const index = (revision: number, tabs: TabMeta[], overrides: Partial<IndexFile> 
   updatedAt: `2026-08-28T00:00:${String(revision).padStart(2, "0")}.000Z`,
   groups: [],
   tabs,
-  ui: { consoleWidth: 300, theme: "light", locale: "zh-CN", ungroupedCollapsed: false },
+  ui: { consoleWidth: 300, theme: "light", locale: "zh-CN", ungroupedCollapsed: false, lastSelectedTabId: null },
   ...overrides,
 });
 
@@ -70,7 +70,7 @@ describe("index delta", () => {
     expect(sameUi.ui).toBeUndefined();
     expect(indexDeltaIsEmpty(sameUi)).toBe(true);
 
-    const themed = index(2, [tab("a", "一", 0)], { ui: { consoleWidth: 300, theme: "dark", locale: "zh-CN", ungroupedCollapsed: false } });
+    const themed = index(2, [tab("a", "一", 0)], { ui: { consoleWidth: 300, theme: "dark", locale: "zh-CN", ungroupedCollapsed: false, lastSelectedTabId: null } });
     const delta = buildIndexDelta(before, themed);
     expect(delta.ui).toMatchObject({ theme: "dark" });
     expect(indexDeltaIsEmpty(delta)).toBe(false);

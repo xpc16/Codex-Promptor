@@ -128,7 +128,7 @@ export class StorageService {
         updatedAt: isoNow(),
         groups: [],
         tabs: [],
-        ui: { consoleWidth: 300, theme: "light", locale: "zh-CN", ungroupedCollapsed: false },
+        ui: { consoleWidth: 300, theme: "light", locale: "zh-CN", ungroupedCollapsed: false, lastSelectedTabId: null },
       });
     }
   }
@@ -140,6 +140,8 @@ export class StorageService {
   answerPath(tabId: string): string { return path.join(this.tabDir(tabId), "final-answers.json"); }
   runtimePath(tabId: string): string { return path.join(this.tabDir(tabId), "runtime.json"); }
   timerPath(tabId: string): string { return path.join(this.tabDir(tabId), "timers.json"); }
+  /** Parsed rollout turns, so a restart re-reads only what the rollout has grown by. */
+  historyCachePath(tabId: string): string { return path.join(this.tabDir(tabId), "rollout-cache.json"); }
   commonPromptPath(): string { return path.join(this.dataDir, "common-prompts.json"); }
 
   private async readFile<T>(filePath: string, parse: (value: unknown) => T): Promise<T> {
