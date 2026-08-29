@@ -16,7 +16,7 @@ import {
   INITIAL_PROMPT_WINDOW,
   MAX_WINDOW_RECORDS,
 } from "../shared/tab-window.js";
-import { AppServerPool, type AppServerManager, terminateStaleAppServer, waitForThreadLoaded } from "./codex.js";
+import { AppServerPool, type AppServerManager, type CodexRpcClient, terminateStaleAppServer, waitForThreadLoaded } from "./codex.js";
 import { ClaudeCodePool, type ClaudeCodeManager, probeClaudeVersion } from "./claude.js";
 import { syncClaudeHistory } from "./claude-history.js";
 import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorHookBridge, probeCursorVersion } from "./cursor.js";
@@ -26,7 +26,7 @@ import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documen
 import { readCodexThreadForHistory } from "./codex-history.js";
 import { readCodexRolloutCached } from "./codex-rollout-cache.js";
 import { RESTORE_STAGGER_MS, restoreOrder, runRestoreQueue, type RestoreQueue } from "./restore-plan.js";
-import { createPhaseRecorder, formatRestoreTimings, type PhaseRecorder, type RestoreTrace } from "./restore-timing.js";
+import { appendRestoreTimings, createPhaseRecorder, formatDuration, formatRestoreTimings, type PhaseRecorder, type RestoreTrace } from "./restore-timing.js";
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
 import { entityTag, ifMatchSatisfied, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
@@ -788,6 +788,40 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return { ok: true, bundle: await readClientTab(tab.id) };
   };
 
+  /**
+   * Subscribes to a thread without holding up the tab that owns it.
+   *
+   * It still has to be visible: a subscription that never landed leaves a tab
+   * that looks fine but cannot run anything, so a failure is surfaced the same
+   * way any other session error is. The rejected attempt is kept, so the
+   * queue's first dispatch fails with this reason rather than hanging. The time
+   * it took goes to the same log as the restore phases -- it is off the
+   * critical path, not unmeasured.
+   */
+  const subscribeInBackground = (tab: TabMeta, rpc: CodexRpcClient): void => {
+    const startedAt = Date.now();
+    void rpc.subscribeThread(tab.session.threadId!, tab.session.workingDirectory!).then(
+      () => logSubscription(tab, Date.now() - startedAt, null),
+      async (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        await logSubscription(tab, Date.now() - startedAt, message);
+        try {
+          await storage.updateTab(tab.id, (current) => ({
+            ...current,
+            session: { ...current.session, lastError: { code: "THREAD_SUBSCRIBE_FAILED", message } },
+            updatedAt: isoNow(),
+          }));
+          await emitSnapshot(tab.id);
+        } catch { /* a missing tab has nothing left to report against */ }
+      },
+    );
+  };
+
+  const logSubscription = (tab: TabMeta, ms: number, error: string | null): Promise<void> => appendRestoreTimings(
+    path.join(storage.dataDir, "restore-timings.log"),
+    [`  subscribe ${formatDuration(ms).padStart(7)}  ${tab.name}${error ? ` [failed] ${error}` : ""}`],
+  );
+
   const performTerminalReopen = async (tabId: string, recorder: PhaseRecorder = createPhaseRecorder()): Promise<TerminalReopenResult> => {
     try {
       await awaitThreadSwitch(tabId);
@@ -817,7 +851,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await restoreTerminalSize(storage, pty, tabId);
       await recorder.step("pty", () => pty.start(tabId, tab.session.workingDirectory!, tuiUrl, { mode: "resume", threadId: tab.session.threadId! }, theme));
       await recorder.step("threadLoaded", () => waitForThreadLoaded(rpc, tab.session.threadId!, 30_000, 200, () => pty.startupError(tabId)));
-      await recorder.step("resume", () => rpc.resumeThread(tab.session.threadId!, tab.session.workingDirectory!));
+      // thread/resume ships the whole conversation back and took eleven seconds
+      // on the two largest here, but nothing on screen needs it: the terminal is
+      // the TUI's own and history comes off the rollout. Only dispatching a turn
+      // does, and CodexRpcClient makes that wait. So the tab opens now and the
+      // subscription lands behind it.
+      subscribeInBackground(tab, rpc);
       await recorder.step("history", async () => {
         await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, tab.session.threadId!, cachedRollout(tabId)));
       });
@@ -937,6 +976,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     await directoryPicker.stop();
     if (restoreOpenSessionsPromise) await Promise.allSettled([restoreOpenSessionsPromise]);
     await Promise.allSettled([...reopenTasks.values()]);
+    // Restores now finish before their subscriptions do, so shutting down has
+    // to wait for those too or a resume is killed mid-flight.
+    await Promise.allSettled(codex.pendingSubscriptions());
     await Promise.allSettled([...threadSwitches.values()]);
     await recordOpenSessionsForNextLaunch(storage);
     if (lastSelectedTabId) {

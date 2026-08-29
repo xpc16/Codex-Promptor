@@ -108,6 +108,8 @@ export class CodexRpcClient extends EventEmitter {
   private readonly turns = new Map<string, TurnAccumulator>();
   private readonly completed = new Map<string, TurnCompletedEvent>();
   private readonly activeThreads = new Set<string>();
+  /** Subscriptions in flight or landed, keyed by thread. See subscribeThread. */
+  private readonly subscriptions = new Map<string, Promise<void>>();
   private connectPromise: Promise<void> | null = null;
   /**
    * Threads whose history does not fit in a frame. Asking again would only
@@ -319,10 +321,50 @@ export class CodexRpcClient extends EventEmitter {
   /**
    * Join a thread so this connection receives its notifications. There is no
    * lighter call for it -- the protocol has no `thread/subscribe` -- and the
-   * response carries the whole conversation, which no caller reads.
+   * response carries the whole conversation, which no caller reads. On the two
+   * largest conversations here that takes eleven seconds.
    */
   async resumeThread(threadId: string, cwd: string): Promise<void> {
     await this.request("thread/resume", { threadId, cwd }, RESUME_TIMEOUT_MS);
+  }
+
+  /**
+   * Subscribes without making the caller wait for it.
+   *
+   * Nothing about showing a conversation needs the subscription: the terminal
+   * is the TUI's own, and history comes off the rollout. What needs it is
+   * dispatching a turn and hearing back about one, so those wait for it here
+   * and everything else -- opening the tab, queueing prompts, pressing start --
+   * carries on eleven seconds sooner.
+   */
+  subscribeThread(threadId: string, cwd: string): Promise<void> {
+    const attempt = this.resumeThread(threadId, cwd);
+    this.subscriptions.set(threadId, attempt);
+    // Nobody may ever await this one; an unobserved rejection would otherwise
+    // take the process down. Callers that do await it still see the error.
+    attempt.catch(() => undefined);
+    return attempt;
+  }
+
+  /**
+   * Resolves once the thread is subscribed, or rethrows why it never was.
+   *
+   * A dispatch that arrives during the window queues up behind the subscription
+   * rather than being sent to a connection that would not hear the answer.
+   */
+  async awaitSubscription(threadId: string): Promise<void> {
+    const attempt = this.subscriptions.get(threadId);
+    if (attempt) await attempt;
+  }
+
+  /** True once nothing is waiting on a subscription for this thread. */
+  hasPendingSubscription(threadId: string): boolean {
+    return this.subscriptions.has(threadId);
+  }
+
+  /** Every subscription still in flight, so shutdown can wait for them. */
+  pendingSubscriptions(): Array<Promise<void>> {
+    return [...this.subscriptions.values()];
   }
 
   async loadedThreadIds(timeoutMs = 2_000): Promise<string[]> {
@@ -331,6 +373,7 @@ export class CodexRpcClient extends EventEmitter {
   }
 
   async unsubscribeThread(threadId: string, timeoutMs = 2_000): Promise<any> {
+    this.subscriptions.delete(threadId);
     return this.request("thread/unsubscribe", { threadId }, timeoutMs);
   }
 
@@ -345,6 +388,7 @@ export class CodexRpcClient extends EventEmitter {
   }
 
   async steerTurn(threadId: string, expectedTurnId: string, text: string, clientUserMessageId: string): Promise<any> {
+    await this.awaitSubscription(threadId);
     return this.request("turn/steer", {
       threadId,
       expectedTurnId,
@@ -354,6 +398,11 @@ export class CodexRpcClient extends EventEmitter {
   }
 
   async startTurn(threadId: string, text: string, clientUserMessageId: string, cwd: string): Promise<{ turnId: string; raw: any }> {
+    // A turn started before the subscription lands would run with nobody
+    // listening for its completion, so the queue would wait on an answer that
+    // never arrives. The prompt is already queued and the button already
+    // responded; only the dispatch waits.
+    await this.awaitSubscription(threadId);
     const raw = await this.request("turn/start", {
       threadId,
       clientUserMessageId,
@@ -470,6 +519,11 @@ export class CodexRpcClient extends EventEmitter {
   }
 
   async waitForThreadIdle(threadId: string, timeoutMs = 24 * 60 * 60 * 1000, pollMs = THREAD_SUMMARY_POLL_MS): Promise<void> {
+    // Before the subscription lands this connection has heard about no turns at
+    // all, so "nothing is running" would be true of every thread. Waiting here
+    // rather than only in startTurn keeps the idle check meaningful: a turn
+    // someone started in the TUI meanwhile is known by the time it is asked.
+    await this.awaitSubscription(threadId);
     if (!this.activeThreads.has(threadId)) return;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -516,6 +570,10 @@ export class CodexRpcClient extends EventEmitter {
   }
 
   close(): void {
+    // A subscription belongs to the socket that made it. Keeping the promises
+    // across a close would let a later dispatch believe it is subscribed on a
+    // connection that no longer exists.
+    this.subscriptions.clear();
     if (this.socket) this.socket.close();
     this.socket = null;
   }
@@ -732,6 +790,11 @@ export class AppServerPool extends EventEmitter {
   }
 
   existing(tabId: string): AppServerManager | null { return this.managers.get(tabId) ?? null; }
+
+  /** Every thread subscription still in flight, so shutdown can wait for them. */
+  pendingSubscriptions(): Array<Promise<void>> {
+    return [...this.managers.values()].flatMap((manager) => manager.rpc.pendingSubscriptions());
+  }
 
   get status(): CodexPoolStatus {
     const statuses = [...this.managers.values()].map((manager) => manager.status);
