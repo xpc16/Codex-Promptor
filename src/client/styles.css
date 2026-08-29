@@ -396,9 +396,12 @@ input, textarea, select { color: var(--text); }
 .terminal-heading > span:first-child { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 700; }
 .terminal-meta { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 6px; color: var(--muted); font-size: 11px; }
 .terminal-meta b { margin-left: 5px; color: var(--text); font-size: 12px; }
-.terminal-mode-control select { max-width: 112px; padding: 3px 22px 3px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft); color: var(--text); font-size: 11px; cursor: pointer; }
-.terminal-mode-badge { padding: 3px 6px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .03em; white-space: nowrap; }
-.terminal-mode-badge.projection { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); background: color-mix(in srgb, var(--success) 9%, var(--panel)); color: var(--success); }
+.terminal-key-control select { max-width: 112px; padding: 3px 22px 3px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft); color: var(--text); font-size: 11px; cursor: pointer; }
+.terminal-key-control select:disabled { cursor: default; }
+.terminal-channel-status { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 999px; background: var(--panel-soft); white-space: nowrap; }
+.terminal-channel-status strong { padding-left: 6px; border-left: 1px solid var(--border); color: var(--muted); font-size: 10px; letter-spacing: .03em; }
+.terminal-channel-status.projection { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); background: color-mix(in srgb, var(--success) 9%, var(--panel)); }
+.terminal-channel-status.projection strong { border-left-color: color-mix(in srgb, var(--success) 30%, var(--border)); color: var(--success); }
 .connection-dot { width: 7px; height: 7px; }
 .connection-dot.connected { background: var(--success); }
 .terminal-error { flex: none; padding: 8px 13px; border-bottom: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border)); background: color-mix(in srgb, var(--danger) 8%, var(--panel)); color: var(--danger); font-size: 12px; }

@@ -1,7 +1,6 @@
 export const TERMINAL_PROTOCOL_VERSION = 2;
 
 export type TerminalTransportMode = "raw" | "projection";
-export type TerminalTransportPreference = "auto" | TerminalTransportMode;
 
 export type TerminalColor = "default" | number | `#${string}`;
 

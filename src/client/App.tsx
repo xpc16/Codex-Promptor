@@ -15,7 +15,7 @@ import {
 } from "react";
 import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta, TabRecordPage } from "../shared/schemas.js";
 import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-link.js";
-import type { TerminalScreenFrame, TerminalTransportMode, TerminalTransportPreference } from "../shared/terminal-protocol.js";
+import type { TerminalScreenFrame, TerminalTransportMode } from "../shared/terminal-protocol.js";
 import { DOCUMENT_RAW_CATCH_UP_BYTES } from "../shared/document-protocol.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
 import { completionNoticeExpiresAt, latestQueueCompletion, runnerIsWorking, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
@@ -37,7 +37,8 @@ import { autoSizedHeight, autoSizedLines, readTextareaMetrics } from "./textarea
 import { createInputCoalescer } from "./input-coalescer.js";
 import { applyIndexDelta } from "../shared/index-delta.js";
 import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenState } from "./terminal-projection.js";
-import { readTerminalTransportPreference, resolveTerminalTransportPreference, writeTerminalTransportPreference } from "./terminal-preference.js";
+import { resolveAutomaticTerminalTransport } from "./terminal-preference.js";
+import { terminalShortcutInput } from "./terminal-shortcut.js";
 import { createConnectionAlarm, reconnectDelay } from "./socket-retry.js";
 import { forgetCachedTerminal, readCachedProjection, readCachedRawTerminal, rememberProjection, rememberRawTerminal, retainCachedTerminals } from "./terminal-cache.js";
 import {
@@ -134,7 +135,6 @@ export function App() {
   const [clock, setClock] = useState(() => new Date());
   const [activities, setActivities] = useState<Record<string, TabActivitySummary>>({});
   const [recentCompletionExpiries, setRecentCompletionExpiries] = useState<Record<string, number>>({});
-  const [terminalPreference, setTerminalPreference] = useState<TerminalTransportPreference>(() => readTerminalTransportPreference());
   // The console width lives on the element, not in state: dragging this divider
   // changes how many columns the terminal has, and a render per pointer event
   // put that cost on every frame of the gesture. See pane-drag.ts.
@@ -163,11 +163,6 @@ export function App() {
   const locale: Locale = index?.ui.locale ?? "zh-CN";
   const i18n = useMemo(() => createI18n(locale), [locale]);
   const { t } = i18n;
-  const changeTerminalPreference = useCallback((value: TerminalTransportPreference) => {
-    writeTerminalTransportPreference(value);
-    setTerminalPreference(value);
-  }, []);
-
   const markRecentCompletion = useCallback((tabId: string, completedAt: string | null, audible: boolean) => {
     const expiresAt = completionNoticeExpiresAt(completedAt);
     if (audible) void playPromptCompletionSound();
@@ -503,7 +498,7 @@ export function App() {
     <div className="console-splitter" role="separator" aria-label={t("aria.resizeConsole")} onMouseDown={() => { consoleDrag.current = new PaneDrag(consoleWidthRef.current, applyConsoleWidth, (width) => writePaneSize(CONSOLE_WIDTH, width)); }} />
     <main className="workspace" aria-label={t("aria.conversationPage")}>
       {Boolean(error) && <div className="toast error-toast">{i18n.errorText(error)}<button onClick={() => setError(null)}>×</button></div>}
-      {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} terminalPreference={terminalPreference} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} onTerminalPreferenceChange={changeTerminalPreference} onBundleChanged={applyTabBundle} onError={setError} />)}
+      {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} onBundleChanged={applyTabBundle} onError={setError} />)}
       {!selected && <Welcome onCreate={() => void createTab()} />}
     </main>
     <nav className="mobile-pane-bar" aria-label={t("aria.paneSwitcher")}>
@@ -722,7 +717,7 @@ function LoadEarlier({ shown, busy, label, busyLabel, onReveal }: { shown: boole
   return <button type="button" className="load-earlier" disabled={busy} onClick={onReveal}>{busy ? busyLabel : label}</button>;
 }
 
-function TabView({ tab, active, refreshNonce, theme, terminalPreference, projectionSupported, onTerminalPreferenceChange, onBundleChanged, onError }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; terminalPreference: TerminalTransportPreference; projectionSupported: boolean; onTerminalPreferenceChange: (value: TerminalTransportPreference) => void; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void }) {
+function TabView({ tab, active, refreshNonce, theme, projectionSupported, onBundleChanged, onError }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; projectionSupported: boolean; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   // Re-selecting a conversation paints from what this page already downloaded
@@ -986,7 +981,7 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
   return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspaceRef}>
     <section className="conversation-pane" ref={conversation}>{active && <><SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} onReopen={reopen} onBundle={applyBundle} onError={onError} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
     <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) splitDrag.current = new PaneDrag(leftWidthRef.current, applyLeftWidth, (value) => writePaneSize(splitSpec, value)); }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
-    <section className="queue-pane" ref={queuePaneRef}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" ref={queueSplitterRef} role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} /><TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} terminalPreference={terminalPreference} projectionSupported={projectionSupported} onTerminalPreferenceChange={onTerminalPreferenceChange} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
+    <section className="queue-pane" ref={queuePaneRef}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" ref={queueSplitterRef} role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} /><TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} projectionSupported={projectionSupported} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
   </div></div>;
 }
 
@@ -1334,11 +1329,12 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
   return <div className={`prompt-row ${prompt.status} ${locked ? "locked" : ""} ${promptMultiline ? "multiline" : ""}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDragOver={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDrop={(event) => { if (!pending) return; event.preventDefault(); event.stopPropagation(); onNativeDrop(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || executionDisabled || insertingNow} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked || executionDisabled} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked || executionDisabled} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
-function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, terminalPreference, projectionSupported, onTerminalPreferenceChange, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; terminalPreference: TerminalTransportPreference; projectionSupported: boolean; onTerminalPreferenceChange: (value: TerminalTransportPreference) => void; onBundle: (bundle: TabBundle) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {
+function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, projectionSupported, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; projectionSupported: boolean; onBundle: (bundle: TabBundle) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   const host = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal | null>(null);
+  const terminalInput = useRef<(data: string) => void>(() => undefined);
   const socket = useRef<WebSocket | null>(null);
   const reconnect = useRef<(() => void) | null>(null);
   const scheduleLayout = useRef<(() => void) | null>(null);
@@ -1352,8 +1348,9 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
   const documentVisibleRef = useRef(documentVisible);
   const [connected, setConnected] = useState(false);
   const [hasOutput, setHasOutput] = useState(false);
-  const transportMode: TerminalTransportMode = projectionSupported
-    ? resolveTerminalTransportPreference(terminalPreference, location.hostname)
+  const [projectionFailed, setProjectionFailed] = useState(false);
+  const transportMode: TerminalTransportMode = projectionSupported && !projectionFailed
+    ? resolveAutomaticTerminalTransport(location.hostname)
     : "raw";
   const runnerBusy = runtime.runner.desiredState === "running"
     || ["starting", "waiting_for_thread", "dispatching", "running", "waiting_for_prompt", "pausing"].includes(runtime.runner.state);
@@ -1512,6 +1509,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       }
       sendInputNow(data);
     };
+    terminalInput.current = sendInput;
     const queueProjectionWrite = (state: ProjectionScreenState, sequence: number, epoch: number, reset: boolean) => {
       projectionRenderPending += 1;
       let settled = false;
@@ -1776,7 +1774,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
             }
           } else if (message.type === "error" && message.error) {
             if (awaitingRawOneShot && String(message.error.code ?? "").startsWith("TERMINAL_")) awaitingRawOneShot = false;
-            if (projectionMode && String(message.error.code ?? "").startsWith("TERMINAL_PROJECTION")) onTerminalPreferenceChange("raw");
+            if (projectionMode && String(message.error.code ?? "").startsWith("TERMINAL_PROJECTION")) setProjectionFailed(true);
             callbacks.current.onError(message.error);
           }
         } catch { /* ignore malformed terminal frames */ }
@@ -1836,6 +1834,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       releasePaneDrag();
       inputDisposable.dispose(); foregroundQuery.dispose(); backgroundQuery.dispose(); colorSchemeQuery.dispose(); cursorBlinkOn.dispose(); cursorBlinkOff.dispose();
       inputCoalescer.flush(); inputCoalescer.dispose();
+      if (terminalInput.current === sendInput) terminalInput.current = () => undefined;
       closeSocketQuietly(socket.current); term.dispose(); terminal.current = null; socket.current = null;
     };
   }, [tabId, transportMode]);
@@ -1886,22 +1885,33 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       setConnected(false);
     } else reconnect.current?.();
   }, [closed]);
+  const sendTerminalShortcut = (value: string) => {
+    const data = terminalShortcutInput(value);
+    if (!data || closed || !connected || documentVisible) return;
+    terminalInput.current(data);
+  };
   const placeholder = t(runtime.terminal.state === "stopped" ? "terminal.notStarted" : runtime.terminal.state === "starting" ? "terminal.startingHelp" : runtime.terminal.state === "running" ? "terminal.runningHelp" : runtime.terminal.state === "error" ? "terminal.failedHelp" : "terminal.exitedHelp");
   const terminalProvider = provider === "claude" ? t("provider.claude") : provider === "cursor" ? t("provider.cursor") : provider === "shell" ? t("provider.shell") : t("provider.codex");
   return <div className={`terminal-card ${closed ? "locked" : ""} ${runnerBusy ? "runner-busy" : ""} ${documentVisible ? "document-open" : ""}`}>
     <div className="terminal-heading">
       <span><i className={`status-dot ${runtime.terminal.state === "running" ? "running" : runtime.terminal.state === "error" ? "error" : ""}`} />PowerShell / {terminalProvider}</span>
       <span className="terminal-meta">
-        <label className="terminal-mode-control" title={t("terminal.transportHelp")}>
-          <span className="sr-only">{t("terminal.transport")}</span>
-          <select aria-label={t("terminal.transport")} value={terminalPreference} onChange={(event) => onTerminalPreferenceChange(event.currentTarget.value as TerminalTransportPreference)}>
-            <option value="auto">{t("terminal.transportAuto")}</option>
-            <option value="projection" disabled={!projectionSupported}>{t("terminal.transportProjection")}</option>
-            <option value="raw">{t("terminal.transportRaw")}</option>
+        <label className="terminal-key-control" title={t("terminal.keyInputHelp")}>
+          <span className="sr-only">{t("terminal.keyInput")}</span>
+          <select aria-label={t("terminal.keyInput")} defaultValue="" disabled={closed || !connected || documentVisible} onChange={(event) => { sendTerminalShortcut(event.currentTarget.value); event.currentTarget.value = ""; }}>
+            <option value="">{t("terminal.keyInput")}</option>
+            <option value="shift-tab">Shift+Tab</option>
+            <option value="escape-twice">Esc*2</option>
+            <option value="escape">Esc</option>
+            <option value="tab">Tab</option>
           </select>
         </label>
-        <span className={`terminal-mode-badge ${transportMode}`}>{t(transportMode === "projection" ? "terminal.modeProjection" : "terminal.modeRaw")}</span>
-        <i className={`connection-dot ${connected ? "connected" : ""}`} />{t(closed ? "terminal.inputDisabled" : connected ? "terminal.inputConnected" : "terminal.inputConnecting")}<b>{closed ? t("terminal.closed") : terminalStateLabel(i18n, runtime.terminal.state)}</b>
+        <b>{closed ? t("terminal.closed") : terminalStateLabel(i18n, runtime.terminal.state)}</b>
+        <span className={`terminal-channel-status ${transportMode}`}>
+          <i className={`connection-dot ${connected ? "connected" : ""}`} />
+          <span>{t(closed ? "terminal.inputDisabled" : connected ? "terminal.inputConnected" : "terminal.inputConnecting")}</span>
+          <strong>{t(transportMode === "projection" ? "terminal.modeProjection" : "terminal.modeRaw")}</strong>
+        </span>
       </span>
     </div>
     {runtime.terminal.lastError && <div className="terminal-error">{i18n.errorText(runtime.terminal.lastError)}</div>}
