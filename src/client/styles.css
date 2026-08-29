@@ -57,7 +57,10 @@ input, textarea, select { color: var(--text); }
 ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--muted) 38%, transparent); border: 3px solid transparent; border-radius: 8px; background-clip: padding-box; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-.app-shell { display: grid; width: 100%; height: 100vh; overflow: hidden; background: var(--page); }
+/* The three grid tracks below are placeholders. Each divider writes its own
+   track sizing straight onto the element on mount and on every drag frame
+   (pane-drag.ts), so React never re-applies a stale size mid-gesture. */
+.app-shell { display: grid; grid-template-columns: 300px 7px minmax(0, 1fr); width: 100%; height: 100vh; overflow: hidden; background: var(--page); }
 .sidebar { min-width: 0; height: 100vh; overflow: hidden; display: flex; flex-direction: column; padding: 20px 14px 14px; background: var(--sidebar); border-right: 1px solid var(--border); }
 .console-splitter, .splitter { cursor: col-resize; position: relative; z-index: 2; }
 .console-splitter { height: 100vh; background: color-mix(in srgb, var(--border) 80%, transparent); border-left: 2px solid transparent; border-right: 2px solid transparent; }
@@ -156,10 +159,10 @@ input, textarea, select { color: var(--text); }
 .workspace { min-width: 0; height: 100vh; overflow: hidden; position: relative; }
 .tab-view { position: absolute; inset: 0; width: 100%; height: 100%; overflow: hidden; }
 .tab-view-hidden { visibility: hidden; pointer-events: none; }
-.tab-workspace { width: 100%; height: 100%; min-height: 0; display: grid; overflow: hidden; padding: 16px; }
+.tab-workspace { width: 100%; height: 100%; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 7px minmax(0, 1fr); overflow: hidden; padding: 16px; }
 .conversation-pane, .queue-pane { min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
 .conversation-pane { display: flex; flex-direction: column; gap: 0; padding-right: 11px; }
-.queue-pane { display: grid; gap: 0; padding-left: 11px; }
+.queue-pane { display: grid; grid-template-rows: minmax(0, 54fr) 14px minmax(0, 46fr); gap: 0; padding-left: 11px; }
 .splitter { width: 7px; height: 100%; border-left: 2px solid transparent; border-right: 2px solid transparent; }
 .splitter.disabled { cursor: not-allowed; opacity: .38; }
 .splitter.disabled:hover, .splitter.disabled:active { background: transparent; border-color: transparent; }

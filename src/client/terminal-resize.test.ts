@@ -167,6 +167,19 @@ describe("emulator and PTY size agreement", () => {
     expect(settled).toEqual({ cols: 80, rows: 24 });
   });
 
+  it("absorbs a row of vertical noise that it would not absorb across", () => {
+    // A banner or the settling overlay appearing and disappearing costs a row
+    // or two. Repainting a whole TUI screen for that is a bad trade, and the
+    // emulator sitting one row short of the pane is only unused space. The same
+    // slack sideways is not free: the two would wrap text differently.
+    const send = vi.fn();
+    const scheduler = new TerminalResizeScheduler(send, 100, { cols: 100, rows: 20 });
+
+    expect(scheduler.effectiveSize({ cols: 100, rows: 22 })).toEqual({ cols: 100, rows: 20 });
+    expect(scheduler.effectiveSize({ cols: 100, rows: 23 })).toEqual({ cols: 100, rows: 23 });
+    expect(scheduler.effectiveSize({ cols: 102, rows: 20 })).toEqual({ cols: 102, rows: 20 });
+  });
+
   it("accepts any size once a new PTY generation invalidates what was sent", () => {
     const scheduler = new TerminalResizeScheduler(() => undefined, 220, { cols: 80, rows: 24 });
     scheduler.invalidate();

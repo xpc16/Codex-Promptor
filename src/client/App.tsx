@@ -29,7 +29,8 @@ import { MOBILE_PANES, type MobilePane } from "./mobile-pane.js";
 import { dialogSurvivesIndex, nextSelectedTabId, shouldAdoptIndexRevision } from "./index-sync.js";
 import { applyTabMessage } from "./tab-bundle-delta.js";
 import { forgetCachedTab, readCachedTab, rememberTab, retainCachedTabs, windowLimits } from "./tab-cache.js";
-import { CONSOLE_WIDTH, conversationSplit, queueTerminalSplit, readPaneSize, readStoredPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
+import { clampPaneSize, CONSOLE_WIDTH, conversationSplit, queueTerminalSplit, readPaneSize, readStoredPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
+import { onPaneDragEnd, PaneDrag, paneDragActive } from "./pane-drag.js";
 import { isAtBottom, isNearTop, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
 import { clearPromptDraft, readPromptDraft, writePromptDraft } from "./prompt-draft.js";
 import { autoSizedHeight, autoSizedLines, readTextareaMetrics } from "./textarea-autosize.js";
@@ -128,14 +129,28 @@ export function App() {
   const [error, setError] = useState<unknown | null>(null);
   const [retainedTabIds, setRetainedTabIds] = useState<string[]>([]);
   const [viewRefreshNonces, setViewRefreshNonces] = useState<Record<string, number>>({});
-  const [consoleWidth, setConsoleWidth] = useState(() => readPaneSize(CONSOLE_WIDTH));
   const [dialog, setDialog] = useState<AppDialog | null>(null);
   const [clock, setClock] = useState(() => new Date());
   const [activities, setActivities] = useState<Record<string, TabActivitySummary>>({});
   const [recentCompletionExpiries, setRecentCompletionExpiries] = useState<Record<string, number>>({});
   const [terminalPreference, setTerminalPreference] = useState<TerminalTransportPreference>(() => readTerminalTransportPreference());
-  const consoleDragging = useRef(false);
+  // The console width lives on the element, not in state: dragging this divider
+  // changes how many columns the terminal has, and a render per pointer event
+  // put that cost on every frame of the gesture. See pane-drag.ts.
   const consoleWidthRef = useRef(readPaneSize(CONSOLE_WIDTH));
+  const appShell = useRef<HTMLDivElement | null>(null);
+  const consoleDrag = useRef<PaneDrag | null>(null);
+  const applyConsoleWidth = useCallback((width: number) => {
+    consoleWidthRef.current = width;
+    appShell.current?.style.setProperty("grid-template-columns", `${width}px 7px minmax(0, 1fr)`);
+  }, []);
+  // A ref callback rather than a style prop, so no later render can put the
+  // pre-drag width back. It runs on mount, which is where the stored width is
+  // applied; nothing else ever changes it.
+  const appShellRef = useCallback((node: HTMLDivElement | null) => {
+    appShell.current = node;
+    applyConsoleWidth(consoleWidthRef.current);
+  }, [applyConsoleWidth]);
   // Highest index revision already applied, so a replayed or out-of-order push
   // cannot roll the sidebar back to an older shape.
   const appliedRevision = useRef(-1);
@@ -323,19 +338,16 @@ export function App() {
 
   useEffect(() => {
     const move = (event: MouseEvent) => {
-      if (!consoleDragging.current) return;
-      const nextWidth = Math.max(220, Math.min(520, Math.min(window.innerWidth * .46, event.clientX)));
-      consoleWidthRef.current = nextWidth;
-      setConsoleWidth(nextWidth);
+      consoleDrag.current?.move(clampPaneSize(Math.min(window.innerWidth * .46, event.clientX), CONSOLE_WIDTH));
     };
-    const up = () => {
-      if (!consoleDragging.current) return;
-      consoleDragging.current = false;
-      writePaneSize(CONSOLE_WIDTH, consoleWidthRef.current);
-    };
+    const up = () => { consoleDrag.current?.end(); consoleDrag.current = null; };
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
-    return () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+    return () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      up();
+    };
     // Refs and module-level helpers only: the drag listeners never need rebinding.
   }, []);
 
@@ -465,7 +477,7 @@ export function App() {
 
   if (!index) return <I18nContext.Provider value={i18n}><div className="loading-screen"><div className="orb" /><p>{error ? i18n.errorText(error) : t("app.loading")}</p><button onClick={() => void refresh()}>{t("action.retry")}</button></div></I18nContext.Provider>;
 
-  return <I18nContext.Provider value={i18n}><div className="app-shell" data-mobile-pane={mobilePane} style={{ gridTemplateColumns: `${consoleWidth}px 7px minmax(0, 1fr)` }}>
+  return <I18nContext.Provider value={i18n}><div className="app-shell" ref={appShellRef} data-mobile-pane={mobilePane}>
     <aside className="sidebar" aria-label={t("aria.console")}>
       <div className="brand"><img className="brand-mark" src="/favicon.svg" alt="" aria-hidden="true" draggable={false} /><div><strong>Promptor</strong><span>{t("brand.subtitle")}</span></div></div>
       <div className="sidebar-actions"><button className="primary small" onClick={() => void createTab()}>{t("nav.newConversation")}</button><button className="icon-button" title={t("nav.newGroupTitle")} onClick={() => setDialog({ kind: "group" })}>{t("nav.newGroup")}</button></div>
@@ -496,7 +508,7 @@ export function App() {
         </div>
       </div>
     </aside>
-    <div className="console-splitter" role="separator" aria-label={t("aria.resizeConsole")} onMouseDown={() => { consoleDragging.current = true; }} />
+    <div className="console-splitter" role="separator" aria-label={t("aria.resizeConsole")} onMouseDown={() => { consoleDrag.current = new PaneDrag(consoleWidthRef.current, applyConsoleWidth, (width) => writePaneSize(CONSOLE_WIDTH, width)); }} />
     <main className="workspace" aria-label={t("aria.conversationPage")}>
       {Boolean(error) && <div className="toast error-toast">{i18n.errorText(error)}<button onClick={() => setError(null)}>×</button></div>}
       {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} terminalPreference={terminalPreference} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} onTerminalPreferenceChange={changeTerminalPreference} onBundleChanged={applyTabBundle} onError={setError} />)}
@@ -730,9 +742,20 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
   // The persisted tab layout is only the starting point for a browser that has
   // never been resized here; after that this screen keeps its own split.
   const splitSpec = useMemo(() => workspaceSplit(tab.id, tab.layout.leftWidthPercent), [tab.id, tab.layout.leftWidthPercent]);
-  const [leftWidth, setLeftWidth] = useState(() => readPaneSize(splitSpec));
-  const dragging = useRef(false);
-  const workspace = useRef<HTMLDivElement>(null);
+  // Both workspace splits are written to the DOM rather than held in state: one
+  // changes the terminal's columns and the other its rows, so a render per
+  // pointer event became an xterm resize per frame. See pane-drag.ts.
+  const leftWidthRef = useRef(readPaneSize(splitSpec));
+  const splitDrag = useRef<PaneDrag | null>(null);
+  const workspace = useRef<HTMLDivElement | null>(null);
+  const applyLeftWidth = useCallback((value: number) => {
+    leftWidthRef.current = value;
+    workspace.current?.style.setProperty("grid-template-columns", `${value}fr 7px ${100 - value}fr`);
+  }, []);
+  const workspaceRef = useCallback((node: HTMLDivElement | null) => {
+    workspace.current = node;
+    applyLeftWidth(leftWidthRef.current);
+  }, [applyLeftWidth]);
   // How tall the session card is, in this browser only. Null until dragged, so
   // an untouched conversation keeps sizing the card to its own content.
   const sessionSpec = useMemo(() => conversationSplit(tab.id), [tab.id]);
@@ -741,8 +764,22 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
   // The queue/terminal balance belongs to this browser origin. In particular,
   // dragging it through a tunnel cannot overwrite the loopback layout.
   const queueTerminalSpec = useMemo(() => queueTerminalSplit(tab.id), [tab.id]);
-  const [queueHeight, setQueueHeight] = useState(() => readPaneSize(queueTerminalSpec));
-  const queuePane = useRef<HTMLElement>(null);
+  const queueHeightRef = useRef(readPaneSize(queueTerminalSpec));
+  const queuePane = useRef<HTMLElement | null>(null);
+  const queueSplitter = useRef<HTMLDivElement | null>(null);
+  const applyQueueHeight = useCallback((value: number) => {
+    queueHeightRef.current = value;
+    queuePane.current?.style.setProperty("grid-template-rows", `minmax(0, ${value}fr) 14px minmax(0, ${100 - value}fr)`);
+    queueSplitter.current?.setAttribute("aria-valuenow", String(Math.round(value)));
+  }, []);
+  const queuePaneRef = useCallback((node: HTMLElement | null) => {
+    queuePane.current = node;
+    applyQueueHeight(queueHeightRef.current);
+  }, [applyQueueHeight]);
+  const queueSplitterRef = useCallback((node: HTMLDivElement | null) => {
+    queueSplitter.current = node;
+    applyQueueHeight(queueHeightRef.current);
+  }, [applyQueueHeight]);
   const [reopening, setReopening] = useState(false);
   const [documentIntent, setDocumentIntent] = useState<DocumentOpenIntent | null>(null);
   const documentIntentId = useRef(0);
@@ -864,11 +901,15 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
   }, [applyRealtimeMessage, load]);
   useEffect(() => { void load(); }, [load, refreshNonce]);
   useEffect(() => {
-    const move = (event: MouseEvent) => { if (!active || !dragging.current) return; const rect = workspace.current?.getBoundingClientRect(); if (!rect) return; setLeftWidth(Math.max(24, Math.min(76, ((event.clientX - rect.left) / rect.width) * 100))); };
-    const up = () => { if (!dragging.current) return; dragging.current = false; writePaneSize(splitSpec, leftWidth); };
+    const move = (event: MouseEvent) => {
+      const rect = workspace.current?.getBoundingClientRect();
+      if (!rect || rect.width <= 0) return;
+      splitDrag.current?.move(clampPaneSize(((event.clientX - rect.left) / rect.width) * 100, splitSpec));
+    };
+    const up = () => { splitDrag.current?.end(); splitDrag.current = null; };
     window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
-    return () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
-  }, [active, leftWidth, splitSpec]);
+    return () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); up(); };
+  }, [splitSpec]);
   // Pointer events rather than mouse: this divider is worth having on a phone,
   // where the conversation column is the whole screen.
   const dragSessionHeight = (event: PointerEvent<HTMLDivElement>) => {
@@ -897,19 +938,15 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
     if (rect.height <= 0) return;
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
-    let latest = queueHeight;
-    let released = false;
+    const drag = new PaneDrag(queueHeightRef.current, applyQueueHeight, (value) => writePaneSize(queueTerminalSpec, value));
     const move = (moveEvent: globalThis.PointerEvent) => {
-      latest = Math.max(queueTerminalSpec.min, Math.min(queueTerminalSpec.max, ((moveEvent.clientY - rect.top) / rect.height) * 100));
-      setQueueHeight(latest);
+      drag.move(clampPaneSize(((moveEvent.clientY - rect.top) / rect.height) * 100, queueTerminalSpec));
     };
     const release = () => {
-      if (released) return;
-      released = true;
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", release);
       window.removeEventListener("pointercancel", release);
-      writePaneSize(queueTerminalSpec, latest);
+      drag.end();
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", release, { once: true });
@@ -954,10 +991,10 @@ function TabView({ tab, active, refreshNonce, theme, terminalPreference, project
       onError(reason);
     } finally { documentOpenBusy.current = false; }
   };
-  return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspace} style={{ gridTemplateColumns: `${leftWidth}fr 7px ${100 - leftWidth}fr` }}>
+  return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspaceRef}>
     <section className="conversation-pane" ref={conversation}>{active && <><SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} onReopen={reopen} onBundle={applyBundle} onError={onError} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
-    <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) dragging.current = true; }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
-    <section className="queue-pane" ref={queuePane} style={{ gridTemplateRows: `minmax(0, ${queueHeight}fr) 14px minmax(0, ${100 - queueHeight}fr)` }}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} aria-valuenow={Math.round(queueHeight)} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} /><TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} terminalPreference={terminalPreference} projectionSupported={projectionSupported} onTerminalPreferenceChange={onTerminalPreferenceChange} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
+    <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) splitDrag.current = new PaneDrag(leftWidthRef.current, applyLeftWidth, (value) => writePaneSize(splitSpec, value)); }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
+    <section className="queue-pane" ref={queuePaneRef}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" ref={queueSplitterRef} role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} /><TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} terminalPreference={terminalPreference} projectionSupported={projectionSupported} onTerminalPreferenceChange={onTerminalPreferenceChange} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
   </div></div>;
 }
 
@@ -1508,6 +1545,11 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     const sendSize = () => {
       resizeFrame = null;
       if (!activeRef.current || documentVisibleRef.current || projectionMode) return;
+      // A divider drag walks the pane through one intermediate size per frame.
+      // Resizing xterm for each rebuilds every visible row, and the PTY resize
+      // behind it repaints the TUI's whole screen. The gesture finishes first;
+      // onPaneDragEnd below runs this once, at the size it stopped at.
+      if (paneDragActive()) return;
       try {
         const dimensions = fit.proposeDimensions();
         if (!dimensions) return;
@@ -1530,6 +1572,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     };
     scheduleLayout.current = scheduleSize;
     const observer = new ResizeObserver(scheduleSize); observer.observe(host.current);
+    const releasePaneDrag = onPaneDragEnd(scheduleSize);
     const currentTerminalSubscription = (boundedCatchUp = false) => projectionMode
       ? {
         mode: "projection",
@@ -1772,6 +1815,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       cursorQuietScheduler.dispose();
       terminalWriteSequence += 1;
       observer.disconnect();
+      releasePaneDrag();
       inputDisposable.dispose(); foregroundQuery.dispose(); backgroundQuery.dispose(); colorSchemeQuery.dispose(); cursorBlinkOn.dispose(); cursorBlinkOff.dispose();
       inputCoalescer.flush(); inputCoalescer.dispose();
       closeSocketQuietly(socket.current); term.dispose(); terminal.current = null; socket.current = null;

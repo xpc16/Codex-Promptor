@@ -1,6 +1,17 @@
 export type TerminalSize = { cols: number; rows: number };
 
-export const DEFAULT_TERMINAL_SIZE_TOLERANCE: TerminalSize = { cols: 1, rows: 1 };
+/**
+ * How far the measured size may drift from the PTY's before it is worth telling
+ * ConPTY, which makes a TUI repaint its whole screen.
+ *
+ * Rows are looser than columns because vertical noise is routine and cheap to
+ * absorb: an error banner or the settling overlay appearing takes a row or two
+ * and gives them straight back, and the only cost of the emulator holding the
+ * PTY's row count meanwhile is a little unused space at the bottom. A column
+ * disagreement is not cosmetic -- the two sides then wrap text differently and
+ * a cursor-repainting TUI degrades with every frame -- so columns stay tight.
+ */
+export const DEFAULT_TERMINAL_SIZE_TOLERANCE: TerminalSize = { cols: 1, rows: 2 };
 
 export function sameTerminalSize(left: TerminalSize | null, right: TerminalSize | null): boolean {
   return Boolean(left && right && left.cols === right.cols && left.rows === right.rows);
