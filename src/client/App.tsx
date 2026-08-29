@@ -31,7 +31,7 @@ import { applyTabMessage } from "./tab-bundle-delta.js";
 import { forgetCachedTab, readCachedTab, rememberTab, retainCachedTabs, windowLimits } from "./tab-cache.js";
 import { clampPaneSize, CONSOLE_WIDTH, conversationSplit, queueTerminalSplit, readPaneSize, readStoredPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
 import { onPaneDragEnd, PaneDrag, paneDragActive } from "./pane-drag.js";
-import { isAtBottom, isNearTop, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
+import { bufferedWheelHandoff, isAtBottom, isNearTop, wheelDeltaPixels, type WheelHandoffBufferState } from "./scroll-anchor.js";
 import { clearPromptDraft, readPromptDraft, readSessionFormDraft, writePromptDraft, writeSessionFormDraft } from "./prompt-draft.js";
 import { autoSizedHeight, autoSizedLines, readTextareaMetrics } from "./textarea-autosize.js";
 import { createInputCoalescer } from "./input-coalescer.js";
@@ -1261,18 +1261,23 @@ function useAutoSizedTextarea(ref: { current: HTMLTextAreaElement | null }, text
  * that direction. At either edge, move the queue list explicitly so disabled
  * and read-only textareas behave the same across Chromium versions.
  */
+const promptWheelHandoffBuffers = new WeakMap<HTMLTextAreaElement, WheelHandoffBufferState>();
+
 function handoffPromptTextareaWheel(event: ReactWheelEvent<HTMLDivElement>) {
-  if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
   const target = event.target instanceof Element ? event.target.closest("textarea") : null;
   if (!(target instanceof HTMLTextAreaElement) || !event.currentTarget.contains(target)) return;
-  if (!shouldHandoffWheel(target, event.deltaY)) return;
+  if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) { promptWheelHandoffBuffers.delete(target); return; }
   const promptList = event.currentTarget.closest<HTMLElement>(".prompt-list");
   if (!promptList) return;
   const lineHeight = Number.parseFloat(getComputedStyle(target).lineHeight);
   const delta = wheelDeltaPixels(event.deltaY, event.deltaMode, lineHeight, promptList.clientHeight);
+  const decision = bufferedWheelHandoff(target, delta, promptWheelHandoffBuffers.get(target) ?? null, event.timeStamp);
+  if (decision.state) promptWheelHandoffBuffers.set(target, decision.state);
+  else promptWheelHandoffBuffers.delete(target);
+  if (!decision.consume) return;
   event.preventDefault();
   event.stopPropagation();
-  promptList.scrollTop += delta;
+  if (decision.outerDelta) promptList.scrollTop += decision.outerDelta;
 }
 
 function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, onNativeDragStart, onNativeDragTarget, onNativeDrop, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; executionDisabled: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragTarget: (targetId: string) => void; onNativeDrop: () => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {

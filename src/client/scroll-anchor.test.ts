@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BOTTOM_SLACK, isAtBottom, isNearTop, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
+import { bufferedWheelHandoff, BOTTOM_SLACK, isAtBottom, isNearTop, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
 
 const at = (scrollTop: number) => ({ scrollTop, scrollHeight: 1_000, clientHeight: 400 });
 
@@ -56,6 +56,34 @@ describe("nested prompt scrolling", () => {
     const short = { scrollTop: 0, scrollHeight: 80, clientHeight: 100 };
     expect(shouldHandoffWheel(short, -40)).toBe(true);
     expect(shouldHandoffWheel(short, 40)).toBe(true);
+  });
+
+  it("absorbs an edge buffer, then hands only the excess to the queue", () => {
+    const bottom = { scrollTop: 200, scrollHeight: 300, clientHeight: 100 };
+    const first = bufferedWheelHandoff(bottom, 20, null, 0);
+    const second = bufferedWheelHandoff(bottom, 20, first.state, 20);
+    const crossing = bufferedWheelHandoff(bottom, 20, second.state, 40);
+    const handedOff = bufferedWheelHandoff(bottom, 20, crossing.state, 60);
+
+    expect(first).toMatchObject({ consume: true, outerDelta: 0, state: { distance: 20, handedOff: false } });
+    expect(second).toMatchObject({ consume: true, outerDelta: 0, state: { distance: 40, handedOff: false } });
+    expect(crossing).toMatchObject({ consume: true, outerDelta: 12, state: { handedOff: true } });
+    expect(handedOff).toMatchObject({ consume: true, outerDelta: 20, state: { handedOff: true } });
+  });
+
+  it("starts a fresh buffer after a pause or when internal scrolling resumes", () => {
+    const bottom = { scrollTop: 200, scrollHeight: 300, clientHeight: 100 };
+    const first = bufferedWheelHandoff(bottom, 30, null, 0);
+    const afterPause = bufferedWheelHandoff(bottom, 30, first.state, 300);
+    const backInside = bufferedWheelHandoff({ ...bottom, scrollTop: 150 }, -20, afterPause.state, 320);
+
+    expect(afterPause).toMatchObject({ outerDelta: 0, state: { distance: 30, handedOff: false } });
+    expect(backInside).toEqual({ consume: false, outerDelta: 0, state: null });
+  });
+
+  it("does not buffer a prompt that has no internal overflow", () => {
+    expect(bufferedWheelHandoff({ scrollTop: 0, scrollHeight: 80, clientHeight: 100 }, 30, null, 0))
+      .toEqual({ consume: true, outerDelta: 30, state: null });
   });
 
   it("converts line and page wheel units before moving the outer list", () => {

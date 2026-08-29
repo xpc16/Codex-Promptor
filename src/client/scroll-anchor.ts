@@ -15,6 +15,23 @@ export const BOTTOM_SLACK = 24;
 export const TOP_TRIGGER = 48;
 /** Fractional scroll positions are common under browser zoom and trackpads. */
 export const SCROLL_EDGE_EPSILON = 1;
+/** Distance absorbed at an inner edge before the containing queue takes over. */
+export const NESTED_SCROLL_HANDOFF_BUFFER = 48;
+/** A pause longer than this begins a fresh wheel gesture and a fresh buffer. */
+export const WHEEL_GESTURE_GAP_MS = 240;
+
+export type WheelHandoffBufferState = {
+  direction: -1 | 1;
+  distance: number;
+  handedOff: boolean;
+  lastAt: number;
+};
+
+export type WheelHandoffDecision = {
+  consume: boolean;
+  outerDelta: number;
+  state: WheelHandoffBufferState | null;
+};
 
 export function isAtBottom({ scrollTop, scrollHeight, clientHeight }: ScrollPosition, slack = BOTTOM_SLACK): boolean {
   if (![scrollTop, scrollHeight, clientHeight].every((value) => Number.isFinite(value))) return true;
@@ -46,6 +63,42 @@ export function shouldHandoffWheel(
   return deltaY < 0
     ? scrollTop <= edgeSlack
     : scrollTop >= maximum - edgeSlack;
+}
+
+/**
+ * Adds a small, local overscroll buffer between a scrollable prompt and its
+ * queue. Only the distance beyond the buffer reaches the outer list, then the
+ * remainder of that continuous gesture passes through normally.
+ */
+export function bufferedWheelHandoff(
+  position: ScrollPosition,
+  deltaPixels: number,
+  previous: WheelHandoffBufferState | null,
+  now: number,
+  threshold = NESTED_SCROLL_HANDOFF_BUFFER,
+  gestureGapMs = WHEEL_GESTURE_GAP_MS,
+): WheelHandoffDecision {
+  if (!shouldHandoffWheel(position, deltaPixels)) return { consume: false, outerDelta: 0, state: null };
+  const maximum = Math.max(0, position.scrollHeight - position.clientHeight);
+  // A short prompt has no inner scroll context to leave, so it must not make
+  // ordinary queue scrolling feel sticky merely because the pointer is over it.
+  if (maximum <= SCROLL_EDGE_EPSILON) return { consume: true, outerDelta: deltaPixels, state: null };
+
+  const direction: -1 | 1 = deltaPixels < 0 ? -1 : 1;
+  const limit = Math.max(0, Number.isFinite(threshold) ? threshold : NESTED_SCROLL_HANDOFF_BUFFER);
+  const gap = Math.max(0, Number.isFinite(gestureGapMs) ? gestureGapMs : WHEEL_GESTURE_GAP_MS);
+  const continued = previous?.direction === direction
+    && Number.isFinite(now)
+    && now >= previous.lastAt
+    && now - previous.lastAt <= gap;
+  if (continued && previous.handedOff) {
+    return { consume: true, outerDelta: deltaPixels, state: { ...previous, lastAt: now } };
+  }
+
+  const distance = (continued ? previous.distance : 0) + Math.abs(deltaPixels);
+  const state: WheelHandoffBufferState = { direction, distance: Math.min(distance, limit), handedOff: distance > limit, lastAt: now };
+  if (!state.handedOff) return { consume: true, outerDelta: 0, state };
+  return { consume: true, outerDelta: direction * (distance - limit), state };
 }
 
 /** Converts WheelEvent line/page deltas to the pixels used by scrollTop. */
