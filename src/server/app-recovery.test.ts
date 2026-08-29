@@ -218,7 +218,11 @@ describe("runtime recovery", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+    // Recovery probes a real port to decide whether the recorded App Server is
+    // still there, which takes about three seconds on its own. That leaves no
+    // margin under the default timeout once the rest of the suite is competing
+    // for the machine, and this failing intermittently would hide a real one.
+  }, 20_000);
 });
 
 describe("answer WebSocket events", () => {

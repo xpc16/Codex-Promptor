@@ -69,8 +69,6 @@ type RolloutParser = {
    * Where a later read of the same rollout must resume so nothing that could
    * still change is missed: the first byte of the earliest turn without a
    * terminal event, or the end of what was read once every turn has finished.
-   * A turn left running forever pins this, which costs no more than the whole
-   * re-read costs today and can never lose a turn.
    */
   resumeOffset(endOffset: number): number;
 };
@@ -176,9 +174,21 @@ function createRolloutParser(threadId: string): RolloutParser {
   };
 
   const resumeOffset = (endOffset: number): number => {
+    // A thread runs one turn at a time, so a turn still marked running with a
+    // later turn already finished after it never got its terminal event and
+    // never will. Without this an abandoned turn pins the resume point forever:
+    // one conversation here re-read 61MB on every launch because of a turn
+    // stranded 23 turns from the end. Nothing is lost by moving past it -- it
+    // stays in the cache exactly as it is, and syncHistory does not import a
+    // running turn anyway.
+    let lastSettled = 0;
+    for (const draft of drafts.values()) {
+      if (draft.status !== "running" && draft.order > lastSettled) lastSettled = draft.order;
+    }
     let earliest = endOffset;
     for (const draft of drafts.values()) {
-      if (draft.status === "running" && draft.startOffset < earliest) earliest = draft.startOffset;
+      if (draft.status !== "running" || draft.order < lastSettled) continue;
+      if (draft.startOffset < earliest) earliest = draft.startOffset;
     }
     return earliest;
   };

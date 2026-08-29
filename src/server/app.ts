@@ -25,7 +25,7 @@ import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-pi
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
 import { readCodexThreadForHistory } from "./codex-history.js";
 import { readCodexRolloutCached } from "./codex-rollout-cache.js";
-import { RESTORE_CONCURRENCY, restoreOrder, runRestoreQueue, type RestoreQueue } from "./restore-plan.js";
+import { RESTORE_STAGGER_MS, restoreOrder, runRestoreQueue, type RestoreQueue } from "./restore-plan.js";
 import { createPhaseRecorder, formatRestoreTimings, type PhaseRecorder, type RestoreTrace } from "./restore-timing.js";
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
@@ -880,7 +880,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const restored: string[] = [];
       const failed: RestoreOpenSessionsSummary["failed"] = [];
       const traces: RestoreTrace[] = [];
-      const queue = runRestoreQueue(plan, RESTORE_CONCURRENCY, async (tabId) => {
+      const queue = runRestoreQueue(plan, RESTORE_STAGGER_MS, async (tabId) => {
         const recorder = createPhaseRecorder();
         const result = await reopenTerminal(tabId, recorder);
         if (result.ok) restored.push(tabId);
@@ -899,7 +899,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await queue.done;
       restoreQueue = null;
       await timers.start();
-      return { restored, failed, timings: formatRestoreTimings(traces, Date.now() - startedAt, RESTORE_CONCURRENCY) };
+      return { restored, failed, timings: formatRestoreTimings(traces, Date.now() - startedAt, RESTORE_STAGGER_MS) };
     })();
     return restoreOpenSessionsPromise;
   };

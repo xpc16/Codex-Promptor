@@ -94,6 +94,27 @@ describe("incremental rollout reads", () => {
     expect(second).toEqual(await readCodexRollout(file, THREAD));
   });
 
+  it("does not let an abandoned turn pin the resume point forever", async () => {
+    // A thread runs one turn at a time, so a turn still marked running with
+    // finished turns after it never got its terminal event and never will.
+    // One real conversation here re-read 61MB on every launch because of a turn
+    // stranded 23 turns from the end.
+    await write([
+      ...turnLines("t1", "一", "答一"),
+      ...runningTurnLines("stuck", "无终点"),
+      ...turnLines("t3", "三", "答三"),
+    ]);
+    const thread = await readCodexRolloutCached(file, THREAD, cache);
+    expect(thread.turns.find((turn) => turn.id === "stuck")!.status).toBe("running");
+
+    // The stranded turn stays in the cache exactly as it is -- nothing is lost,
+    // and syncHistory does not import a running turn anyway -- but the next
+    // read starts past it rather than replaying everything after it.
+    const cached = await readCache();
+    expect(cached.offset).toBe((await readFile(file)).length);
+    expect(await readCodexRolloutCached(file, THREAD, cache)).toEqual(await readCodexRollout(file, THREAD));
+  });
+
   it("does not fold a half-written trailing line into the cache", async () => {
     await write(turnLines("t1", "一", "答一"));
     await appendFile(file, '{"timestamp":"2026-08-28T00:02:00.000Z","payl', "utf8");

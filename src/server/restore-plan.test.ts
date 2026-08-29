@@ -53,7 +53,7 @@ describe("restoreOrder", () => {
 });
 
 describe("runRestoreQueue", () => {
-  /** The queue hands off through a catch and a then, so one tick is not enough. */
+  /** The launcher hands off through a catch and a then, so one tick is not enough. */
   const flush = async () => { for (let tick = 0; tick < 8; tick += 1) await Promise.resolve(); };
 
   /** A task whose completion the test controls. */
@@ -63,52 +63,73 @@ describe("runRestoreQueue", () => {
     return { promise, release };
   }
 
-  it("runs no more than the limit at once", async () => {
-    const gates = new Map([["a", gate()], ["b", gate()], ["c", gate()]]);
+  /** A stagger the test steps through by hand, so nothing waits on real time. */
+  function stagger() {
+    const requested: number[] = [];
+    const pending: Array<() => void> = [];
+    return {
+      wait: (ms: number) => new Promise<void>((resolve) => { requested.push(ms); pending.push(resolve); }),
+      ms: () => [...requested],
+      async step() { pending.shift()?.(); await flush(); },
+    };
+  }
+
+  it("never makes one restore wait for another to finish", async () => {
+    // This is the regression being fixed: a restore is almost all waiting --
+    // spawns, readiness polls, RPC round trips -- and capping how many may wait
+    // at once turned parallel waiting into sequential waiting.
+    const gates = new Map(["a", "b", "c"].map((id) => [id, gate()] as const));
     const started: string[] = [];
-    const queue = runRestoreQueue(["a", "b", "c"], 2, async (id) => {
+    const clock = stagger();
+    const queue = runRestoreQueue(["a", "b", "c"], 250, async (id) => {
       started.push(id);
       await gates.get(id)!.promise;
-    });
+    }, clock.wait);
 
     await flush();
+    expect(started).toEqual(["a"]);
+    await clock.step();
     expect(started).toEqual(["a", "b"]);
-
-    gates.get("a")!.release();
-    await gates.get("a")!.promise;
-    await flush();
+    await clock.step();
     expect(started).toEqual(["a", "b", "c"]);
 
-    gates.get("b")!.release();
-    gates.get("c")!.release();
+    // All three were in flight together; none of them had finished.
+    for (const entry of gates.values()) entry.release();
     await queue.done;
   });
 
-  it("moves a promoted conversation to the front of what is left", async () => {
-    const gates = new Map(["a", "b", "c", "d"].map((id) => [id, gate()] as const));
+  it("spaces the launches out instead of firing every spawn in one instant", async () => {
+    const clock = stagger();
+    const queue = runRestoreQueue(["a", "b", "c"], 250, async () => undefined, clock.wait);
+    await flush();
+    await clock.step();
+    await clock.step();
+    await queue.done;
+    // Two gaps for three conversations: nothing waits after the last launch.
+    expect(clock.ms()).toEqual([250, 250]);
+  });
+
+  it("moves a promoted conversation to the front of what has not launched", async () => {
     const started: string[] = [];
-    const queue = runRestoreQueue(["a", "b", "c", "d"], 1, async (id) => {
-      started.push(id);
-      await gates.get(id)!.promise;
-    });
+    const clock = stagger();
+    const queue = runRestoreQueue(["a", "b", "c", "d"], 250, async (id) => { started.push(id); }, clock.wait);
 
     await flush();
     expect(started).toEqual(["a"]);
 
     // The page that just opened asked for "d"; it must not wait behind b and c.
     queue.promote("d");
-    gates.get("a")!.release();
-    await gates.get("a")!.promise;
-    await flush();
+    await clock.step();
     expect(started).toEqual(["a", "d"]);
 
-    for (const entry of gates.values()) entry.release();
+    await clock.step();
+    await clock.step();
     await queue.done;
     expect(started).toEqual(["a", "d", "b", "c"]);
   });
 
-  it("ignores promoting something already running or unknown", async () => {
-    const queue = runRestoreQueue(["a", "b"], 1, async () => undefined);
+  it("ignores promoting something already launched or unknown", async () => {
+    const queue = runRestoreQueue(["a", "b"], 0, async () => undefined);
     queue.promote("a");
     queue.promote("nothing");
     await expect(queue.done).resolves.toBeUndefined();
@@ -117,8 +138,8 @@ describe("runRestoreQueue", () => {
   it("finishes even when a restore fails, and resolves an empty plan at once", async () => {
     // One conversation that cannot come back must not strand the others.
     const run = vi.fn().mockRejectedValue(new Error("TERMINAL_REOPEN_FAILED"));
-    await expect(runRestoreQueue(["a", "b"], 2, run).done).resolves.toBeUndefined();
+    await expect(runRestoreQueue(["a", "b"], 0, run).done).resolves.toBeUndefined();
     expect(run).toHaveBeenCalledTimes(2);
-    await expect(runRestoreQueue([], 2, run).done).resolves.toBeUndefined();
+    await expect(runRestoreQueue([], 0, run).done).resolves.toBeUndefined();
   });
 });
