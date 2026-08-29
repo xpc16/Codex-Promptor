@@ -66,6 +66,19 @@ export class QueueRunner extends EventEmitter {
     if (this.loopPromise) {
       const current = await this.storage.readTab(this.tabId);
       if (current.runtime.runner.desiredState === "running") return;
+      // A one-shot prompt can already own the live loop while the queue itself
+      // is paused or armed. Starting at that point means "keep going after
+      // this turn"; it must not replace the real running/dispatching state
+      // (or its active ids) with the idle-loop bootstrap state.
+      await this.updateRuntime((runtime) => ({
+        ...runtime,
+        runner: { ...runtime.runner, desiredState: "running", lastError: null, lastTransitionAt: isoNow() },
+      }));
+      this.stopping = false;
+      // This is normally a no-op. It also closes the narrow race where the
+      // observed loop settles while the runtime update above is awaiting I/O.
+      this.launchLoop();
+      return;
     }
     await this.updateRuntime((runtime) => ({
       ...runtime,

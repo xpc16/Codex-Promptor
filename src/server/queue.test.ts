@@ -570,6 +570,10 @@ describe("starting the queue during a one-shot", () => {
       // Pressing start mid-turn is a decision to keep going, and it has to
       // outrank the one-shot's standing instruction to stop after this prompt.
       await runner.start();
+      const afterStart = await storage.readTab(tab.id);
+      expect(afterStart.runtime.runner.desiredState).toBe("running");
+      expect(afterStart.runtime.runner.state).toBe("running");
+      expect(afterStart.runtime.runner.activePromptId).toBe(selected.id);
       gates.shift()!();
 
       await waitUntil(async () => calls.length === 2 && gates.length === 1);
