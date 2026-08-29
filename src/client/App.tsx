@@ -4,6 +4,7 @@ import {
   useLayoutEffect,
   lazy,
   useMemo,
+  useReducer,
   useRef,
   useState,
   Suspense,
@@ -18,7 +19,7 @@ import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-li
 import type { TerminalScreenFrame, TerminalTransportMode } from "../shared/terminal-protocol.js";
 import { DOCUMENT_RAW_CATCH_UP_BYTES } from "../shared/document-protocol.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
-import { completionNoticeExpiresAt, latestQueueCompletion, runnerIsWorking, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
+import { completionNoticeExpiresAt, latestQueueCompletion, runnerIsWorking, stalledMinutes, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
 import { EARLIER_ANSWER_PAGE, EARLIER_PROMPT_PAGE, INITIAL_ANSWER_WINDOW, INITIAL_PROMPT_WINDOW } from "../shared/tab-window.js";
 import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
@@ -1118,6 +1119,17 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     || (!prompt.threadId && currentAnswerPromptIds.has(prompt.id))
     || (prompt.status === "pending" && !prompt.threadId));
   const promptContentKey = prompts.map((prompt) => prompt.id).join("|");
+  // A stalled turn is marked once and then left alone, so the elapsed label has
+  // to move on its own or it would read "5 minutes" for an hour. Only ticks
+  // while something is actually stalled.
+  const [, stallTick] = useReducer((count: number) => count + 1, 0);
+  const stalledSince = bundle.runtime.runner.stalledSince;
+  useEffect(() => {
+    if (!stalledSince) return;
+    const timer = window.setInterval(stallTick, 30_000);
+    return () => window.clearInterval(timer);
+  }, [stalledSince]);
+  const stalledFor = stalledSince ? stalledMinutes(stalledSince, Date.now()) : null;
   const { onScroll: onPromptScroll, scrollRef: promptWindow, startIndex: promptStartIndex, visibleItems: visiblePrompts, revealEarlier: revealEarlierPrompts, revealing: revealingPrompts, canRevealEarlier: canRevealEarlierPrompts } = useTailWindow(prompts, promptContentKey, 24, hasEarlier, onLoadEarlier);
   const runtime = bundle.runtime;
   // Two different facts, and they come apart: the agent can be idle between
@@ -1215,7 +1227,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     if (!box || disabled || isShell) return;
     box.style.height = `${clampPromptComposerHeight(box.getBoundingClientRect().height + delta, window.innerHeight)}px`;
   };
-  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : runnerIsWorking(runtime.runner.state) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span></>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={showStartPending || undefined} onClick={() => void changeRunner("start")}>{t(showStartPending ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
+  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : runnerIsWorking(runtime.runner.state) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span>{stalledFor !== null && <span className="queue-state stalled" title={t("queue.stalledHelp", { minutes: stalledFor })}><i className="status-dot" /><span>{t("queue.stalled", { minutes: stalledFor })}</span></span>}</>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={showStartPending || undefined} onClick={() => void changeRunner("start")}>{t(showStartPending ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
     <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t(notebookOnly ? "queue.notebookEmpty" : "queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} executionDisabled={!runnable} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; if (!sourceId) nativeDragTarget.current = null; }} onNativeDragTarget={(targetId) => { if (nativeDragSource.current) nativeDragTarget.current = targetId; }} onNativeDrop={() => { const sourceId = nativeDragSource.current; const targetId = nativeDragTarget.current; nativeDragSource.current = null; nativeDragTarget.current = null; if (sourceId && targetId) void reorder(sourceId, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}

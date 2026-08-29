@@ -6,7 +6,7 @@ import fastifyCompress from "@fastify/compress";
 import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
 import { AgentProviderSchema, type AgentProvider, type AnswerRecord, CommonPromptFileSchema, type Group, type IndexFile, IndexFileSchema, isoNow, MAX_AUXILIARY_FILE_BYTES, MAX_COMMON_PROMPTS, MAX_TIMER_REQUEST_BYTES, newPrompt, PromptFileSchema, RuntimeFileSchema, type RuntimeFile, type TabBundle, type TabMeta } from "../shared/schemas.js";
-import { settledDesiredState, type TabActivitySummary } from "../shared/tab-activity.js";
+import { runnerIsWorking, settledDesiredState, type TabActivitySummary } from "../shared/tab-activity.js";
 import type { PromptDelta } from "../shared/tab-delta.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
 import {
@@ -23,7 +23,8 @@ import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorH
 import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
-import { readCodexThreadForHistory } from "./codex-history.js";
+import { locateCodexRollout, readCodexThreadForHistory } from "./codex-history.js";
+import { decideStall, TURN_STALL_POLL_MS } from "./turn-stall.js";
 import { readCodexRolloutCached } from "./codex-rollout-cache.js";
 import { RESTORE_STAGGER_MS, restoreOrder, runRestoreQueue, type RestoreQueue } from "./restore-plan.js";
 import { appendRestoreTimings, createPhaseRecorder, formatDuration, formatRestoreTimings, type PhaseRecorder, type RestoreTrace } from "./restore-timing.js";
@@ -943,6 +944,64 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return restoreOpenSessionsPromise;
   };
 
+  /**
+   * Says so when a running turn has stopped recording anything.
+   *
+   * Codex can abandon a turn without ending it -- no completion, no abort, the
+   * rollout simply stops -- and waitForTurn's deadline is twenty-four hours, so
+   * the queue would sit on "running" for a day with nothing to show for it.
+   * The rollout's last write is the signal because it is Codex's own record,
+   * written whichever client it is talking to; our notifications can be routed
+   * to the TUI instead of here, so a quiet socket proves nothing.
+   *
+   * Reporting only. A single long command legitimately records nothing while it
+   * runs, so nothing is interrupted and no state is changed on this account.
+   */
+  const rolloutPaths = new Map<string, string>();
+  const lastRolloutWrite = async (threadId: string): Promise<number | null> => {
+    try {
+      const file = rolloutPaths.get(threadId) ?? await locateCodexRollout(threadId);
+      if (!file) return null;
+      rolloutPaths.set(threadId, file);
+      return (await fs.stat(file)).mtimeMs;
+    } catch {
+      // A path that stopped resolving is re-looked-up next sweep rather than
+      // cached as broken.
+      rolloutPaths.delete(threadId);
+      return null;
+    }
+  };
+  const sweepStalledTurns = async (): Promise<void> => {
+    const now = Date.now();
+    for (const tab of await storage.listTabMeta()) {
+      if (tab.session.provider !== "codex" || !tab.session.threadId) continue;
+      let runtime: RuntimeFile;
+      try { runtime = await storage.readRuntime(tab.id); } catch { continue; }
+      const working = Boolean(runtime.runner.activeTurnId) && runnerIsWorking(runtime.runner.state);
+      const decision = decideStall({
+        working,
+        lastProgressAtMs: working ? await lastRolloutWrite(tab.session.threadId) : null,
+        stalledSince: runtime.runner.stalledSince,
+        nowMs: now,
+      });
+      if (decision.action === "none") continue;
+      await storage.withTabLock(tab.id, async () => {
+        const bundle = await storage.readTab(tab.id);
+        // Re-read under the lock: the turn may have completed while the stat ran.
+        if (bundle.runtime.runner.activeTurnId !== runtime.runner.activeTurnId) return;
+        const stalledSince = decision.action === "mark" ? decision.since : null;
+        if (bundle.runtime.runner.stalledSince === stalledSince) return;
+        await storage.writeRuntime(tab.id, RuntimeFileSchema.parse({
+          ...bundle.runtime,
+          runner: { ...bundle.runtime.runner, stalledSince },
+          revision: bundle.runtime.revision + 1,
+        }));
+      });
+    }
+  };
+  const stallTimer = setInterval(() => { void sweepStalledTurns().catch(() => undefined); }, TURN_STALL_POLL_MS);
+  stallTimer.unref?.();
+
   // Sealed buckets are appended once a minute, off the hot path. `unref` so a
   // measurement timer never keeps the process alive on its own.
   const flushTraffic = async (): Promise<void> => {
@@ -963,6 +1022,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   if (trafficLoggingEnabled) void trafficLog.prune();
 
   app.promptor = { storage, codex, claude, cursor, pty, runners, timers, ui, traffic, documents, token, restoreOpenSessions, close: async () => {
+    clearInterval(stallTimer);
     if (trafficFlushTimer) clearInterval(trafficFlushTimer);
     if (trafficPruneTimer) clearInterval(trafficPruneTimer);
     // Seal the minute in progress so a restart does not lose it.

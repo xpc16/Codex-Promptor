@@ -274,6 +274,9 @@ input, textarea, select { color: var(--text); }
 .queue-state { min-width: 0; display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; }
 .queue-state > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .queue-state.error { color: var(--danger); }
+/* A stalled turn is still running, so this warns rather than reporting a failure. */
+.queue-state.stalled { color: var(--notice); }
+.queue-state.stalled .status-dot { background: currentColor; }
 .queue-state .status-dot { flex: none; }
 .runner-actions { flex: none; display: flex; flex-wrap: nowrap; justify-content: flex-end; gap: 5px; }
 .runner-start-button { padding: 7px 10px; font-size: 12px; }

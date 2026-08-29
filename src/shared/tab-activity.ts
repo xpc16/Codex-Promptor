@@ -26,6 +26,17 @@ export function runnerIsWorking(state: RuntimeFile["runner"]["state"]): boolean 
 }
 
 /**
+ * Whole minutes since a stalled turn last recorded anything, for the label the
+ * reader sees. Shared because the server decides when to set the mark and the
+ * client decides how to say it.
+ */
+export function stalledMinutes(since: string, nowMs: number): number {
+  const from = Date.parse(since);
+  if (!Number.isFinite(from)) return 0;
+  return Math.max(0, Math.floor((nowMs - from) / 60_000));
+}
+
+/**
  * Where a runner's intent lands when the loop it belonged to no longer exists
  * -- across a service restart, or after a session was torn down and reopened.
  *

@@ -74,11 +74,12 @@ export function DocumentView({ state, loader, onClose }: { state: DocumentViewer
     void loader.open({ href, tabId: state.source.tabId, parentDocId: state.docId });
   };
   const percent = state.totalBytes > 0 ? Math.min(100, Math.round(state.loadedBytes / state.totalBytes * 100)) : 100;
+  const progressLabel = `${state.loadedBytes.toLocaleString()} / ${state.totalBytes.toLocaleString()} B · ${percent}%`;
   return <div className="document-view" role="region" aria-label={t("document.viewer")}>
     <div className="document-toolbar">
       <span className="document-title" title={state.name}>{state.name || t("document.opening")}</span>
-      <span className="document-progress">{state.loadedBytes.toLocaleString()} / {state.totalBytes.toLocaleString()} B · {percent}%</span>
-      <button className="ghost compact" onClick={onClose}>{t("document.close")}</button>
+      <span className="document-progress" title={progressLabel}>{progressLabel}</span>
+      <button type="button" className="ghost compact document-close" aria-label={t("document.close")} title={t("document.close")} onClick={onClose}>{t("document.close")}</button>
     </div>
     <div className="document-scroll" ref={scroll} onScroll={onScroll}>
       {state.kind === "text" && <pre className="document-text">{state.textSegments}</pre>}

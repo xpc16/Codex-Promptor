@@ -160,6 +160,10 @@ export const RuntimeFileSchema = z.object({
     activePromptId: z.string().nullable().default(null),
     activeTurnId: z.string().nullable().default(null),
     lastError: z.object({ code: z.string(), message: z.string() }).nullable().default(null),
+    // When the running turn last recorded anything, set only once it has been
+    // quiet long enough to be worth saying so. Never changes the turn's state:
+    // a stalled turn is still running as far as everything else is concerned.
+    stalledSince: z.string().nullable().default(null),
     lastTransitionAt: z.string().default(isoNow),
   }).default({
     desiredState: "paused",
@@ -167,6 +171,7 @@ export const RuntimeFileSchema = z.object({
     activePromptId: null,
     activeTurnId: null,
     lastError: null,
+    stalledSince: null,
     lastTransitionAt: isoNow(),
   }),
   terminal: z.object({
