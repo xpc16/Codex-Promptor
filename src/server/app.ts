@@ -24,7 +24,7 @@ import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
 import { locateCodexRollout, readCodexThreadForHistory } from "./codex-history.js";
-import { decideStall, TURN_STALL_POLL_MS } from "./turn-stall.js";
+import { decideStall, noteRolloutSize, TURN_STALL_POLL_MS, type RolloutProgress } from "./turn-stall.js";
 import { readCodexRolloutCached } from "./codex-rollout-cache.js";
 import { RESTORE_STAGGER_MS, restoreOrder, runRestoreQueue, type RestoreQueue } from "./restore-plan.js";
 import { appendRestoreTimings, createPhaseRecorder, formatDuration, formatRestoreTimings, type PhaseRecorder, type RestoreTrace } from "./restore-timing.js";
@@ -976,15 +976,34 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
    * runs, so nothing is interrupted and no state is changed on this account.
    */
   const rolloutPaths = new Map<string, string>();
-  const lastRolloutWrite = async (threadId: string): Promise<number | null> => {
+  /**
+   * How large a rollout was when it was last seen to change, and when that was.
+   *
+   * The size, not the modification time. Windows does not push a file's
+   * last-write time to the directory entry while a handle stays open for
+   * appending, and Codex holds the rollout open for the life of the session:
+   * one measured here was still reporting 05:02 fifty minutes after its last
+   * record was written at 05:51. `stat` reads the size from the file itself and
+   * it was exact to the byte, so growth is the signal and the clock is ours.
+   */
+  const rolloutProgress = new Map<string, RolloutProgress>();
+  const rolloutFile = async (threadId: string): Promise<string | null> => {
+    const known = rolloutPaths.get(threadId);
+    if (known) return known;
+    const found = await locateCodexRollout(threadId).catch(() => null);
+    if (found) rolloutPaths.set(threadId, found);
+    return found;
+  };
+  const lastRolloutGrowth = async (threadId: string, nowMs: number): Promise<number | null> => {
     try {
-      const file = rolloutPaths.get(threadId) ?? await locateCodexRollout(threadId);
+      const file = await rolloutFile(threadId);
       if (!file) return null;
-      rolloutPaths.set(threadId, file);
-      return (await fs.stat(file)).mtimeMs;
+      const progress = noteRolloutSize(rolloutProgress.get(threadId), (await fs.stat(file)).size, nowMs);
+      rolloutProgress.set(threadId, progress);
+      return progress.seenAtMs;
     } catch {
-      // A path that stopped resolving is re-looked-up next sweep rather than
-      // cached as broken.
+      // A path that stopped resolving is looked up again next sweep rather
+      // than cached as broken.
       rolloutPaths.delete(threadId);
       return null;
     }
@@ -996,12 +1015,24 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       let runtime: RuntimeFile;
       try { runtime = await storage.readRuntime(tab.id); } catch { continue; }
       const working = Boolean(runtime.runner.activeTurnId) && runnerIsWorking(runtime.runner.state);
+      const lastProgressAtMs = working ? await lastRolloutGrowth(tab.session.threadId, now) : null;
       const decision = decideStall({
         working,
-        lastProgressAtMs: working ? await lastRolloutWrite(tab.session.threadId) : null,
+        lastProgressAtMs,
         stalledSince: runtime.runner.stalledSince,
         nowMs: now,
       });
+      // A quiet rollout is the same picture whether the turn died or finished
+      // without us hearing about it, and the two need opposite responses. The
+      // rollout says which: if the turn is recorded as finished there, the
+      // completion notification was simply lost -- observed on a turn that
+      // completed on disk at 05:51 and still had the queue on "running" at
+      // 06:03 -- so it is handed to whatever is waiting for it, and the queue
+      // carries on through its own path rather than being nudged from outside.
+      if (working && decision.action === "mark") {
+        const settled = await settleTurnFromRollout(tab.id, tab.session.threadId, runtime.runner.activeTurnId!).catch(() => false);
+        if (settled) continue;
+      }
       if (decision.action === "none") continue;
       await storage.withTabLock(tab.id, async () => {
         const bundle = await storage.readTab(tab.id);
@@ -1017,6 +1048,25 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       });
     }
   };
+  /**
+   * Delivers a completion the notification never carried.
+   *
+   * Codex can route a turn's completion to the interactive TUI client instead
+   * of this one -- waitForTurn already works around that with a summary poll,
+   * but the App Server's summary can stay unsettled while the TUI drives the
+   * same thread, and then nothing ever looks at the rollout. The rollout is the
+   * append-only record and it says plainly that the turn is over.
+   */
+  const settleTurnFromRollout = async (tabId: string, threadId: string, turnId: string): Promise<boolean> => {
+    const manager = codex.existing(tabId);
+    const file = await rolloutFile(threadId);
+    if (!manager || !file || !manager.rpc.isAwaitingTurn(turnId)) return false;
+    const thread = await readCodexRolloutCached(file, threadId, storage.historyCachePath(tabId));
+    const turn = thread.turns.find((item) => item.id === turnId);
+    if (!turn || turn.status === "running") return false;
+    return manager.rpc.settleTurnFromRecord(threadId, turn, turn.items);
+  };
+
   const stallTimer = setInterval(() => { void sweepStalledTurns().catch(() => undefined); }, TURN_STALL_POLL_MS);
   stallTimer.unref?.();
 

@@ -508,6 +508,23 @@ export class CodexRpcClient extends EventEmitter {
     return unwrapThread(await this.readThread(threadId, Math.min(30_000, remainingMs)));
   }
 
+  /** Whether a turn is still being waited on here, so a caller knows if it is worth looking. */
+  isAwaitingTurn(turnId: string): boolean {
+    return this.turns.has(turnId) && !this.completed.has(turnId);
+  }
+
+  /**
+   * Settle a turn from Codex's own record when its completion notification
+   * never arrived. Returns false if it was already settled or was never one of
+   * ours, so this can be called speculatively.
+   */
+  settleTurnFromRecord(threadId: string, turn: any, items: any[]): boolean {
+    const turnId = String(turn?.id ?? turn?.turnId ?? "");
+    if (!turnId || !this.isAwaitingTurn(turnId)) return false;
+    this.rememberCompletedTurn({ threadId, turnId, turn, items: Array.isArray(items) ? items : [] });
+    return true;
+  }
+
   private rememberCompletedTurn(event: TurnCompletedEvent): TurnCompletedEvent {
     const existing = this.completed.get(event.turnId);
     if (existing) return existing;

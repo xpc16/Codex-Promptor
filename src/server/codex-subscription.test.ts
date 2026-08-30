@@ -120,3 +120,44 @@ describe("subscribing without making the tab wait", () => {
     expect(rpc.hasPendingSubscription("thread-1")).toBe(false);
   });
 });
+
+describe("settling a turn Codex never told us about", () => {
+  /** A client whose transport is replaced, so only the bookkeeping is under test. */
+  function client() {
+    const rpc = new CodexRpcClient();
+    (rpc as any).request = async (method: string) => {
+      if (method === "turn/start") return { turnId: "turn-1" };
+      return {};
+    };
+    return rpc;
+  }
+
+  it("hands a rollout-recorded completion to whoever is waiting", async () => {
+    // The observed failure: the turn completed on disk at 05:51 and the queue
+    // still had it running at 06:03. The completion notification can be routed
+    // to the interactive TUI instead of here, and the App Server summary that
+    // waitForTurn falls back to can stay unsettled while the TUI drives the
+    // same thread, so nothing ever looked at the rollout.
+    const rpc = client();
+    await rpc.startTurn("thread-1", "跑一下", "client-1", "D:" + '\\work');
+    expect(rpc.isAwaitingTurn("turn-1")).toBe(true);
+
+    const completed = new Promise<any>((resolve) => rpc.once("turnCompleted", resolve));
+    const settled = rpc.settleTurnFromRecord("thread-1", { id: "turn-1", status: "completed" }, [{ type: "agentMessage", text: "答" }]);
+
+    expect(settled).toBe(true);
+    expect(await completed).toMatchObject({ turnId: "turn-1", threadId: "thread-1" });
+    expect(await rpc.waitForTurn("turn-1", 1_000)).toMatchObject({ turnId: "turn-1" });
+  });
+
+  it("can be called speculatively without settling anything twice", async () => {
+    const rpc = client();
+    await rpc.startTurn("thread-1", "跑一下", "client-1", "D:" + '\\work');
+    expect(rpc.settleTurnFromRecord("thread-1", { id: "turn-1", status: "completed" }, [])).toBe(true);
+
+    // The sweep runs every 30 seconds and does not know what it will find.
+    expect(rpc.settleTurnFromRecord("thread-1", { id: "turn-1", status: "completed" }, [])).toBe(false);
+    expect(rpc.settleTurnFromRecord("thread-1", { id: "never-started", status: "completed" }, [])).toBe(false);
+    expect(rpc.isAwaitingTurn("turn-1")).toBe(false);
+  });
+});
