@@ -458,6 +458,8 @@ input, textarea, select { color: var(--text); }
 .welcome h1 { margin: 0 0 11px; color: var(--text); font-size: 28px; letter-spacing: -.03em; }
 .welcome p { margin: 0 0 25px; color: var(--muted); font-size: 15px; line-height: 1.75; }
 .loading-screen button { margin-top: 13px; padding: 8px 13px; border-radius: 8px; background: var(--primary-soft); color: var(--primary); }
+.loading-screen.failed p { max-width: 520px; color: var(--danger); line-height: 1.6; }
+.startup-error-mark { width: 34px; height: 34px; display: grid; place-items: center; border: 2px solid color-mix(in srgb, var(--danger) 60%, var(--border)); border-radius: 50%; color: var(--danger); font-weight: 800; }
 .orb, .spinner { border: 2px solid var(--border-strong); border-top-color: var(--primary); border-radius: 50%; animation: spin .9s linear infinite; }
 .orb { width: 34px; height: 34px; }
 .spinner { width: 26px; height: 26px; }

@@ -464,7 +464,11 @@ export function App() {
     catch (reason) { setError(reason); }
   };
 
-  if (!index) return <I18nContext.Provider value={i18n}><div className="loading-screen"><div className="orb" /><p>{error ? i18n.errorText(error) : t("app.loading")}</p><button onClick={() => void refresh()}>{t("action.retry")}</button></div></I18nContext.Provider>;
+  if (!index) return <I18nContext.Provider value={i18n}><div className={`loading-screen ${error ? "failed" : ""}`}>
+    {error ? <div className="startup-error-mark" aria-hidden="true">!</div> : <div className="orb" />}
+    <p role={error ? "alert" : undefined}>{error ? i18n.errorText(error) : t("app.loading")}</p>
+    <button onClick={() => void refresh()}>{t("action.retry")}</button>
+  </div></I18nContext.Provider>;
 
   return <I18nContext.Provider value={i18n}><div className="app-shell" ref={appShellRef} data-mobile-pane={mobilePane}>
     <aside className="sidebar" aria-label={t("aria.console")}>

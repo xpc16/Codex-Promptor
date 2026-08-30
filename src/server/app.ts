@@ -53,6 +53,7 @@ import { syncTerminalThreadSelection } from "./terminal-thread-sync.js";
 import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionHandler } from "./tui-protocol.js";
 import { TuiProxyPool } from "./tui-proxy.js";
 import { DEFAULT_UI_GRACE_MS, UiLifecycle } from "./ui-lifecycle.js";
+import { loadTrustedBrowserHosts } from "./trusted-hosts.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -178,14 +179,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   // The browser's Origin/Referer still has to match exactly, so this only
   // widens *which* host is eligible for the same-origin check below — it
   // does not skip the check itself.
-  const trustedHosts = (process.env.CODEX_PROMPTOR_TRUSTED_HOSTS ?? "")
-    .split(",")
-    .map((value) => value.trim().toLowerCase())
-    .filter(Boolean);
   const claudeVersion = probeClaudeVersion();
   const cursorVersion = probeCursorVersion();
 
   await storage.ensure();
+  const trustedHosts = await loadTrustedBrowserHosts(rootDir, process.env.CODEX_PROMPTOR_TRUSTED_HOSTS);
   const documents = await DocumentService.create(rootDir, storage);
   const readClientTab = (tabId: string): Promise<TabBundle> => storage.readTabWindow(tabId, INITIAL_PROMPT_WINDOW, INITIAL_ANSWER_WINDOW);
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
