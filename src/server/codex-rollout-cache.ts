@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createReadStream, promises as fs } from "node:fs";
-import { readCodexRolloutSlice, type CodexRolloutThread, type CodexRolloutTurn } from "./codex-history.js";
+import { locateCodexRollout, readCodexRolloutSlice, readRolloutHistoryBase, type CodexRolloutThread, type CodexRolloutTurn } from "./codex-history.js";
 
 /**
  * Reading a rollout once instead of once per launch.
@@ -25,6 +25,9 @@ import { readCodexRolloutSlice, type CodexRolloutThread, type CodexRolloutTurn }
 export const ROLLOUT_PARSE_VERSION = 1;
 
 const HEAD_BYTES = 4096;
+
+/** A fork of a fork is ordinary; a cycle is not. This bounds the walk either way. */
+const MAX_FORK_DEPTH = 16;
 
 export type RolloutCache = {
   version: number;
@@ -62,6 +65,29 @@ export function mergeCachedTurns(
   return [...merged, ...fresh.filter((turn) => !known.has(turn.id))];
 }
 
+/**
+ * The turns a forked thread inherited, by walking back through the rollouts it
+ * was forked from.
+ *
+ * Rewinding a turn forks the thread, and the fork's own rollout starts empty:
+ * its history is the parent's file up to the byte the fork was taken at. Read
+ * only the fork and the conversation looks brand new -- which also sent
+ * readCodexThreadForHistory to thread/read for the whole inherited history over
+ * RPC, and on a 179MB thread that is the frame that kills the connection.
+ */
+async function readInheritedTurns(file: string, threadId: string, depth = 0): Promise<CodexRolloutTurn[]> {
+  if (depth >= MAX_FORK_DEPTH) return [];
+  const base = await readRolloutHistoryBase(file).catch(() => null);
+  if (!base) return [];
+  const parent = await locateCodexRollout(base.threadId).catch(() => null);
+  if (!parent) return [];
+  const older = await readInheritedTurns(parent, base.threadId, depth + 1);
+  // Bounded to the byte the fork was taken at: everything after it in the
+  // parent is what the rewind discarded and is not this thread's history.
+  const own = await readCodexRolloutSlice(parent, threadId, 0, base.endByteOffset);
+  return mergeCachedTurns(older, own.turns);
+}
+
 async function readCache(cachePath: string): Promise<RolloutCache | null> {
   try {
     const parsed = JSON.parse(await fs.readFile(cachePath, "utf8"));
@@ -90,7 +116,11 @@ export async function readCodexRolloutCached(
     && cached.offset >= 0
     && cached.offset <= stat.size);
   const slice = await readCodexRolloutSlice(file, threadId, usable ? cached!.offset : 0);
-  const turns = usable ? mergeCachedTurns(cached!.turns, slice.turns) : slice.turns;
+  // Only on a cold read: a fork's inherited turns are a fixed byte range of an
+  // append-only file, so once they are in the cache they never change.
+  const turns = usable
+    ? mergeCachedTurns(cached!.turns, slice.turns)
+    : mergeCachedTurns(await readInheritedTurns(file, threadId), slice.turns);
   const next: RolloutCache = {
     version: ROLLOUT_PARSE_VERSION,
     threadId,

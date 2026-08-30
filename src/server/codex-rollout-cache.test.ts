@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile, appendFile, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile, appendFile, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -23,6 +23,12 @@ function runningTurnLines(turnId: string, prompt: string): string[] {
     JSON.stringify({ timestamp: "2026-08-28T00:01:01.000Z", payload: { type: "item_completed", turn_id: turnId, item: { type: "userMessage", content: prompt } } }),
   ];
 }
+
+const codexHome = process.env.CODEX_HOME;
+afterEach(() => {
+  if (codexHome === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = codexHome;
+});
 
 describe("incremental rollout reads", () => {
   let root: string;
@@ -169,5 +175,98 @@ describe("mergeCachedTurns", () => {
       [turn("t2", "completed"), turn("t3", "completed")],
     );
     expect(merged.map((item) => `${item.id}:${item.status}`)).toEqual(["t1:completed", "t2:completed", "t3:completed"]);
+  });
+});
+
+describe("a thread that was rewound", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "promptor-fork-"));
+    process.env.CODEX_HOME = root;
+  });
+  afterEach(async () => { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 60 }).catch(() => undefined); });
+
+  /**
+   * Rewinding a turn forks the thread: Codex starts a new one whose rollout is
+   * a session_meta naming the parent and the exact byte it was taken at, and
+   * nothing else. The sessions directory is redirected so locateCodexRollout
+   * finds these instead of the real ones.
+   */
+  async function rollout(threadId: string, lines: string[], base?: { threadId: string; endByteOffset: number }): Promise<string> {
+    const directory = path.join(root, "sessions", "2026", "08", "30");
+    await mkdir(directory, { recursive: true });
+    const meta = JSON.stringify({
+      timestamp: "2026-08-30T04:55:53.995Z",
+      type: "session_meta",
+      payload: {
+        session_id: threadId,
+        id: threadId,
+        ...(base ? { forked_from_id: base.threadId, history_base: { thread_id: base.threadId, end_ordinal_exclusive: 1, end_byte_offset: base.endByteOffset } } : {}),
+      },
+    });
+    const file = path.join(directory, `rollout-2026-08-30T12-55-53-${threadId}.jsonl`);
+    await writeFile(file, `${[meta, ...lines].join("\n")}${"\n"}`, "utf8");
+    return file;
+  }
+
+  it("reads its history out of the rollout it was forked from", async () => {
+    // The reported failure: the fork's own rollout has no turns at all, so the
+    // conversation looked brand new and the history read fell through to
+    // thread/read for the whole inherited history over RPC -- which on a 179MB
+    // thread is the frame that kills the connection.
+    const parentFile = await rollout("parent-thread", [
+      ...turnLines("t1", "一", "答一"),
+      ...turnLines("t2", "二", "答二"),
+    ]);
+    const keep = (await readFile(parentFile)).length;
+    await appendFile(parentFile, `${turnLines("rewound", "被回退的一轮", "不该保留").join("\n")}${"\n"}`, "utf8");
+
+    const forkFile = await rollout("fork-thread", [], { threadId: "parent-thread", endByteOffset: keep });
+    expect((await readCodexRollout(forkFile, "fork-thread")).turns).toEqual([]);
+
+    const thread = await readCodexRolloutCached(forkFile, "fork-thread", path.join(root, "cache.json"));
+    // Everything up to the fork point, and nothing the rewind discarded.
+    expect(thread.turns.map((turn) => turn.id)).toEqual(["t1", "t2"]);
+  });
+
+  it("keeps inheriting once it has turns of its own", async () => {
+    const parentFile = await rollout("parent-thread", turnLines("t1", "一", "答一"));
+    const keep = (await readFile(parentFile)).length;
+    const forkFile = await rollout("fork-thread", turnLines("t2", "二", "答二"), { threadId: "parent-thread", endByteOffset: keep });
+    const cache = path.join(root, "cache.json");
+
+    expect((await readCodexRolloutCached(forkFile, "fork-thread", cache)).turns.map((turn) => turn.id)).toEqual(["t1", "t2"]);
+
+    // The inherited turns are a fixed byte range of an append-only file, so a
+    // warm read must keep them without going back for them.
+    await appendFile(forkFile, `${turnLines("t3", "三", "答三").join("\n")}${"\n"}`, "utf8");
+    expect((await readCodexRolloutCached(forkFile, "fork-thread", cache)).turns.map((turn) => turn.id)).toEqual(["t1", "t2", "t3"]);
+  });
+
+  it("walks back through a fork of a fork", async () => {
+    // The real conversation this came from had been rewound twice.
+    const rootFile = await rollout("root-thread", turnLines("t1", "一", "答一"));
+    const rootKeep = (await readFile(rootFile)).length;
+    const midFile = await rollout("mid-thread", turnLines("t2", "二", "答二"), { threadId: "root-thread", endByteOffset: rootKeep });
+    const midKeep = (await readFile(midFile)).length;
+    const leafFile = await rollout("leaf-thread", turnLines("t3", "三", "答三"), { threadId: "mid-thread", endByteOffset: midKeep });
+
+    const thread = await readCodexRolloutCached(leafFile, "leaf-thread", path.join(root, "cache.json"));
+    expect(thread.turns.map((turn) => turn.id)).toEqual(["t1", "t2", "t3"]);
+  });
+
+  it("carries on when the parent rollout is gone", async () => {
+    // Deleted or pruned history is not a reason to fail the conversation.
+    const forkFile = await rollout("fork-thread", turnLines("t2", "二", "答二"), { threadId: "missing-thread", endByteOffset: 999 });
+    const thread = await readCodexRolloutCached(forkFile, "fork-thread", path.join(root, "cache.json"));
+    expect(thread.turns.map((turn) => turn.id)).toEqual(["t2"]);
+  });
+
+  it("stops at a cycle instead of walking forever", async () => {
+    const aFile = await rollout("thread-a", turnLines("t1", "一", "答一"), { threadId: "thread-b", endByteOffset: 100 });
+    await rollout("thread-b", turnLines("t2", "二", "答二"), { threadId: "thread-a", endByteOffset: 100 });
+    const thread = await readCodexRolloutCached(aFile, "thread-a", path.join(root, "cache.json"));
+    expect(thread.turns.map((turn) => turn.id)).toContain("t1");
   });
 });

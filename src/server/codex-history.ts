@@ -223,11 +223,13 @@ export function parseCodexRollout(contents: string, threadId: string): CodexRoll
 async function feedRolloutLines(
   file: string,
   from: number,
+  to: number | null,
   push: (line: string, startOffset: number) => void,
 ): Promise<number> {
+  if (to !== null && to <= from) return from;
   let buffer: Buffer = Buffer.alloc(0);
   let bufferStart = from;
-  const stream = createReadStream(file, { start: from });
+  const stream = createReadStream(file, to === null ? { start: from } : { start: from, end: to - 1 });
   for await (const chunk of stream as AsyncIterable<Buffer>) {
     buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk;
     let index = buffer.indexOf(0x0a);
@@ -239,7 +241,10 @@ async function feedRolloutLines(
       index = buffer.indexOf(0x0a);
     }
   }
-  if (buffer.length) {
+  // Only an open-ended read may hand over a line with no newline yet: there it
+  // is a record still being written and is real data. Inside a bound it is
+  // whatever happened to straddle the cut, which belongs to the other side.
+  if (buffer.length && to === null) {
     const line = buffer.toString("utf8");
     push(line.endsWith("\r") ? line.slice(0, -1) : line, bufferStart);
   }
@@ -254,11 +259,56 @@ export type CodexRolloutSlice = {
   endOffset: number;
 };
 
-/** The turns a rollout records from a byte offset onwards. */
-export async function readCodexRolloutSlice(file: string, threadId: string, from = 0): Promise<CodexRolloutSlice> {
+/** The turns a rollout records between two byte offsets; `to` null means to the end. */
+export async function readCodexRolloutSlice(
+  file: string,
+  threadId: string,
+  from = 0,
+  to: number | null = null,
+): Promise<CodexRolloutSlice> {
   const parser = createRolloutParser(threadId);
-  const endOffset = await feedRolloutLines(file, from, (line, startOffset) => parser.push(line, startOffset));
+  const endOffset = await feedRolloutLines(file, from, to, (line, startOffset) => parser.push(line, startOffset));
   return { turns: parser.finish().turns, resumeOffset: parser.resumeOffset(endOffset), endOffset };
+}
+
+/**
+ * Where a forked thread's history came from.
+ *
+ * Rewinding a turn in the TUI does not edit the thread, it forks it: Codex
+ * starts a new thread with a new id whose rollout begins empty apart from a
+ * `session_meta` record naming the parent and the exact byte of the parent's
+ * rollout the fork was taken at. Everything before that byte is this thread's
+ * history and lives in the parent's file; reading only the fork's own rollout
+ * finds no turns at all.
+ */
+export type RolloutHistoryBase = { threadId: string; endByteOffset: number };
+
+/** How far in the opening record is looked for. Session metadata carries the whole system prompt. */
+const SESSION_META_SCAN_BYTES = 8 * 1024 * 1024;
+
+export async function readRolloutHistoryBase(file: string): Promise<RolloutHistoryBase | null> {
+  let head: string | null = null;
+  let buffer: Buffer = Buffer.alloc(0);
+  const stream = createReadStream(file, { start: 0, end: SESSION_META_SCAN_BYTES - 1 });
+  try {
+    for await (const chunk of stream as AsyncIterable<Buffer>) {
+      buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk;
+      const index = buffer.indexOf(0x0a);
+      if (index === -1) continue;
+      head = buffer.subarray(0, index).toString("utf8");
+      break;
+    }
+  } finally {
+    stream.destroy();
+  }
+  if (head === null) return null;
+  let record: any;
+  try { record = JSON.parse(head); } catch { return null; }
+  const base = record?.payload?.history_base ?? record?.payload?.historyBase;
+  const threadId = String(base?.thread_id ?? base?.threadId ?? "");
+  const endByteOffset = Number(base?.end_byte_offset ?? base?.endByteOffset);
+  if (!threadId || !Number.isSafeInteger(endByteOffset) || endByteOffset <= 0) return null;
+  return { threadId, endByteOffset };
 }
 
 /** The same parse, fed from disk, so file size bounds the time it takes and not the memory it needs. */

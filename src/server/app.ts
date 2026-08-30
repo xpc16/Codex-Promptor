@@ -858,8 +858,19 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       // does, and CodexRpcClient makes that wait. So the tab opens now and the
       // subscription lands behind it.
       subscribeInBackground(tab, rpc);
-      await recorder.step("history", async () => {
-        await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, tab.session.threadId!, cachedRollout(tabId)));
+      // Best effort, deliberately. Nothing the conversation needs to work
+      // depends on this: the terminal is the TUI's own and the queue talks to
+      // the App Server. Failing the whole reopen over it left a usable session
+      // marked closed -- and because an oversized thread/read is remembered,
+      // every retry failed at once, so the conversation could not be opened at
+      // all. It is reported instead, and everything else carries on.
+      const historyError = await recorder.step("history", async (): Promise<string | null> => {
+        try {
+          await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, tab.session.threadId!, cachedRollout(tabId)));
+          return null;
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
       });
       await storage.updateTab(tabId, (current) => ({
         ...current,
@@ -867,6 +878,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         updatedAt: isoNow(),
       }));
       await clearSessionNotReadyError(storage, tabId);
+      if (historyError) {
+        await storage.updateTab(tabId, (current) => ({
+          ...current,
+          session: { ...current.session, lastError: { code: "HISTORY_SYNC_FAILED", message: historyError } },
+          updatedAt: isoNow(),
+        }));
+      }
       // A non-empty Codex input buffer avoids the empty-input cursor repaint
       // loop seen in the remote TUI. This draft space is never submitted and
       // queue prompts continue to use App Server turn/start or turn/steer.
