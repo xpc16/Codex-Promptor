@@ -71,6 +71,38 @@ describe("native provider session switches", () => {
     expect(bundle.answers.answers).toContainEqual(expect.objectContaining({ threadId: "session-new", finalAnswer: "new answer" }));
   });
 
+  it("retires a runner failure once a turn driven from the terminal succeeds", async () => {
+    // lastError explains why the queue stopped, and only the queue cleared it.
+    // A conversation whose turns are all typed into the terminal therefore kept
+    // reporting one old failure forever, while visibly working the whole time.
+    root = await mkdtemp(path.join(os.tmpdir(), "promptor-runner-error-"));
+    const staticRoot = path.join(root, "dist", "client");
+    await mkdir(staticRoot, { recursive: true });
+    await writeFile(path.join(staticRoot, "index.html"), "<!doctype html><title>test</title>", "utf8");
+    app = await createApp(root);
+    await app.ready();
+
+    const tab = await app.promptor.storage.createTab("Runner error");
+    await app.promptor.storage.updateTab(tab.id, (current) => ({
+      ...current,
+      updatedAt: isoNow(),
+      session: { ...current.session, provider: "claude", state: "ready", workingDirectory: root, threadId: "session-1", sessionId: "session-1", connectedAt: isoNow() },
+    }));
+    const runtime = await app.promptor.storage.readRuntime(tab.id);
+    runtime.runner.state = "error";
+    runtime.runner.lastError = { code: "TURN_FAILED", message: "CLAUDE_TURN_NOT_FOUND:0e753900" };
+    await app.promptor.storage.writeRuntime(tab.id, runtime);
+
+    const manager = app.promptor.claude.get(tab.id);
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "session-1", cwd: root, transcript_path: path.join(root, "session-1.jsonl") });
+    await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-1", prompt_id: "manual-1", prompt: "typed straight in" });
+    await manager.handleHook({ hook_event_name: "Stop", session_id: "session-1", prompt_id: "manual-1", last_assistant_message: "done" });
+
+    await eventually(async () => (await app!.promptor.storage.readRuntime(tab.id)).runner.lastError === null);
+    const cleared = await app.promptor.storage.readRuntime(tab.id);
+    expect(cleared.runner.state).toBe("paused");
+  });
+
   it("binds a new Codex conversation to the thread its first prompt creates", async () => {
     // Codex's TUI has no thread until something is submitted, so a new
     // conversation opens with none. The SessionStart hook that arrives with the

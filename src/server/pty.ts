@@ -349,11 +349,17 @@ export function sliceTerminalBuffer(source: Pick<TerminalBuffer, "generation" | 
       && requestedOffset <= source.nextOffset;
     const maximum = Number(cursor.maxCatchUpBytes);
     const hasMaximum = Number.isSafeInteger(maximum) && maximum >= 0;
-    if (canContinueFromCursor && hasMaximum && source.nextOffset - requestedOffset > maximum) {
+    // A caller that set a bound is asking not to be handed a replay, and a
+    // cursor that fell out of the rolling buffer is the largest gap there is.
+    // Answering that one with a full reset ignored the bound in exactly the
+    // case it was asked for, and a megabyte of scrollback is painted the same
+    // way any other catch-up is: a chunk per frame, visibly fast-forwarding.
+    if (hasMaximum && (!canContinueFromCursor || source.nextOffset - requestedOffset > maximum)) {
+      const at = canContinueFromCursor ? requestedOffset : source.nextOffset;
       return {
         generation: source.generation,
-        startOffset: requestedOffset,
-        endOffset: requestedOffset,
+        startOffset: at,
+        endOffset: at,
         reset: false,
         dataBase64: "",
         catchUpExceeded: true,

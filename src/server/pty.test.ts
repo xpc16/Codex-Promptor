@@ -86,4 +86,15 @@ describe("remote Codex terminal command", () => {
     const snapshot = sliceTerminalBuffer(source, { generation: "generation-1", nextOffset: 10, maxCatchUpBytes: 32 });
     expect(snapshot).toMatchObject({ startOffset: 10, endOffset: 10, reset: false, catchUpExceeded: true, dataBase64: "" });
   });
+
+  it("treats a cursor that fell out of the buffer as over the bound too", () => {
+    // The largest gap there is, answered until now with the whole retained
+    // buffer -- which the browser paints a chunk per frame, so the terminal
+    // fast-forwards through it instead of showing where things ended up.
+    const source = { generation: "generation-1", buffer: Buffer.from("x".repeat(100), "utf8"), bufferStart: 400, nextOffset: 500 };
+    const stale = sliceTerminalBuffer(source, { generation: "generation-1", nextOffset: 12, maxCatchUpBytes: 64 });
+    expect(stale).toMatchObject({ startOffset: 500, endOffset: 500, reset: false, catchUpExceeded: true, dataBase64: "" });
+    // Without a bound the retained buffer is still the right answer.
+    expect(sliceTerminalBuffer(source, { generation: "generation-1", nextOffset: 12 })).toMatchObject({ reset: true });
+  });
 });

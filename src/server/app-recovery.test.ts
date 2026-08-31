@@ -48,6 +48,30 @@ describe("runtime recovery", () => {
     }
   });
 
+  it("does not carry a dead runner's failure across a restart", async () => {
+    // The runner that failed is gone with the process that hosted it. Keeping
+    // its error made a healthy conversation report a failure from a previous
+    // run, indefinitely -- nothing but starting the queue ever cleared it.
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-runner-error-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      const tab = await storage.createTab("旧错误");
+      const bundle = await storage.readTab(tab.id);
+      bundle.runtime.terminal.state = "running";
+      bundle.runtime.runner.state = "error";
+      bundle.runtime.runner.lastError = { code: "TURN_FAILED", message: "CLAUDE_TURN_NOT_FOUND:0e753900" };
+      await storage.writeRuntime(tab.id, bundle.runtime);
+
+      expect(await recoverTerminalRuntime(storage)).toBe(1);
+      const recovered = await storage.readTab(tab.id);
+      expect(recovered.runtime.runner.lastError).toBeNull();
+      expect(recovered.runtime.runner.state).toBe("paused");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("closes sessions and pauses queues whose processes cannot survive restart", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-session-recovery-"));
     try {

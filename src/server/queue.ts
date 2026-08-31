@@ -784,9 +784,21 @@ export class QueueRunner extends EventEmitter {
   }
 
   private async setRunnerState(state: RuntimeFile["runner"]["state"], activePromptId: string | null = null, activeTurnId: string | null = null): Promise<void> {
+    // A runner that is working again is not a runner that failed. The error is
+    // what explains a stopped queue, so it lasts exactly as long as the stop
+    // does; keeping it any longer made one old failure read as a broken
+    // conversation through every successful turn that came after it.
+    const working = state === "dispatching" || state === "running";
     await this.updateRuntime((runtime) => ({
       ...runtime,
-      runner: { ...runtime.runner, state, activePromptId, activeTurnId, lastTransitionAt: isoNow() },
+      runner: {
+        ...runtime.runner,
+        state,
+        activePromptId,
+        activeTurnId,
+        ...(working ? { lastError: null } : {}),
+        lastTransitionAt: isoNow(),
+      },
     }));
   }
 

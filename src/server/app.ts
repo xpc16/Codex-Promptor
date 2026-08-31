@@ -484,6 +484,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         // those are reconciled here together with the manual turn.
         if (bundle.runtime.runner.activeTurnId === event.turnId) return;
         await recordTurn(storage, tabId, { threadId: event.threadId, turn: event.turn, items: event.items, origin: "manual" });
+        // A manual turn that finished is proof the agent is working.
+        if (String(event.turn?.status ?? "") === "completed") {
+          await clearRunnerFailure(storage, tabId);
+          await emitSnapshot(tabId);
+        }
       } catch { /* manual history is reconciled by the explicit sync endpoint */ }
     });
     manager.rpc.on("serverRequest", (request: any) => {
@@ -608,6 +613,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         const bundle = await storage.readTab(tabId);
         if (bundle.runtime.runner.activeTurnId === event.turnId) return;
         await recordTurn(storage, tabId, { threadId: event.threadId, turn: event.turn, items: event.items, origin: "manual" });
+        // A manual turn that finished is proof the agent is working.
+        if (String(event.turn?.status ?? "") === "completed") {
+          await clearRunnerFailure(storage, tabId);
+          await emitSnapshot(tabId);
+        }
       } catch { /* explicit history sync reconstructs a missed manual turn */ }
     });
   });
@@ -629,6 +639,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           items: event.items,
           origin: "manual",
         });
+        // A manual turn that finished is proof the agent is working.
+        if (String(event.turn?.status ?? "") === "completed") {
+          await clearRunnerFailure(storage, tabId);
+          await emitSnapshot(tabId);
+        }
       } catch { /* explicit history sync can reconstruct the transcript later */ }
     });
   });
@@ -644,6 +659,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         const bundle = await storage.readTab(tabId);
         if (bundle.runtime.runner.activeTurnId === event.turnId) return;
         await recordTurn(storage, tabId, { threadId: event.threadId, turn: event.turn, items: event.items, origin: "manual" });
+        // A manual turn that finished is proof the agent is working.
+        if (String(event.turn?.status ?? "") === "completed") {
+          await clearRunnerFailure(storage, tabId);
+          await emitSnapshot(tabId);
+        }
       } catch { /* explicit history sync can reconstruct the transcript later */ }
     });
   });
@@ -2817,6 +2837,36 @@ async function restoreTerminalSize(storage: StorageService, pty: PtyManager, tab
   if (cols !== null && rows !== null) pty.resize(tabId, cols, rows);
 }
 
+/**
+ * Retires a runner failure that a later turn has disproved.
+ *
+ * `lastError` explains why the queue stopped, and only the queue itself clears
+ * it. A turn the reader drove from the terminal never goes through the queue,
+ * so one old failure kept reading as "编程代理执行失败" through every manual turn
+ * after it -- with the terminal, the agent and the queue all visibly healthy.
+ */
+async function clearRunnerFailure(storage: StorageService, tabId: string): Promise<void> {
+  await storage.withTabLock(tabId, async () => {
+    const bundle = await storage.readTab(tabId);
+    const runner = bundle.runtime.runner;
+    // A queue turn in flight owns this field and clears it on its own terms.
+    if (!runner.lastError || runner.activeTurnId || runner.activePromptId) return;
+    const runtime = RuntimeFileSchema.parse({
+      ...bundle.runtime,
+      revision: bundle.runtime.revision + 1,
+      runner: {
+        ...runner,
+        // Nothing is failing any more. The queue's own intent is not this
+        // function's to change, so an idle queue stays paused, not armed.
+        state: runner.state === "error" ? "paused" : runner.state,
+        lastError: null,
+        lastTransitionAt: isoNow(),
+      },
+    });
+    await storage.writeRuntime(tabId, runtime);
+  });
+}
+
 async function clearSessionNotReadyError(storage: StorageService, tabId: string): Promise<void> {
   await storage.withTabLock(tabId, async () => {
     const bundle = await storage.readTab(tabId);
@@ -2897,7 +2947,10 @@ export async function recoverTerminalRuntime(storage: StorageService): Promise<n
         const runtime = RuntimeFileSchema.parse({
           ...bundle.runtime,
           revision: bundle.runtime.revision + 1,
-          runner: { ...bundle.runtime.runner, desiredState: settledDesiredState(bundle.runtime.runner.desiredState), state: "paused", activePromptId: null, activeTurnId: null, lastTransitionAt: recoveredAt },
+          // The runner this error belonged to no longer exists. Carrying it
+          // across a restart left a healthy conversation reporting a failure
+          // from a previous run; the prompts it touched keep their own errors.
+          runner: { ...bundle.runtime.runner, desiredState: settledDesiredState(bundle.runtime.runner.desiredState), state: "paused", activePromptId: null, activeTurnId: null, lastError: null, lastTransitionAt: recoveredAt },
           terminal: {
             ...bundle.runtime.terminal,
             state: appServerCleanupError ? "error" : "stopped",

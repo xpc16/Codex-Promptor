@@ -25,6 +25,7 @@ import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { sameTerminalSize, terminalFrameLooksSettled, terminalResetNeedsSettling, TerminalCursorQuietScheduler, TerminalResizeScheduler } from "./terminal-resize.js";
+import { terminalVisibilityAction } from "./terminal-visibility.js";
 import { loadTabWithRetry, retainRecentTabIds } from "./tab-load.js";
 import { MOBILE_PANES, type MobilePane } from "./mobile-pane.js";
 import { dialogSurvivesIndex, nextSelectedTabId, shouldAdoptIndexRevision } from "./index-sync.js";
@@ -1431,6 +1432,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     let rawLeaseWritable = true;
     let awaitingRawOneShot = false;
     let rawOneShotAttempts = 0;
+    let pageHidden = typeof document !== "undefined" && document.visibilityState === "hidden";
     const pendingProjectionInput: string[] = [];
     const initialSize = !projectionMode && runtime.terminal.cols !== null && runtime.terminal.rows !== null
       ? { cols: runtime.terminal.cols, rows: runtime.terminal.rows }
@@ -1629,6 +1631,25 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       resizeFrame = requestAnimationFrame(sendSize);
     };
     scheduleLayout.current = scheduleSize;
+    const applyPageVisibility = () => {
+      const hidden = document.visibilityState === "hidden";
+      if (hidden === pageHidden) return;
+      pageHidden = hidden;
+      const action = terminalVisibilityAction({ hidden, documentVisible: documentVisibleRef.current, projectionMode, active: activeRef.current });
+      if (action === "none") return;
+      if (action === "unsubscribe") {
+        awaitingRawOneShot = false;
+        sendSubscription(false);
+        return;
+      }
+      // Bounded, so the server answers a short absence with the few bytes that
+      // were missed and a long one with catchUpExceeded -- which comes back as
+      // a single screen snapshot instead of a replay.
+      rawOneShotAttempts = 0;
+      sendSubscription(true, false, true);
+      scheduleSize();
+    };
+    document.addEventListener("visibilitychange", applyPageVisibility);
     const observer = new ResizeObserver(scheduleSize); observer.observe(host.current);
     const releasePaneDrag = onPaneDragEnd(scheduleSize);
     const currentTerminalSubscription = (boundedCatchUp = false) => projectionMode
@@ -1763,6 +1784,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
         return;
       }
       awaitingRawOneShot = false;
+      rawOneShotAttempts = 0;
       const state = result.state;
       const bytes = new TextEncoder().encode(projectionScreenToAnsi(state));
       terminalWriteEpoch += 1;
@@ -1797,8 +1819,8 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
           } else if (projectionMode) sendSubscription(true);
           else requestRawOneShot();
         };
-        sendSubscription(!documentVisibleRef.current, reconnecting);
-        if (!projectionMode && !documentVisibleRef.current) scheduleSize();
+        sendSubscription(!documentVisibleRef.current && !pageHidden, reconnecting);
+        if (!projectionMode && !documentVisibleRef.current && !pageHidden) scheduleSize();
       };
       ws.onmessage = (event) => {
         try {
@@ -1873,6 +1895,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       cursorQuietScheduler.dispose();
       terminalWriteSequence += 1;
       observer.disconnect();
+      document.removeEventListener("visibilitychange", applyPageVisibility);
       releasePaneDrag();
       inputDisposable.dispose(); foregroundQuery.dispose(); backgroundQuery.dispose(); colorSchemeQuery.dispose(); cursorBlinkOn.dispose(); cursorBlinkOff.dispose();
       inputCoalescer.flush(); inputCoalescer.dispose();
