@@ -12,7 +12,8 @@
     "start": "node dist/server/main.js",
     "typecheck": "tsc -p config/tsconfig.client.json --noEmit && tsc -p config/tsconfig.server.json --noEmit",
     "test": "vitest --config config/vitest.config.ts run",
-    "test:watch": "vitest --config config/vitest.config.ts"
+    "test:watch": "vitest --config config/vitest.config.ts",
+    "check:codex": "node scripts/check-codex-compat.mjs"
   },
   "dependencies": {
     "@fastify/compress": "9.2.0",
