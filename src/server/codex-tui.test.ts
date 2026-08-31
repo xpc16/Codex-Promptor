@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildCodexHookOverride, buildCodexTuiLaunch, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, CodexTuiManager, resolveHookCommandPaths, spaceFreePath } from "./codex-tui.js";
+import { buildCodexHookOverride, buildCodexTuiLaunch, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, codexTuiReady, CodexTuiManager, resolveHookCommandPaths, spaceFreePath } from "./codex-tui.js";
 
 describe("Codex native PTY/hooks provider", () => {
   it("builds per-run hooks and keeps every Codex argument in an argv slot", () => {
@@ -142,21 +142,51 @@ describe("the questions Codex asks before a session exists", () => {
 
   it("is not seen in ordinary output", () => {
     expect(codexStartupQuestion("codex resuming thread 01a0...")).toBeNull();
-    // A list with no one waiting on it is not a question.
-    expect(codexStartupQuestion("› 1. Review hooks\n  2. Trust all and continue")).toBeNull();
+    // The composer's own prompt marker carries no option number.
+    expect(codexStartupQuestion("› Implement {feature}\n gpt-5.6-sol · Context 100% left")).toBeNull();
+    // A short terminal can cut the screen in half. Either half still means
+    // Codex is waiting, so half a question is reported without a name.
+    expect(codexStartupQuestion("› 1. Review hooks\n  2. Trust all and continue")).toBe("Codex 启动提问");
+    expect(codexStartupQuestion("  Press enter to confirm or esc to go back")).toBe("Codex 启动提问");
   });
 
   it("stops the clock while a question is on screen, and names it when it is never answered", async () => {
     const manager = new CodexTuiManager("tab-question", { write: () => undefined } as any);
     await manager.beginLaunch({ cwd: "D:\\work", launch: { mode: "new" }, hookScriptPath: "scripts/codex-hook.mjs" });
-    let onScreen = true;
     const started = Date.now();
     // A 20ms budget would have expired long before this resolves; the question
     // has to hold it open for the reader, then hand back what to answer.
-    const waiting = manager.waitForSession(20, undefined, () => (onScreen ? codexStartupQuestion(hooksReview) : null), 400);
-    setTimeout(() => { onScreen = false; }, 250);
+    const waiting = manager.waitForStartup(
+      { startupError: () => null, question: () => codexStartupQuestion(hooksReview), ready: () => false },
+      { timeoutMs: 20, questionTimeoutMs: 300, pollMs: 20 },
+    );
     await expect(waiting).rejects.toThrow("CODEX_STARTUP_QUESTION_UNANSWERED:Hooks need review");
-    expect(Date.now() - started).toBeGreaterThan(200);
+    expect(Date.now() - started).toBeGreaterThan(250);
+  });
+
+  it("starts as soon as the TUI is taking input, without waiting for a hook", async () => {
+    // Codex creates the session -- and fires SessionStart -- only on the first
+    // prompt, so a launch that waited for that hook could never finish.
+    const manager = new CodexTuiManager("tab-ready", { write: () => undefined } as any);
+    await manager.beginLaunch({ cwd: "D:\\work", launch: { mode: "new" }, hookScriptPath: "scripts/codex-hook.mjs" });
+    let screen = hooksReview;
+    setTimeout(() => { screen = "  >_ OpenAI Codex (v0.147.0)\n› Implement {feature}"; }, 120);
+    await manager.waitForStartup(
+      { startupError: () => null, question: () => codexStartupQuestion(screen), ready: () => codexTuiReady(screen) },
+      { timeoutMs: 50, questionTimeoutMs: 5_000, settleMs: 60_000, pollMs: 20 },
+    );
+    expect(codexTuiReady(hooksReview)).toBe(false);
+    expect(codexTuiReady(directoryTrust)).toBe(false);
+    // The composer, which is what a short or narrow terminal is left showing.
+    expect(codexTuiReady("› Implement {feature}")).toBe(true);
+  });
+
+  it("adopts a session whose id the caller already knows", async () => {
+    const manager = new CodexTuiManager("tab-resume", { write: () => undefined } as any);
+    await manager.beginLaunch({ cwd: "D:\\work", launch: { mode: "resume", sessionId: "thread-1" }, hookScriptPath: "scripts/codex-hook.mjs" });
+    await manager.attachKnownSession({ sessionId: "thread-1", cwd: "D:\\work", transcriptPath: null, source: "resume" });
+    expect((await manager.waitForSession(50)).sessionId).toBe("thread-1");
+    expect(manager.session?.sessionId).toBe("thread-1");
   });
 
   it("tells the reader what to do about each hook failure", () => {

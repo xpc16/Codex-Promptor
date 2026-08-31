@@ -70,6 +70,48 @@ describe("native provider session switches", () => {
     });
     expect(bundle.answers.answers).toContainEqual(expect.objectContaining({ threadId: "session-new", finalAnswer: "new answer" }));
   });
+
+  it("binds a new Codex conversation to the thread its first prompt creates", async () => {
+    // Codex's TUI has no thread until something is submitted, so a new
+    // conversation opens with none. The SessionStart hook that arrives with the
+    // first prompt is the only thing that can supply one, and until this bound
+    // it the conversation stayed unrunnable for the rest of its life.
+    root = await mkdtemp(path.join(os.tmpdir(), "promptor-codex-adopt-"));
+    const staticRoot = path.join(root, "dist", "client");
+    await mkdir(staticRoot, { recursive: true });
+    await writeFile(path.join(staticRoot, "index.html"), "<!doctype html><title>test</title>", "utf8");
+    app = await createApp(root);
+    await app.ready();
+
+    const tab = await app.promptor.storage.createTab("Codex adopt");
+    await app.promptor.storage.updateTab(tab.id, (current) => ({
+      ...current,
+      updatedAt: isoNow(),
+      session: {
+        ...current.session,
+        provider: "codex",
+        state: "ready",
+        reopenOnLaunch: true,
+        workingDirectory: root,
+        threadId: null,
+        sessionId: null,
+        connectedAt: isoNow(),
+      },
+    }));
+
+    await app.promptor.codexTui.get(tab.id).handleHook({
+      hook_event_name: "SessionStart",
+      session_id: "01a05706-ef06-7b11-8c3b-ada4281ea2cb",
+      cwd: root,
+      transcript_path: path.join(root, "missing-rollout.jsonl"),
+    });
+
+    await eventually(async () => (await app!.promptor.storage.getTabMeta(tab.id)).session.threadId === "01a05706-ef06-7b11-8c3b-ada4281ea2cb");
+    const bound = await app.promptor.storage.getTabMeta(tab.id);
+    expect(bound.session).toMatchObject({ provider: "codex", state: "ready", sessionId: "01a05706-ef06-7b11-8c3b-ada4281ea2cb" });
+    // Nothing was switched away from, so no switch is reported.
+    expect(bound.session.lastThreadSwitch).toBeNull();
+  });
 });
 
 async function eventually(check: () => Promise<boolean>, timeoutMs = 2_000): Promise<void> {

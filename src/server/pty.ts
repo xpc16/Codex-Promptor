@@ -287,6 +287,18 @@ export class PtyManager extends EventEmitter {
   }
   setScreenResponder(tabId: string, enabled: boolean): void { this.screens.get(tabId)?.setResponderEnabled(enabled); }
   setScreenTheme(tabId: string, theme: TerminalTheme): void { this.screens.get(tabId)?.setTheme(theme); }
+  /**
+   * What the terminal is showing right now, as plain text.
+   *
+   * The rolling buffer is a transcript, not a screen: a question that has been
+   * answered stays in it forever, so anything asking "is the agent waiting for
+   * me" has to read the parsed screen instead.
+   */
+  async screenText(tabId: string, viewportRows = 40): Promise<string> {
+    const snapshot = await this.screenSnapshot(tabId, viewportRows);
+    if (!snapshot) return "";
+    return snapshot.rows.map((row) => row.runs.map((run) => run.text).join("")).join("\n");
+  }
   async screenSnapshot(tabId: string, viewportRows = 20): Promise<TerminalScreenSnapshot | null> {
     const screen = this.screens.get(tabId);
     if (!screen) return null;

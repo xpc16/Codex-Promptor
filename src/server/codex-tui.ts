@@ -28,6 +28,21 @@ export function codexStartupQuestionFrom(message: string): string | null {
 }
 
 export type CodexTuiLaunch = { mode: "new" } | { mode: "resume"; sessionId: string };
+export type CodexStartupProbe = {
+  /** A terminal that failed outright, reported by name. */
+  startupError: () => string | null;
+  /** The question on screen right now, if Codex is waiting for an answer. */
+  question: () => Promise<string | null> | string | null;
+  /** Whether the TUI is visibly past its startup screens. */
+  ready: () => Promise<boolean> | boolean;
+};
+export type CodexStartupOptions = {
+  timeoutMs?: number;
+  questionTimeoutMs?: number;
+  /** How long a quiet, unrecognised screen counts as started. */
+  settleMs?: number;
+  pollMs?: number;
+};
 export type CodexTuiSessionInfo = {
   sessionId: string;
   cwd: string;
@@ -124,36 +139,79 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
     return buildCodexTuiLaunch(options.cwd, options.launch, script, node, options.bypassHookTrust);
   }
 
-async waitForSession(
-    timeoutMs = 30_000,
-    startupError?: () => string | null,
-    pendingQuestion?: () => string | null,
-    questionTimeoutMs = 10 * 60_000,
-  ): Promise<CodexTuiSessionInfo> {
+/**
+   * Waits until the Codex TUI is taking input.
+   *
+   * Not until a session exists: Codex creates one -- and fires SessionStart --
+   * only when the first prompt is submitted. Measured on 0.147.0, `codex
+   * resume` sat for eighteen seconds with no hook of any kind, then fired
+   * SessionStart 1.5s after the first Enter. Opening a conversation by waiting
+   * for that hook therefore deadlocks: the queue cannot submit until the
+   * session is ready, and the session is not ready until something submits.
+   *
+   * `ready` reads Codex's own wording so the common case finishes as soon as
+   * the TUI paints. The settle window behind it does not, so a Codex that
+   * renames its status line still opens, just a few seconds slower.
+   */
+  async waitForStartup(probe: CodexStartupProbe, options: CodexStartupOptions = {}): Promise<void> {
     const ready = this.launchReady;
     if (!ready) throw new Error("CODEX_TUI_LAUNCH_NOT_PREPARED");
-    let deadline = Date.now() + timeoutMs;
-    const latest = Date.now() + Math.max(timeoutMs, questionTimeoutMs);
+    const timeoutMs = options.timeoutMs ?? 30_000;
+    const questionTimeoutMs = options.questionTimeoutMs ?? 10 * 60_000;
+    const settleMs = options.settleMs ?? 4_000;
+    const pollMs = options.pollMs ?? 250;
+    const started = Date.now();
+    const latest = started + Math.max(timeoutMs, questionTimeoutMs);
+    let deadline = started + timeoutMs;
     let asked: string | null = null;
+    let quietSince = started;
     while (Date.now() < deadline) {
-      if (ready.settled) return ready.promise;
-      const error = startupError?.();
+      if (ready.settled) return;
+      const error = probe.startupError();
       if (error) throw new Error(error);
       // Codex is waiting for an answer, not stuck. Counting down through the
       // question and then killing the terminal would take away the very prompt
       // the reader has to answer, so the clock stops while it is on screen.
-      const question = pendingQuestion?.();
+      const question = await probe.question();
       if (question) {
         asked = question;
+        quietSince = Date.now();
         deadline = Math.min(latest, Date.now() + questionTimeoutMs);
+      } else {
+        if (await probe.ready()) return;
+        if (Date.now() - quietSince >= settleMs) return;
       }
-      const result = await Promise.race([
-        ready.promise.then((value) => ({ value })),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), Math.min(150, Math.max(1, deadline - Date.now())))),
-      ]);
-      if (result) return result.value;
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
     }
-    throw new Error(asked ? `${CODEX_STARTUP_QUESTION_UNANSWERED}:${asked}` : "CODEX_HOOK_TRUST_REQUIRED_OR_SESSION_START_TIMEOUT");
+    throw new Error(asked ? `${CODEX_STARTUP_QUESTION_UNANSWERED}:${asked}` : "CODEX_TUI_START_TIMEOUT");
+  }
+
+  /**
+   * Attaches to a session whose id the caller already knows.
+   *
+   * A resume carries the id it asked for and keeps it -- measured: SessionStart,
+   * UserPromptSubmit and Stop all reported back the same id `codex resume` was
+   * given -- so there is nothing to wait for. The hooks still arrive at the
+   * first prompt and confirm what is recorded here.
+   */
+  async attachKnownSession(info: CodexTuiSessionInfo): Promise<CodexTuiSessionInfo> {
+    this.attached = { ...info };
+    this.sessionCursor = await transcriptCursor(info.transcriptPath);
+    this.launchReady?.resolve(this.attached);
+    this.emit("session", this.attached);
+    return { ...this.attached };
+  }
+
+  /** Resolves once a session exists, however it came to exist. */
+  async waitForSession(timeoutMs = 30_000): Promise<CodexTuiSessionInfo> {
+    const ready = this.launchReady;
+    if (!ready) throw new Error("CODEX_TUI_LAUNCH_NOT_PREPARED");
+    const result = await Promise.race([
+      ready.promise.then((value) => ({ value })),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+    ]);
+    if (!result) throw new Error("CODEX_SESSION_START_TIMEOUT");
+    return result.value;
   }
 
   async handleHook(payload: any): Promise<void> {
@@ -591,10 +649,12 @@ export async function resolveCodexTuiLaunch(launch: AgentProcessLaunch): Promise
 }
 
 const QUESTION_OPTION = /^›\s*\d+[.)]\s+\S/u;
+const QUESTION_FOOTER = /press enter to \w/i;
 const QUESTION_HEADING_LINES = 8;
+const UNNAMED_QUESTION = "Codex 启动提问";
 
 /**
- * The question Codex is waiting on before any session exists, or null.
+ * The question Codex is showing before any session exists, or null.
  *
  * More than one screen can stop a launch here: the working-directory trust
  * prompt, then the hooks review (tui/src/startup_hooks_review.rs), and a later
@@ -604,17 +664,23 @@ const QUESTION_HEADING_LINES = 8;
  * away the prompt the reader was supposed to answer.
  *
  * They share a shape rather than a wording: a numbered list whose current row
- * is marked with U+203A, under a heading, above a "press enter" footer.
- * Matching the shape parks the clock for a question this code has never seen.
+ * is marked with U+203A, above a "press enter" footer. Matching the shape parks
+ * the clock for a question this code has never seen.
+ *
+ * Pass what the terminal is showing now, never the rolling buffer: the buffer
+ * keeps every answered question forever, and a question that reads as pending
+ * for the rest of the session never lets the launch finish.
  */
-export function codexStartupQuestion(output: string): string | null {
-  const lines = stripTerminalControls(output).split(/\r?\n/).map((line) => line.trim());
+export function codexStartupQuestion(screen: string): string | null {
+  const lines = stripTerminalControls(screen).split(/\r?\n/).map((line) => line.trim());
   let selected = -1;
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     if (QUESTION_OPTION.test(lines[index])) { selected = index; break; }
   }
-  if (selected < 0) return null;
-  if (!lines.slice(selected).some((line) => /press enter/i.test(line))) return null;
+  // A short terminal may show only one half of the screen. Either half is
+  // enough: the composer's own "› " prompt carries no option number, so this
+  // does not fire on an idle TUI.
+  if (selected < 0) return lines.some((line) => QUESTION_FOOTER.test(line)) ? UNNAMED_QUESTION : null;
   // The heading sits a few lines above the options, past the wrapped detail
   // text. Keep the topmost line of that run: it is the question itself, where
   // the lines below it only qualify the answer.
@@ -625,7 +691,26 @@ export function codexStartupQuestion(output: string): string | null {
     if (!line || line.startsWith(">") || /^\d+[.)]\s/u.test(line) || QUESTION_OPTION.test(line)) continue;
     heading = line;
   }
-  return heading;
+  return heading ?? UNNAMED_QUESTION;
+}
+
+/**
+ * Whether the Codex TUI is past its startup screens and taking input.
+ *
+ * Codex only prints its header box and status line once every startup question
+ * has been answered, so either is positive evidence that the launch is through.
+ * Callers must not rely on this alone -- it reads Codex's wording, which can
+ * change -- but it turns the common case from "wait out a settle window" into
+ * "start as soon as it is ready".
+ */
+export function codexTuiReady(screen: string): boolean {
+  const plain = stripTerminalControls(screen);
+  // The composer is the one part that stays on screen at any size: the header
+  // box scrolls off a short terminal and the status line is truncated by a
+  // narrow one. Its marker is the same U+203A the option rows use, so the
+  // absence of an option number is what separates "type here" from "choose".
+  if (plain.split(/\r?\n/).some((line) => /^\s*›\s+(?!\d+[.)]\s)\S/u.test(line))) return true;
+  return />_\s*OpenAI Codex/i.test(plain) || /context\s+\d+%\s*left/i.test(plain);
 }
 
 export function codexHookStartupError(output: string): string | null {
@@ -647,15 +732,18 @@ export function codexHookFailureText(message: string): string | null {
   if (question) {
     return `Codex 正在下方终端里等你回答：「${question}」。用方向键选择后回车（钩子信任请选 Trust all and continue），答案会被 Codex 记住；随后点「重新打开」即可连上。`;
   }
-  if (message.includes("CODEX_HOOK_TRUST_REQUIRED")) {
+  // Matched exactly: this code used to be tested with `includes`, which also
+  // swallowed the plain start timeout and told the reader to answer a trust
+  // prompt that was not on screen.
+  if (message.trim() === "CODEX_HOOK_TRUST_REQUIRED") {
     return "Codex 正在终端里请求信任本应用的钩子。请在下方终端选择「Trust all and continue」，然后重新打开该对话。";
   }
   const spaces = /CODEX_HOOK_PATH_HAS_SPACES:(.*)$/.exec(message);
   if (spaces) {
     return `钩子命令里的路径含空格，而 Codex 会按空格拆分命令且不识别引号：${spaces[1].trim()}。请把 Node 或本应用安装到不含空格的路径，或启用该盘符的 8.3 短路径。`;
   }
-  if (message.includes("SESSION_START_TIMEOUT")) {
-    return "Codex 启动后一直没有回报 SessionStart 钩子。若终端里有信任提示请先同意；否则用 npm run check:codex 确认钩子是否可用。";
+  if (message.trim() === "CODEX_TUI_START_TIMEOUT") {
+    return "Codex 终端启动后一直没有进入可输入状态。请查看下方终端里 Codex 的输出。";
   }
   return null;
 }

@@ -17,7 +17,7 @@ import {
   MAX_WINDOW_RECORDS,
 } from "../shared/tab-window.js";
 import { AppServerPool, type AppServerManager, type CodexRpcClient, terminateStaleAppServer, waitForThreadLoaded } from "./codex.js";
-import { CodexTuiPool, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, resolveCodexTuiLaunch, type CodexTuiManager } from "./codex-tui.js";
+import { CodexTuiPool, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, codexTuiReady, resolveCodexTuiLaunch, type CodexTuiManager } from "./codex-tui.js";
 import { ClaudeCodePool, type ClaudeCodeManager, probeClaudeVersion } from "./claude.js";
 import { syncClaudeHistory } from "./claude-history.js";
 import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorHookBridge, probeCursorVersion } from "./cursor.js";
@@ -524,12 +524,15 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (currentManager !== manager) return;
       const tab = await storage.getTabMeta(tabId);
       const fromThreadId = tab.session.threadId;
-      if (tab.session.provider !== provider || tab.session.state !== "ready" || !fromThreadId || fromThreadId === session.sessionId) return;
+      if (tab.session.provider !== provider || tab.session.state !== "ready" || fromThreadId === session.sessionId) return;
+      // Nothing to switch away from: a new Codex conversation is bound here,
+      // when the first submitted prompt finally makes Codex create the thread.
+      const adopting = !fromThreadId;
 
       // SessionStart has already moved the native TUI. Stop any old queue turn
       // before rebinding persistence, then keep pending prompts for the newly
       // selected conversation through the common history reconciliation.
-      await runners.get(tabId).freeze().catch(() => undefined);
+      if (!adopting) await runners.get(tabId).freeze().catch(() => undefined);
       const switchedAt = isoNow();
       const workingDirectory = await validWorkingDirectory(session.cwd) ?? tab.session.workingDirectory;
       await storage.updateTab(tabId, (current) => ({
@@ -543,7 +546,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           sessionId: session.sessionId,
           connectedAt: switchedAt,
           lastError: null,
-          lastThreadSwitch: { fromThreadId, toThreadId: session.sessionId, method: "session/start", switchedAt },
+          lastThreadSwitch: adopting
+            ? current.session.lastThreadSwitch
+            : { fromThreadId: fromThreadId!, toThreadId: session.sessionId, method: "session/start", switchedAt },
         },
         updatedAt: switchedAt,
       }));
@@ -553,8 +558,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       } else if (provider === "claude") await syncClaudeHistory(storage, tabId, session.sessionId, session.transcriptPath);
       else await syncCursorHistoryIfAvailable(tabId, session.sessionId, session.transcriptPath);
       await clearSessionNotReadyError(storage, tabId);
-      emit(tabId, { type: "thread.switched", switch: { fromThreadId, toThreadId: session.sessionId, method: "session/start", switchedAt } });
-        emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
+      if (!adopting) emit(tabId, { type: "thread.switched", switch: { fromThreadId: fromThreadId!, toThreadId: session.sessionId, method: "session/start", switchedAt } });
+      emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
     }).catch(async (error) => {
       const message = error instanceof Error ? error.message : String(error);
       try {
@@ -705,14 +710,21 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         CODEX_PROMPTOR_CODEX_HOOK_URL: codexHookUrl(tabId, lease.nonce),
         CODEX_PROMPTOR_HOOK_SECRET: lease.secret,
       }, theme);
-      const session = await manager.waitForSession(
-        30_000,
-        () => pty.startupError(tabId) ?? codexHookStartupError(pty.recentOutput(tabId)),
-        () => codexStartupQuestion(pty.recentOutput(tabId)),
-      );
-      if (launch.mode === "resume" && session.sessionId !== launch.sessionId) {
-        throw new Error(`CODEX_RESUME_ID_MISMATCH:${launch.sessionId}:${session.sessionId}`);
-      }
+      await manager.waitForStartup({
+        startupError: () => pty.startupError(tabId) ?? codexHookStartupError(pty.recentOutput(tabId)),
+        question: async () => codexStartupQuestion(await pty.screenText(tabId)),
+        ready: async () => codexTuiReady(await pty.screenText(tabId)),
+      });
+      // A new conversation has no session yet, and cannot be given one: Codex
+      // creates the thread when the first prompt is submitted. Reporting that
+      // honestly beats waiting thirty seconds for a hook that is not coming.
+      if (launch.mode === "new") return { manager, session: manager.session };
+      const session = await manager.attachKnownSession({
+        sessionId: launch.sessionId,
+        cwd,
+        transcriptPath: await rolloutFile(launch.sessionId),
+        source: "resume",
+      });
       return { manager, session };
     } catch (error) {
       revokeHookLease("codex", tabId);
@@ -950,6 +962,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         tab.session.workingDirectory!,
         { mode: "resume", sessionId: tab.session.threadId! },
       ));
+      // Only a new conversation comes back without one, and this is a resume.
+      if (!session) throw new Error("CODEX_RESUME_SESSION_MISSING");
       const historyError = await recorder.step("history", async (): Promise<string | null> => {
         try {
           await syncCodexNativeHistory(tabId, session.sessionId, session.transcriptPath ?? manager.session?.transcriptPath);
@@ -2050,9 +2064,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           cwd,
           mode === "resume" ? { mode: "resume", sessionId: resumeId } : { mode: "new" },
         );
-        const report = mode === "resume"
+        const report = session && mode === "resume"
           ? await syncCodexNativeHistory(tabId, session.sessionId, session.transcriptPath ?? manager.session?.transcriptPath)
           : { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
+        // A new conversation has no thread yet: Codex creates one when the
+        // first prompt is submitted, and the SessionStart hook that follows is
+        // what binds it here. Recording null rather than inventing an id keeps
+        // the queue honestly disabled until there is something to queue onto.
         await storage.updateTab(tabId, (current) => ({
           ...current,
           session: {
@@ -2060,8 +2078,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             state: "ready",
             reopenOnLaunch: true,
             workingDirectory: cwd,
-            threadId: session.sessionId,
-            sessionId: session.sessionId,
+            threadId: session?.sessionId ?? null,
+            sessionId: session?.sessionId ?? null,
             createdAt: current.session.createdAt ?? now,
             connectedAt: isoNow(),
             lastError: null,
@@ -2222,7 +2240,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await awaitThreadSwitch(tabId);
       const bundle = await storage.readTab(tabId);
       const tab = bundle.tab;
-      if (!tab.session.threadId && tab.session.provider !== "shell") return apiError(reply, 400, "SESSION_NOT_READY", "This tab has no active session.");
+      // A Codex conversation that was opened but never prompted has a terminal
+      // and no thread. Refusing to close it would strand the terminal.
+      const openWithoutThread = tab.session.state === "ready" && pty.has(tabId);
+      if (!tab.session.threadId && tab.session.provider !== "shell" && !openWithoutThread) {
+        return apiError(reply, 400, "SESSION_NOT_READY", "This tab has no active session.");
+      }
       await runners.get(tabId).freeze();
       // A terminal reaches this route with no threadId at all, so narrow here
       // rather than leaning on the guard above having ruled null out.
