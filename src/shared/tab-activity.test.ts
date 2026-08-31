@@ -49,6 +49,7 @@ describe("what counts as the agent working", () => {
     // still running, so the indicator must not go dark yet.
     expect(runnerIsWorking("pausing")).toBe(true);
     expect(runnerIsWorking("dispatching")).toBe(true);
+    expect(runnerIsWorking("reconciling")).toBe(true);
     expect(runnerIsWorking("running")).toBe(true);
   });
 

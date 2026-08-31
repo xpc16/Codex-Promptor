@@ -460,4 +460,39 @@ describe("history sync", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("merge mode imports evidence without deleting local or unparsed records", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-history-merge-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      const tab = await storage.createTab("migration merge");
+      const bundle = await storage.readTab(tab.id);
+      const local = newPrompt("local completed prompt", "manual");
+      Object.assign(local, { status: "completed", threadId: "thread-merge", codexTurnId: "local-turn", completedAt: "2026-08-20T00:00:00.000Z" });
+      const pending = newPrompt("keep pending after history");
+      bundle.prompts.prompts = [local, pending];
+      bundle.answers.answers = [{
+        id: "local-answer", promptId: local.id, threadId: "thread-merge", codexTurnId: "local-turn", origin: "manual",
+        prompt: local.text, status: "completed", finalAnswer: "local answer", captureMode: "phase_final_answer",
+        startedAt: null, completedAt: local.completedAt, recordedAt: local.completedAt!, clientUserMessageId: null, error: null, metadata: {},
+      }];
+      await storage.writePrompts(tab.id, bundle.prompts);
+      await storage.writeAnswers(tab.id, bundle.answers);
+
+      await syncHistory(storage, tab.id, {
+        id: "thread-merge",
+        turns: [{
+          id: "imported-turn", status: "completed",
+          items: [{ type: "userMessage", text: "imported history" }, { type: "agentMessage", phase: "final_answer", text: "imported answer" }],
+        }],
+      }, { mode: "merge" });
+
+      const synced = await storage.readTab(tab.id);
+      expect(synced.prompts.prompts.map((prompt) => prompt.text)).toEqual(["imported history", "local completed prompt", "keep pending after history"]);
+      expect(synced.answers.answers.map((answer) => answer.finalAnswer)).toEqual(["local answer", "imported answer"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

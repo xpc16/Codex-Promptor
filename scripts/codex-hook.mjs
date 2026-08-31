@@ -1,7 +1,7 @@
-// Claude Code command-hook bridge. SessionStart does not support Claude's
-// native HTTP hook type, so all Promptor lifecycle events use this silent
-// command hook and post to the tab-private loopback endpoint instead.
-const hookUrl = process.env.CODEX_PROMPTOR_CLAUDE_HOOK_URL;
+// Codex command-hook bridge. Hooks are a fast observability path only; the
+// rollout remains the reconciliation authority when this best-effort POST is
+// delayed or lost.
+const hookUrl = process.env.CODEX_PROMPTOR_CODEX_HOOK_URL;
 const hookSecret = process.env.CODEX_PROMPTOR_HOOK_SECRET;
 const eventName = process.argv[2] ?? "";
 
@@ -25,5 +25,5 @@ try {
     signal: AbortSignal.timeout(5_000),
   });
 } catch {
-  // Observation must never block or add text to UserPromptSubmit/SessionStart.
+  // A missing Promptor must never block or alter an independent Codex TUI.
 }

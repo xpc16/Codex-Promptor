@@ -1395,7 +1395,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     ? resolveAutomaticTerminalTransport(location.hostname)
     : "raw";
   const runnerBusy = runtime.runner.desiredState === "running"
-    || ["starting", "waiting_for_thread", "dispatching", "running", "waiting_for_prompt", "pausing"].includes(runtime.runner.state);
+    || ["starting", "waiting_for_thread", "dispatching", "reconciling", "running", "waiting_for_prompt", "pausing"].includes(runtime.runner.state);
   closedRef.current = closed;
   activeRef.current = active;
   themeRef.current = theme;

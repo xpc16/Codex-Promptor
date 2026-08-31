@@ -368,7 +368,16 @@ export async function recordTurn(storage: StorageService, tabId: string, options
 
 export type HistoryReport = { imported: number; skipped: number; ignored: number; repaired: number };
 
-export async function syncHistory(storage: StorageService, tabId: string, thread: any): Promise<HistoryReport> {
+export type SyncHistoryOptions = {
+  /**
+   * `authoritative` mirrors a complete provider history. `merge` is used by
+   * migrations and partial recovery reads: it may add/repair evidence but must
+   * never delete a local record merely because this parse did not see it.
+   */
+  mode?: "authoritative" | "merge";
+};
+
+export async function syncHistory(storage: StorageService, tabId: string, thread: any, options: SyncHistoryOptions = {}): Promise<HistoryReport> {
   const threadId = String(thread?.id ?? thread?.threadId ?? "");
   if (!threadId) throw new Error("THREAD_ID_MISSING");
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
@@ -656,20 +665,22 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
     }
     // final_answers.json mirrors the active conversation. Old-thread answers are
     // reproducible from Codex and must not leak into the currently selected tab.
-    const seenAnswerTurns = new Set<string>();
-    const syncedAnswers = bundle.answers.answers.filter((answer) => {
-      const linkedLifecyclePrompt = bundle.prompts.prompts.find((prompt) => prompt.threadId === threadId
-        && prompt.codexTurnId === answer.codexTurnId
-        && prompt.status === answer.status);
-      const keepLocalLifecycle = answer.status !== "completed" && Boolean(linkedLifecyclePrompt);
-      const keep = answer.threadId === threadId
-        && (recordedAnswerTurnIds.has(answer.codexTurnId) || keepLocalLifecycle)
-        && !seenAnswerTurns.has(answer.codexTurnId);
-      if (keep) seenAnswerTurns.add(answer.codexTurnId);
-      else answerChanges += 1;
-      return keep;
-    });
-    bundle.answers.answers = syncedAnswers;
+    if (options.mode !== "merge") {
+      const seenAnswerTurns = new Set<string>();
+      const syncedAnswers = bundle.answers.answers.filter((answer) => {
+        const linkedLifecyclePrompt = bundle.prompts.prompts.find((prompt) => prompt.threadId === threadId
+          && prompt.codexTurnId === answer.codexTurnId
+          && prompt.status === answer.status);
+        const keepLocalLifecycle = answer.status !== "completed" && Boolean(linkedLifecyclePrompt);
+        const keep = answer.threadId === threadId
+          && (recordedAnswerTurnIds.has(answer.codexTurnId) || keepLocalLifecycle)
+          && !seenAnswerTurns.has(answer.codexTurnId);
+        if (keep) seenAnswerTurns.add(answer.codexTurnId);
+        else answerChanges += 1;
+        return keep;
+      });
+      bundle.answers.answers = syncedAnswers;
+    }
 
     // The Codex history is authoritative and stays first. Keep this thread's
     // local non-history state, then append unbound/current pending prompts in
@@ -682,17 +693,14 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
     // human prompt), remove that stale record on the next sync. Keep locally
     // recorded queue/manual completions because the provider transcript can
     // lag briefly behind the durable local lifecycle record.
-    const completedRemainder = remainder.filter((prompt) => prompt.threadId === threadId
-      && prompt.status === "completed"
-      && prompt.origin !== "imported");
-    const currentNonPending = remainder.filter((prompt) => prompt.threadId === threadId && prompt.status !== "completed" && prompt.status !== "pending");
-    const queuedPending = remainder.filter((prompt) => prompt.status === "pending" && (!prompt.threadId || prompt.threadId === threadId));
-    const orderedPrompts = [
-      ...historyPrompts,
-      ...completedRemainder,
-      ...currentNonPending,
-      ...queuedPending,
-    ];
+    const orderedPrompts = options.mode === "merge"
+      ? [...historyPrompts, ...remainder]
+      : [
+        ...historyPrompts,
+        ...remainder.filter((prompt) => prompt.threadId === threadId && prompt.status === "completed" && prompt.origin !== "imported"),
+        ...remainder.filter((prompt) => prompt.threadId === threadId && prompt.status !== "completed" && prompt.status !== "pending"),
+        ...remainder.filter((prompt) => prompt.status === "pending" && (!prompt.threadId || prompt.threadId === threadId)),
+      ];
     if (orderedPrompts.length !== bundle.prompts.prompts.length
       || orderedPrompts.some((prompt, index) => bundle.prompts.prompts[index]?.id !== prompt.id)) {
       bundle.prompts.prompts = orderedPrompts;

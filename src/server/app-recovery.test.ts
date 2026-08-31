@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { isoNow, newAttempt, newPrompt } from "../shared/schemas.js";
-import { answerEventType, isLocalHost, isTrustedBrowserOrigin, isTrustedBrowserRequest, isValidResumeId, recordOpenSessionsForNextLaunch, recoverTerminalRuntime, tabsToRestore } from "./app.js";
+import { answerEventType, codexConnectionModeFromEnv, isLocalHost, isTrustedBrowserOrigin, isTrustedBrowserRequest, isValidResumeId, recordOpenSessionsForNextLaunch, recoverTerminalRuntime, tabsToRestore } from "./app.js";
 import { StorageService } from "./storage.js";
 
 describe("provider resume id validation", () => {
@@ -15,6 +15,14 @@ describe("provider resume id validation", () => {
     expect(isValidResumeId("cursor", "project-chat-name")).toBe(true);
     expect(isValidResumeId("cursor", "chat\nname")).toBe(false);
     expect(isValidResumeId("cursor", "")).toBe(false);
+  });
+});
+
+describe("Codex connection mode", () => {
+  it("keeps App Server as the safe default and enables PTY/hooks explicitly", () => {
+    expect(codexConnectionModeFromEnv(undefined)).toBe("app-server");
+    expect(codexConnectionModeFromEnv("unknown")).toBe("app-server");
+    expect(codexConnectionModeFromEnv("PTY-HOOKS")).toBe("pty-hooks");
   });
 });
 

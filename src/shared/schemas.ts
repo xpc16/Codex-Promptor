@@ -132,6 +132,7 @@ export const RunnerStateSchema = z.enum([
   "starting",
   "waiting_for_thread",
   "dispatching",
+  "reconciling",
   "running",
   "waiting_for_prompt",
   "pausing",

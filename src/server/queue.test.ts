@@ -404,6 +404,55 @@ describe("queue pause boundary", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("interrupts an unconfirmed PTY submission before a provider turn id exists", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-queue-unconfirmed-"));
+    const storage = new StorageService(root);
+    try {
+      await storage.ensure();
+      const tab = await storage.createTab("unconfirmed submission");
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        updatedAt: isoNow(),
+        session: { ...current.session, state: "ready", workingDirectory: root, threadId: "thread-unconfirmed", sessionId: "thread-unconfirmed", connectedAt: isoNow() },
+      }));
+      const bundle = await storage.readTab(tab.id);
+      bundle.prompts.prompts.push(newPrompt("waiting for transcript", "queue"));
+      await storage.writePrompts(tab.id, bundle.prompts);
+
+      let rejectStart!: (error: Error) => void;
+      let pendingInterrupts = 0;
+      const binding = {
+        rpc: {
+          activeTurnIds: () => [],
+          waitForThreadIdle: async () => undefined,
+          startTurn: async () => new Promise<{ turnId: string }>((_resolve, reject) => { rejectStart = reject; }),
+          interruptPendingSubmission: async () => {
+            pendingInterrupts += 1;
+            rejectStart(new Error("PROMPT_SUBMISSION_INTERRUPTED"));
+            return true;
+          },
+        },
+      } as any;
+      const runner = new QueueRunner(tab.id, storage, binding, 200);
+      await runner.start();
+      await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.activePromptId !== null);
+
+      await expect(runner.interruptCurrent()).resolves.toBe(true);
+      const interrupted = await storage.readTab(tab.id);
+      expect(pendingInterrupts).toBe(1);
+      expect(interrupted.runtime.runner).toMatchObject({ desiredState: "paused", state: "paused", activePromptId: null, activeTurnId: null });
+      expect(interrupted.prompts.prompts[0]).toMatchObject({ status: "interrupted", error: { code: "TURN_INTERRUPTED" } });
+      expect(interrupted.answers.answers[0]).toMatchObject({
+        status: "interrupted",
+        error: { code: "TURN_INTERRUPTED" },
+        codexTurnId: expect.stringContaining("submission-interrupted:"),
+      });
+      await runner.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("insert now", () => {

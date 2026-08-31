@@ -13,6 +13,11 @@ export type TerminalLaunch =
   | { mode: "new" }
   | { mode: "resume"; threadId: string };
 
+export type AgentProcessLaunch = {
+  executable: string;
+  args: string[];
+};
+
 type TerminalBuffer = { generation: string; buffer: Buffer; bufferStart: number; nextOffset: number; exitMarker?: string; agentLabel?: string };
 type TerminalSize = { cols: number; rows: number };
 type Session = TerminalBuffer & TerminalSize & { process: pty.IPty; agentExited: boolean; inputPrimed: boolean; exitScanTail: string };
@@ -83,6 +88,53 @@ export class PtyManager extends EventEmitter {
     envPatch: Record<string, string> = {},
     theme: TerminalTheme = "light",
   ): Promise<void> {
+    return this.startTerminal(tabId, cwd, ["-NoLogo", "-NoExit", "-NoProfile"], agentLabel, exitMarker, envPatch, theme, (child) => {
+      child.write(`${command}\r`);
+    });
+  }
+
+  /**
+   * Launches an agent from an argv array instead of interpolating its arguments
+   * into a PowerShell command line. The tiny tracked launcher decodes the argv
+   * from an environment variable and uses PowerShell's call operator with an
+   * array, so hook TOML, spaces and Windows paths are never parsed twice.
+   * `-NoExit` deliberately leaves the shell available after the TUI exits.
+   */
+  async startArgvCommand(
+    tabId: string,
+    cwd: string,
+    launch: AgentProcessLaunch,
+    launcherPath: string,
+    agentLabel: string,
+    exitMarker: string,
+    envPatch: Record<string, string> = {},
+    theme: TerminalTheme = "light",
+  ): Promise<void> {
+    const spec = Buffer.from(JSON.stringify({ ...launch, cwd, theme, exitMarker, nodePath: process.execPath }), "utf8").toString("base64");
+    const shellArgs = process.platform === "win32"
+      ? ["-NoLogo", "-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", launcherPath]
+      : ["-NoLogo", "-NoExit", "-NoProfile", "-File", launcherPath];
+    return this.startTerminal(
+      tabId,
+      cwd,
+      shellArgs,
+      agentLabel,
+      exitMarker,
+      { ...envPatch, CODEX_PROMPTOR_AGENT_SPEC_BASE64: spec },
+      theme,
+    );
+  }
+
+  private async startTerminal(
+    tabId: string,
+    cwd: string,
+    shellArgs: string[],
+    agentLabel: string,
+    exitMarker: string,
+    envPatch: Record<string, string>,
+    theme: TerminalTheme,
+    onReady?: (child: pty.IPty) => void,
+  ): Promise<void> {
     await this.stop(tabId, false);
     this.archives.delete(tabId);
     this.screens.get(tabId)?.dispose();
@@ -94,7 +146,7 @@ export class PtyManager extends EventEmitter {
       // that size avoids loading a long history at 80x12 and immediately
       // forcing Codex to repaint the entire history at a second size.
       const initialSize = this.requestedSizes.get(tabId) ?? { cols: 80, rows: 12 };
-      const child = pty.spawn(shell, ["-NoLogo", "-NoExit", "-NoProfile"], {
+      const child = pty.spawn(shell, shellArgs, {
         name: "xterm-256color",
         cols: initialSize.cols,
         rows: initialSize.rows,
@@ -168,7 +220,7 @@ export class PtyManager extends EventEmitter {
       setTimeout(() => {
         if (this.sessions.get(tabId)?.process !== child) return;
         this.emitEvent({ tabId, type: "state", state: "running" });
-        child.write(`${command}\r`);
+        onReady?.(child);
       }, 180);
     } catch (error) {
       this.emitEvent({ tabId, type: "state", state: "error", message: error instanceof Error ? error.message : String(error) });
@@ -262,6 +314,11 @@ export class PtyManager extends EventEmitter {
     const source = this.sessions.get(tabId) ?? this.archives.get(tabId);
     if (!source) return null;
     return terminalStartupError(source.buffer.toString("utf8"), source.exitMarker, source.agentLabel);
+  }
+  recentOutput(tabId: string, maxBytes = 64 * 1024): string {
+    const source = this.sessions.get(tabId) ?? this.archives.get(tabId);
+    if (!source) return "";
+    return source.buffer.subarray(Math.max(0, source.buffer.length - maxBytes)).toString("utf8");
   }
   snapshot(tabId: string, cursor: TerminalCursor = {}): TerminalSnapshot | null {
     const source = this.sessions.get(tabId) ?? this.archives.get(tabId);

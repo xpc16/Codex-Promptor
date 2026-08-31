@@ -11,6 +11,17 @@ const userItem = (turnId: string, text: string, clientId?: string) =>
   event("item_completed", turnId, { item: { type: "UserMessage", id: `${turnId}-u`, content: [{ type: "text", text }], ...(clientId ? { client_id: clientId } : {}) } });
 const agentItem = (turnId: string, text: string) =>
   event("item_completed", turnId, { item: { type: "AgentMessage", id: `${turnId}-a`, content: [{ type: "Text", text }], phase: "commentary" } });
+const legacyMessage = (turnId: string, role: "user" | "assistant", text: string, phase?: string) => line({
+  timestamp: "2026-08-25T14:22:21.000Z",
+  type: "response_item",
+  payload: {
+    type: "message",
+    role,
+    content: [{ type: role === "user" ? "input_text" : "output_text", text }],
+    ...(phase ? { phase } : {}),
+    internal_chat_message_metadata_passthrough: { turn_id: turnId },
+  },
+});
 
 describe("Codex rollout history", () => {
   it("recovers a completed turn the App Server projection never reached", () => {
@@ -72,6 +83,41 @@ describe("Codex rollout history", () => {
       event("task_complete", "t5", { last_agent_message: "orphan" }),
     ].join("\n");
     expect(parseCodexRollout(rollout, "thread-1").turns).toHaveLength(0);
+  });
+
+  it("imports legacy response_item turns without mistaking transport envelopes for prompts", () => {
+    const rollout = [
+      event("task_started", "legacy-turn", { started_at: 1787667740 }),
+      legacyMessage("legacy-turn", "user", "<recommended_plugins>internal catalog</recommended_plugins>"),
+      legacyMessage("legacy-turn", "user", "<environment_context><cwd>D:\\work</cwd></environment_context>"),
+      legacyMessage("legacy-turn", "user", "the actual legacy prompt"),
+      legacyMessage("legacy-turn", "assistant", "legacy final", "final_answer"),
+      event("task_complete", "legacy-turn", {}),
+    ].join("\n");
+
+    expect(parseCodexRollout(rollout, "thread-legacy").turns).toEqual([expect.objectContaining({
+      id: "legacy-turn",
+      status: "completed",
+      items: [
+        { type: "userMessage", text: "the actual legacy prompt" },
+        { type: "agentMessage", phase: "final_answer", text: "legacy final" },
+      ],
+    })]);
+  });
+
+  it("uses the active task as a fallback for old messages without passthrough metadata", () => {
+    const message = (role: string, text: string, phase?: string) => line({
+      timestamp: "2026-08-25T14:22:21.000Z",
+      type: "response_item",
+      payload: { type: "message", role, content: [{ type: role === "user" ? "input_text" : "output_text", text }], ...(phase ? { phase } : {}) },
+    });
+    const turn = parseCodexRollout([
+      event("task_started", "old-turn"),
+      message("user", "old prompt"),
+      message("assistant", "old answer", "final_answer"),
+      event("task_complete", "old-turn"),
+    ].join("\n"), "thread-old").turns[0];
+    expect(turn.items.map((item) => item.text)).toEqual(["old prompt", "old answer"]);
   });
 
   it("only adds turns the App Server did not already return", () => {

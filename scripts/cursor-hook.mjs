@@ -1,6 +1,7 @@
 // Promptor's Cursor hook dispatcher. It is registered once in ~/.cursor/hooks.json
 // and becomes a no-op for every Cursor process that was not launched by Promptor.
 const hookUrl = process.env.CODEX_PROMPTOR_CURSOR_HOOK_URL;
+const hookSecret = process.env.CODEX_PROMPTOR_HOOK_SECRET;
 const eventName = process.argv[2] ?? "";
 const transcriptPath = process.env.CURSOR_TRANSCRIPT_PATH;
 
@@ -10,7 +11,7 @@ for await (const chunk of process.stdin) {
   if (input.length > 8 * 1024 * 1024) process.exit(0);
 }
 
-if (!hookUrl || !eventName) {
+if (!hookUrl || !hookSecret || !eventName) {
   process.stdout.write("{}\n");
   process.exit(0);
 }
@@ -22,7 +23,7 @@ catch { payload = {}; }
 try {
   const response = await fetch(hookUrl, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${hookSecret}` },
     body: JSON.stringify({
       ...payload,
       hook_event_name: payload.hook_event_name ?? eventName,

@@ -7,7 +7,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { CURSOR_EXIT_MARKER, type PtyManager, type TerminalTheme } from "./pty.js";
 import type { QueueBinding, QueueRpc } from "./queue.js";
-import { clearSubmitTimers, scheduleSubmitRecovery, type SubmitTimers } from "./prompt-submit.js";
+import { clearSubmitTimers, sameSubmittedPrompt, scheduleSubmitRecovery, type SubmitEvidence, type SubmitTimers } from "./prompt-submit.js";
+import { inspectCursorSubmission, reconcileCursorTurn, transcriptCursor, type TranscriptCursor } from "./transcript-reconciliation.js";
 import { writeFileAtomicWithRetry } from "./storage.js";
 
 const execFileAsync = promisify(execFile);
@@ -31,6 +32,7 @@ type CursorTurn = {
   origin: "queue" | "manual";
   startedAt: string;
   response: string;
+  recordCursor: TranscriptCursor;
   completion: Deferred<{ turn: any; items: any[] }>;
 };
 
@@ -39,6 +41,7 @@ type Submission = {
   prompt: string;
   clientUserMessageId: string;
   logicalTurnId: string | null;
+  recordCursor: TranscriptCursor;
   accepted: Deferred<string>;
   timers: SubmitTimers;
 };
@@ -61,7 +64,10 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
   private attached: CursorSessionInfo | null = null;
   private readonly turns = new Map<string, CursorTurn>();
   private readonly completed = new Map<string, { turn: any; items: any[] }>();
-  private readonly submissions: Submission[] = [];
+  private submission: Submission | null = null;
+  private sessionCursor: TranscriptCursor = { path: null, offset: 0 };
+  private submissionReservation = 0;
+  private reservationInFlight = false;
 
   constructor(readonly tabId: string, private readonly pty: PtyManager) {
     super();
@@ -71,6 +77,7 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
       startTurn: (threadId, text, clientUserMessageId) => this.startTurn(threadId, text, clientUserMessageId),
       steerTurn: (threadId, turnId, text, clientUserMessageId) => this.steerTurn(threadId, turnId, text, clientUserMessageId),
       interruptTurn: (threadId, turnId) => this.interruptTurn(threadId, turnId),
+      interruptPendingSubmission: (threadId) => this.interruptPendingSubmission(threadId),
       waitForTurn: (turnId) => this.waitForTurn(turnId),
     };
     this.on("error", () => undefined);
@@ -113,7 +120,7 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
       if (!sessionId) throw new Error("CURSOR_SESSION_ID_MISSING");
       if (this.attached?.sessionId && this.attached.sessionId !== sessionId) {
         const message = `Cursor CLI switched from conversation ${this.attached.sessionId} to ${sessionId}.`;
-        for (const submission of [...this.submissions]) this.rejectSubmission(submission, new Error(message));
+        if (this.submission) this.rejectSubmission(this.submission, new Error(message));
         for (const turn of [...this.turns.values()]) this.completeTurn(turn, "interrupted", "", message);
       }
       const info = {
@@ -122,6 +129,7 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
         transcriptPath,
       };
       this.attached = info;
+      this.sessionCursor = await transcriptCursor(transcriptPath);
       this.launchReady?.resolve(info);
       this.emit("session", info);
       return {};
@@ -161,7 +169,7 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
   }
 
   observeTerminalExit(message = "Cursor CLI TUI exited before the turn produced a final answer."): void {
-    for (const submission of [...this.submissions]) this.rejectSubmission(submission, new Error(message));
+    if (this.submission) this.rejectSubmission(this.submission, new Error(message));
     for (const turn of [...this.turns.values()]) this.completeTurn(turn, "interrupted", "", message);
     if (this.launchReady && !this.launchReady.settled) {
       this.launchReady.reject(new Error(message));
@@ -175,10 +183,9 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
   private async startTurn(threadId: string, text: string, clientUserMessageId: string): Promise<{ turnId: string }> {
     this.assertAttached(threadId);
     if (this.activeTurnIds(threadId).length) throw new Error("CURSOR_SESSION_BUSY");
-    const submission = this.reserveSubmission("turn", text, clientUserMessageId, null);
+    const submission = await this.reserveSubmission("turn", text, clientUserMessageId, null);
     if (!this.pty.submitPrompt(this.tabId, text)) {
       this.rejectSubmission(submission, new Error("CURSOR_TERMINAL_NOT_RUNNING"));
-      throw new Error("CURSOR_TERMINAL_NOT_RUNNING");
     }
     return { turnId: await submission.accepted.promise };
   }
@@ -186,10 +193,9 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
   private async steerTurn(threadId: string, turnId: string, text: string, clientUserMessageId: string): Promise<void> {
     this.assertAttached(threadId);
     if (!this.turns.has(turnId)) throw new Error("CURSOR_TURN_NOT_ACTIVE");
-    const submission = this.reserveSubmission("steer", text, clientUserMessageId, turnId);
+    const submission = await this.reserveSubmission("steer", text, clientUserMessageId, turnId);
     if (!this.pty.submitPrompt(this.tabId, text)) {
       this.rejectSubmission(submission, new Error("CURSOR_TERMINAL_NOT_RUNNING"));
-      throw new Error("CURSOR_TERMINAL_NOT_RUNNING");
     }
     await submission.accepted.promise;
   }
@@ -202,11 +208,41 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
     this.completeTurn(turn, "interrupted", "", "Cursor turn was interrupted before a final answer was produced.");
   }
 
-  private waitForTurn(turnId: string): Promise<{ turn: any; items: any[] }> {
+  private async interruptPendingSubmission(threadId: string): Promise<boolean> {
+    this.assertAttached(threadId);
+    const submission = this.submission;
+    if (!submission) {
+      if (!this.reservationInFlight) return false;
+      this.submissionReservation += 1;
+      this.reservationInFlight = false;
+      return true;
+    }
+    const evidence = await inspectCursorSubmission(this.submissionCursor(submission), submission.prompt);
+    if (evidence.state === "accepted") {
+      this.acceptRecoveredSubmission(submission, evidence);
+      const turnId = submission.kind === "steer" ? submission.logicalTurnId : evidence.turnId;
+      if (turnId) await this.interruptTurn(threadId, turnId);
+      return true;
+    }
+    this.pty.write(this.tabId, "\x1b");
+    this.rejectSubmission(submission, new Error("PROMPT_SUBMISSION_INTERRUPTED"));
+    return true;
+  }
+
+  private async waitForTurn(turnId: string): Promise<{ turn: any; items: any[] }> {
     const completed = this.completed.get(turnId);
-    if (completed) return Promise.resolve(completed);
-    const active = this.turns.get(turnId);
-    return active ? active.completion.promise : Promise.reject(new Error(`CURSOR_TURN_NOT_FOUND:${turnId}`));
+    if (completed) return completed;
+    while (true) {
+      const active = this.turns.get(turnId);
+      if (!active) throw new Error(`CURSOR_TURN_NOT_FOUND:${turnId}`);
+      const result = await Promise.race([
+        active.completion.promise.then((value) => ({ value })),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
+      ]);
+      if (result) return result.value;
+      const recovered = await reconcileCursorTurn(active.recordCursor, active.turnId);
+      if (recovered) this.completeTurn(active, recovered.status, recovered.answer, "Cursor turn ended without a completion hook.", recovered.completedAt);
+    }
   }
 
   private activeTurnIds(threadId: string): string[] {
@@ -228,33 +264,30 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
 
   private acceptPrompt(payload: any, sessionId: string): void {
     const prompt = String(payload?.prompt ?? "");
-    const matching = this.submissions.findIndex((candidate) => samePrompt(candidate.prompt, prompt));
-    const index = matching >= 0 ? matching : (!prompt.trim() && this.submissions.length ? 0 : -1);
-    const submission = index >= 0 ? this.submissions.splice(index, 1)[0] : null;
-    if (submission) clearSubmitTimers(submission.timers);
+    const pending = this.submission;
+    if (pending && !prompt.trim()) {
+      this.emit("submissionAmbiguous", { threadId: sessionId, reason: "CURSOR_HOOK_PROMPT_MISSING" });
+      return;
+    }
+    const submission = pending && sameSubmittedPrompt(pending.prompt, prompt)
+      ? this.takeSubmission(pending)
+      : null;
     if (submission?.kind === "steer") {
       submission.accepted.resolve(submission.logicalTurnId!);
       return;
     }
     const active = [...this.turns.values()].find((turn) => turn.threadId === sessionId);
+    if (submission && active) {
+      submission.accepted.resolve(active.turnId);
+      this.emit("turnSteered", { threadId: sessionId, turnId: active.turnId, prompt: submission.prompt, origin: "queue" });
+      return;
+    }
     if (!submission && active) {
       this.emit("turnSteered", { threadId: sessionId, turnId: active.turnId, prompt, origin: "manual" });
       return;
     }
     const turnId = String(payload?.generation_id ?? payload?.generationId ?? "") || randomUUID();
-    const turn: CursorTurn = {
-      turnId,
-      threadId: sessionId,
-      prompt: prompt || submission?.prompt || "[non-text input]",
-      clientUserMessageId: submission?.clientUserMessageId ?? null,
-      origin: submission ? "queue" : "manual",
-      startedAt: new Date().toISOString(),
-      response: "",
-      completion: deferred(),
-    };
-    this.turns.set(turnId, turn);
-    submission?.accepted.resolve(turnId);
-    this.emit("turnStarted", { threadId: sessionId, turnId, prompt: turn.prompt, origin: turn.origin });
+    this.createTurn(turnId, sessionId, prompt || submission?.prompt || "[non-text input]", submission);
   }
 
   private findTurn(payload: any, sessionId: string): CursorTurn | null {
@@ -264,11 +297,11 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
       ?? null;
   }
 
-  private completeTurn(turn: CursorTurn, status: "completed" | "failed" | "interrupted", answer: string, errorMessage: string): void {
+  private completeTurn(turn: CursorTurn, status: "completed" | "failed" | "interrupted", answer: string, errorMessage: string, recoveredCompletedAt?: string | null): void {
     if (!this.turns.delete(turn.turnId)) return;
-    const completedAt = new Date().toISOString();
+    const completedAt = recoveredCompletedAt ?? new Date().toISOString();
     const items: any[] = [{ type: "userMessage", text: turn.prompt, ...(turn.clientUserMessageId ? { clientId: turn.clientUserMessageId } : {}) }];
-    if (status === "completed" && answer) items.push({ type: "agentMessage", phase: "final_answer", text: answer });
+    if (answer) items.push({ type: "agentMessage", phase: status === "completed" ? "final_answer" : "partial_answer", text: answer });
     const result = {
       turn: { id: turn.turnId, status, startedAt: turn.startedAt, completedAt, ...(status === "completed" ? {} : { error: { message: errorMessage } }) },
       items,
@@ -277,46 +310,106 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
     while (this.completed.size > COMPLETED_CACHE_LIMIT) this.completed.delete(this.completed.keys().next().value!);
     turn.completion.resolve(result);
     this.emit("turnCompleted", { threadId: turn.threadId, turnId: turn.turnId, ...result, origin: turn.origin });
+    void this.refreshSessionCursor();
   }
 
-  private reserveSubmission(kind: Submission["kind"], prompt: string, clientUserMessageId: string, logicalTurnId: string | null): Submission {
-    const accepted = deferred<string>();
-    let submission!: Submission;
-    submission = {
-      kind,
-      prompt,
-      clientUserMessageId,
-      logicalTurnId,
-      accepted,
-      // The prompt text is already in the input box; a dropped Enter is what
-      // stalls the turn, so retry that before failing the queued prompt.
-      timers: scheduleSubmitRecovery(
-        () => this.pty.submitEnter(this.tabId),
-        () => this.rejectSubmission(submission, new Error("CURSOR_PROMPT_SUBMIT_TIMEOUT")),
-      ),
-    };
-    this.submissions.push(submission);
-    return submission;
+  private async reserveSubmission(kind: Submission["kind"], prompt: string, clientUserMessageId: string, logicalTurnId: string | null): Promise<Submission> {
+    if (this.submission || this.reservationInFlight) throw new Error("CURSOR_PROMPT_SUBMISSION_IN_FLIGHT");
+    const attached = this.attached;
+    const reservation = ++this.submissionReservation;
+    this.reservationInFlight = true;
+    try {
+      const accepted = deferred<string>();
+      const recordCursor = await transcriptCursor(attached?.transcriptPath);
+      if (reservation !== this.submissionReservation) throw new Error("PROMPT_SUBMISSION_INTERRUPTED");
+      if (this.attached !== attached) throw new Error("SESSION_NOT_READY");
+      let submission!: Submission;
+      submission = { kind, prompt, clientUserMessageId, logicalTurnId, recordCursor, accepted, timers: null as unknown as SubmitTimers };
+      submission.timers = scheduleSubmitRecovery({
+        inspect: () => inspectCursorSubmission(this.submissionCursor(submission), prompt),
+        resend: () => { this.pty.submitEnter(this.tabId); },
+        accept: (evidence) => this.acceptRecoveredSubmission(submission, evidence),
+        unconfirmed: (evidence) => this.emit("submissionUnconfirmed", { threadId: this.attached?.sessionId, prompt, reason: evidence.reason ?? null }),
+      });
+      this.submission = submission;
+      return submission;
+    } finally {
+      if (reservation === this.submissionReservation) this.reservationInFlight = false;
+    }
   }
 
   private rejectSubmission(submission: Submission, error: Error): void {
     clearSubmitTimers(submission.timers);
-    const index = this.submissions.indexOf(submission);
-    if (index >= 0) this.submissions.splice(index, 1);
+    if (this.submission === submission) this.submission = null;
     submission.accepted.reject(error);
+  }
+
+  private takeSubmission(submission: Submission): Submission {
+    clearSubmitTimers(submission.timers);
+    if (this.submission === submission) this.submission = null;
+    return submission;
+  }
+
+  private submissionCursor(submission: Submission): TranscriptCursor {
+    return submission.recordCursor.path
+      ? submission.recordCursor
+      : { path: this.attached?.transcriptPath ?? null, offset: submission.recordCursor.offset };
+  }
+
+  private acceptRecoveredSubmission(submission: Submission, evidence: Extract<SubmitEvidence, { state: "accepted" }>): void {
+    if (this.submission !== submission) return;
+    this.takeSubmission(submission);
+    if (submission.kind === "steer") {
+      submission.accepted.resolve(submission.logicalTurnId!);
+      return;
+    }
+    const active = [...this.turns.values()].find((turn) => turn.threadId === (this.attached?.sessionId ?? ""));
+    if (active) {
+      submission.accepted.resolve(active.turnId);
+      this.emit("turnSteered", { threadId: active.threadId, turnId: active.turnId, prompt: submission.prompt, origin: "queue" });
+      return;
+    }
+    this.createTurn(evidence.turnId, this.attached?.sessionId ?? "", submission.prompt, submission);
+  }
+
+  private createTurn(turnId: string, threadId: string, prompt: string, submission: Submission | null): void {
+    const turn: CursorTurn = {
+      turnId,
+      threadId,
+      prompt,
+      clientUserMessageId: submission?.clientUserMessageId ?? null,
+      origin: submission ? "queue" : "manual",
+      startedAt: new Date().toISOString(),
+      response: "",
+      recordCursor: submission ? this.submissionCursor(submission) : { ...this.sessionCursor },
+      completion: deferred(),
+    };
+    this.turns.set(turnId, turn);
+    submission?.accepted.resolve(turnId);
+    this.emit("turnStarted", { threadId, turnId, prompt, origin: turn.origin });
   }
 
   private assertAttached(threadId: string): void {
     if (!this.attached?.sessionId || this.attached.sessionId !== threadId) throw new Error("SESSION_NOT_READY");
   }
 
+  private async refreshSessionCursor(): Promise<void> {
+    const session = this.attached;
+    if (!session?.transcriptPath) return;
+    const next = await transcriptCursor(session.transcriptPath);
+    if (this.attached === session) this.sessionCursor = next;
+  }
+
   private reset(message: string): void {
-    for (const submission of [...this.submissions]) this.rejectSubmission(submission, new Error(message));
+    this.submissionReservation += 1;
+    this.reservationInFlight = false;
+    if (this.submission) this.rejectSubmission(this.submission, new Error(message));
     for (const turn of [...this.turns.values()]) this.completeTurn(turn, "interrupted", "", message);
     this.launchReady?.reject(new Error(message));
     void this.launchReady?.promise.catch(() => undefined);
     this.launchReady = null;
     this.attached = null;
+    this.sessionCursor = { path: null, offset: 0 };
   }
 }
 
@@ -401,7 +494,6 @@ export async function probeCursorVersion(): Promise<{ available: boolean; versio
   }
 }
 
-function samePrompt(left: string, right: string): boolean { return left.replace(/\r\n/g, "\n").trim() === right.replace(/\r\n/g, "\n").trim(); }
 function stringOrNull(value: unknown): string | null { return typeof value === "string" && value.trim() ? value : null; }
 function quotePowerShellArg(value: string): string { return /^[A-Za-z0-9_:/.-]+$/.test(value) ? value : `'${value.replace(/'/g, "''")}'`; }
 function quoteCommandArg(value: string): string { return `"${value.replace(/"/g, '\\"')}"`; }

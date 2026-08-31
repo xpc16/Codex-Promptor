@@ -22,10 +22,12 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
+import { buildCodexHookOverride } from "../src/server/codex-tui.ts";
 
 const execFileAsync = promisify(execFile);
 const isWindows = process.platform === "win32";
-const command = isWindows ? "codex.cmd" : "codex";
+const command = await resolveCodexExecutable();
+const commandNeedsShell = isWindows && /\.(?:cmd|bat)$/i.test(command);
 const findings = [];
 const note = (ok, what, detail, usedBy) => {
   findings.push({ ok, what, detail, usedBy });
@@ -41,7 +43,7 @@ const freePort = () => new Promise((resolve) => {
 console.log("\nCodex CLI");
 let version = "unknown";
 try {
-  const result = await execFileAsync(command, ["--version"], { windowsHide: true, shell: isWindows });
+  const result = await execFileAsync(command, ["--version"], { windowsHide: true, shell: commandNeedsShell });
   version = String(result.stdout).trim();
   note(true, "codex --version", version, "AppServerManager.version()");
 } catch (error) {
@@ -52,21 +54,29 @@ try {
 console.log("\nCLI flags the terminal is launched with");
 let help = "";
 try {
-  const result = await execFileAsync(command, ["--help"], { windowsHide: true, shell: isWindows });
+  const result = await execFileAsync(command, ["--help"], { windowsHide: true, shell: commandNeedsShell });
   help = `${result.stdout}${result.stderr}`;
 } catch (error) { help = String(error?.stdout ?? "") + String(error?.stderr ?? ""); }
-for (const flag of ["--remote", "--no-alt-screen", "-C"]) {
+for (const flag of ["--remote", "--no-alt-screen", "-C", "--dangerously-bypass-hook-trust"]) {
   note(help.includes(flag), `flag ${flag}`, help.includes(flag) ? "present" : "not in --help", "pty.ts buildCodexCommand");
 }
 note(/\bresume\b/.test(help), "subcommand resume", /\bresume\b/.test(help) ? "present" : "missing", "reopening a conversation");
 note(/\bapp-server\b/.test(help), "subcommand app-server", /\bapp-server\b/.test(help) ? "present" : "missing", "the whole RPC path");
+
+const hookOverride = buildCodexHookOverride(path.join(process.cwd(), "scripts", "codex-hook.mjs"));
+try {
+  const result = await execFileAsync(command, ["-c", hookOverride, "--version"], { windowsHide: true, shell: commandNeedsShell });
+  note(result.stdout.includes("codex-cli"), "per-run hook TOML", String(result.stdout).trim(), "native PTY/hooks transport");
+} catch (error) {
+  note(false, "per-run hook TOML", String(error?.stderr ?? error?.message ?? error), "native PTY/hooks transport");
+}
 
 // ----------------------------------------------------------- the app server
 console.log("\nApp Server");
 const port = await freePort();
 const url = `ws://127.0.0.1:${port}`;
 const child = spawn(command, ["app-server", "--listen", url], {
-  cwd: process.cwd(), windowsHide: true, shell: isWindows, stdio: ["ignore", "pipe", "pipe"],
+  cwd: process.cwd(), windowsHide: true, shell: commandNeedsShell, stdio: ["ignore", "pipe", "pipe"],
 });
 let said = "";
 child.stdout?.on("data", (chunk) => { said += chunk; });
@@ -156,7 +166,8 @@ if (rollouts.length) {
   const stats = await Promise.all(rollouts.map(async (file) => ({ file, at: (await fs.stat(file)).mtimeMs })));
   const newest = stats.sort((a, b) => b.at - a.at)[0].file;
   const seen = new Set();
-  let meta = null, lines = 0;
+  let meta = null, lines = 0, boundaryRecords = 0, boundaryRecordsWithIds = 0;
+  let paginatedContent = false, legacyContent = false;
   const reader = createInterface({ input: createReadStream(newest, { encoding: "utf8" }), crlfDelay: Infinity });
   for await (const line of reader) {
     if (!line.trim()) continue;
@@ -166,6 +177,12 @@ if (rollouts.length) {
     if (lines === 1) meta = record?.payload ?? null;
     const type = String(record?.payload?.type ?? "");
     if (type) seen.add(type);
+    if (type === "item_completed") paginatedContent = true;
+    if (record?.type === "response_item" && type === "message") legacyContent = true;
+    if (["task_started", "task_complete", "turn_aborted", "turn_failed"].includes(type)) {
+      boundaryRecords += 1;
+      if (record?.payload?.turn_id || record?.payload?.turnId) boundaryRecordsWithIds += 1;
+    }
     if (lines > 60_000) break;
   }
   reader.close();
@@ -177,19 +194,19 @@ if (rollouts.length) {
   for (const type of ["task_started", "task_complete"]) {
     note(seen.has(type), `record ${type}`, seen.has(type) ? "present" : "absent from the newest rollout", "codex-history.ts createRolloutParser");
   }
-  // The parser reads prompts and answers only out of item_completed. Sessions
-  // written with history_mode "legacy" put them in top-level user_message and
-  // agent_message records instead, and read as empty conversations.
-  const legacyShape = seen.has("user_message") || seen.has("agent_message");
+  // Both currently observed content families are supported. Unknown content
+  // shapes must fail closed rather than be mistaken for an empty conversation.
   note(
-    seen.has("item_completed"),
-    "record item_completed",
-    seen.has("item_completed")
-      ? "present"
-      : legacyShape
-        ? `absent - this session uses user_message/agent_message (history_mode ${mode}); its history reads as empty`
-        : "absent from the newest rollout",
-    "every prompt and answer in a conversation",
+    paginatedContent || legacyContent,
+    "recognized content shape",
+    paginatedContent ? "paginated item_completed" : legacyContent ? "legacy response_item message" : "neither known shape appeared",
+    "prompt and answer reconciliation",
+  );
+  note(
+    boundaryRecords > 0 && boundaryRecords === boundaryRecordsWithIds,
+    "turn boundary ids",
+    `${boundaryRecordsWithIds}/${boundaryRecords} recognized boundaries carry turn_id`,
+    "low-frequency completion reconciliation",
   );
   const hasIds = meta && (meta.session_id || meta.id);
   note(Boolean(hasIds), "session_meta ids", hasIds ? "session_id/id present" : "missing", "matching a rollout to a conversation");
@@ -202,9 +219,30 @@ const failed = findings.filter((finding) => !finding.ok);
 console.log(`\n${"-".repeat(72)}`);
 if (!failed.length) {
   console.log(`Codex ${version}: everything this app depends on is present.`);
-  process.exit(0);
+  process.exitCode = 0;
+} else {
+  console.log(`Codex ${version}: ${failed.length} of ${findings.length} checks failed.`);
+  for (const finding of failed) console.log(`  ${finding.what}  ->  breaks: ${finding.usedBy}`);
+  if (said.trim()) console.log(`\nApp Server said:\n${said.trim().split("\n").slice(-10).map((line) => `  ${line}`).join("\n")}`);
+  process.exitCode = 1;
 }
-console.log(`Codex ${version}: ${failed.length} of ${findings.length} checks failed.`);
-for (const finding of failed) console.log(`  ${finding.what}  ->  breaks: ${finding.usedBy}`);
-if (said.trim()) console.log(`\nApp Server said:\n${said.trim().split("\n").slice(-10).map((line) => `  ${line}`).join("\n")}`);
-process.exit(1);
+
+async function resolveCodexExecutable() {
+  if (!isWindows) return "codex";
+  try {
+    const where = await execFileAsync("where.exe", ["codex.cmd"], { windowsHide: true });
+    const shim = String(where.stdout).split(/\r?\n/).find(Boolean);
+    if (!shim) return "codex.cmd";
+    const packageModules = path.join(path.dirname(shim), "node_modules", "@openai", "codex", "node_modules");
+    const stack = [packageModules];
+    while (stack.length) {
+      const directory = stack.pop();
+      for (const entry of await fs.readdir(directory, { withFileTypes: true }).catch(() => [])) {
+        const full = path.join(directory, entry.name);
+        if (entry.isDirectory()) stack.push(full);
+        else if (entry.name.toLowerCase() === "codex.exe") return full;
+      }
+    }
+  } catch { /* fall back to the npm shim */ }
+  return "codex.cmd";
+}

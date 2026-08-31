@@ -17,13 +17,14 @@ import {
   MAX_WINDOW_RECORDS,
 } from "../shared/tab-window.js";
 import { AppServerPool, type AppServerManager, type CodexRpcClient, terminateStaleAppServer, waitForThreadLoaded } from "./codex.js";
+import { CodexTuiPool, codexHookStartupError, resolveCodexTuiLaunch, type CodexTuiManager } from "./codex-tui.js";
 import { ClaudeCodePool, type ClaudeCodeManager, probeClaudeVersion } from "./claude.js";
 import { syncClaudeHistory } from "./claude-history.js";
 import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorHookBridge, probeCursorVersion } from "./cursor.js";
 import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
-import { locateCodexRollout, readCodexThreadForHistory } from "./codex-history.js";
+import { locateCodexRollout, readCodexRolloutThread, readCodexThreadForHistory } from "./codex-history.js";
 import { decideStall, noteRolloutSize, TURN_STALL_POLL_MS, type RolloutProgress } from "./turn-stall.js";
 import { appendBoundedLines } from "./log-file.js";
 import { readCodexRolloutCached } from "./codex-rollout-cache.js";
@@ -32,7 +33,7 @@ import { appendRestoreTimings, createPhaseRecorder, formatDuration, formatRestor
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
 import { entityTag, ifMatchSatisfied, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
-import { CLAUDE_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
+import { CLAUDE_EXIT_MARKER, CODEX_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
 import { RunnerManager } from "./queue.js";
 import { StorageService } from "./storage.js";
 import { TimerService, TimerServiceError } from "./timer-service.js";
@@ -57,6 +58,12 @@ import { DEFAULT_UI_GRACE_MS, UiLifecycle } from "./ui-lifecycle.js";
 import { loadTrustedBrowserHosts } from "./trusted-hosts.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export type CodexConnectionMode = "app-server" | "pty-hooks";
+
+export function codexConnectionModeFromEnv(value: unknown): CodexConnectionMode {
+  return String(value ?? "").trim().toLowerCase() === "pty-hooks" ? "pty-hooks" : "app-server";
+}
 
 export function isValidResumeId(provider: AgentProvider, resumeId: string): boolean {
   if (provider !== "cursor") return UUID_RE.test(resumeId);
@@ -119,6 +126,8 @@ export type PromptorApp = FastifyInstance & {
   promptor: {
     storage: StorageService;
     codex: AppServerPool;
+    codexTui: CodexTuiPool;
+    codexConnectionMode: CodexConnectionMode;
     claude: ClaudeCodePool;
     cursor: CursorCliPool;
     pty: PtyManager;
@@ -138,12 +147,14 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const storage = new StorageService(rootDir);
   const codex = new AppServerPool();
   const pty = new PtyManager();
+  const codexTui = new CodexTuiPool(pty);
   const claude = new ClaudeCodePool(pty);
   const cursor = new CursorCliPool(pty);
   const tuiProxy = new TuiProxyPool();
   const directoryPicker = new DirectoryPickerService();
   const ui = new UiLifecycle(Number(process.env.CODEX_PROMPTOR_UI_GRACE_MS ?? DEFAULT_UI_GRACE_MS));
   const token = process.env.CODEX_PROMPTOR_TOKEN ?? randomBytes(32).toString("hex");
+  const codexConnectionMode = codexConnectionModeFromEnv(process.env.CODEX_PROMPTOR_CODEX_CONNECTION_MODE);
   const clients = new Set<Client>();
   const sequences = new Map<string, number>();
   const transportConfig = terminalTransportConfigFromEnv();
@@ -173,6 +184,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const rawResponderOwners = new Map<string, string>();
   const responderLeaseEpochs = new Map<string, number>();
   const pendingApprovals = new Map<string, { tabId: string; manager: AppServerManager; requestId: number | string }>();
+  const hookLeases = new Map<string, { nonce: string; secret: string }>();
   const threadSwitches = new Map<string, Promise<void>>();
   const noAuth = process.env.CODEX_PROMPTOR_NO_AUTH === "1";
   // Hosts beyond 127.0.0.1/localhost that a reverse proxy (e.g. a Cloudflare
@@ -395,7 +407,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     terminalResyncTimers.set(tabId, timer);
   };
 
-  const runners = new RunnerManager(storage, (tabId) => cursor.existing(tabId) ?? claude.existing(tabId) ?? codex.get(tabId), (event) => {
+  const runners = new RunnerManager(storage, (tabId) => cursor.existing(tabId)
+    ?? claude.existing(tabId)
+    ?? (codexConnectionMode === "pty-hooks" ? codexTui.get(tabId) : codex.get(tabId)), (event) => {
     if (event.type === "error") emit(event.tabId, { type: "error", error: event.data });
     if (event.type === "answer") {
       const answer = event.data as AnswerRecord | undefined;
@@ -497,14 +511,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   });
 
   const scheduleNativeSessionSwitch = (
-    provider: "claude" | "cursor",
+    provider: "codex" | "claude" | "cursor",
     tabId: string,
-    manager: ClaudeCodeManager | CursorCliManager,
+    manager: CodexTuiManager | ClaudeCodeManager | CursorCliManager,
     session: { sessionId: string; cwd: string; transcriptPath: string | null },
   ): Promise<void> => {
     const previousTask = threadSwitches.get(tabId) ?? Promise.resolve();
     const task = previousTask.catch(() => undefined).then(async () => {
-      const currentManager = provider === "claude" ? claude.existing(tabId) : cursor.existing(tabId);
+      const currentManager = provider === "codex"
+        ? codexTui.existing(tabId)
+        : provider === "claude" ? claude.existing(tabId) : cursor.existing(tabId);
       if (currentManager !== manager) return;
       const tab = await storage.getTabMeta(tabId);
       const fromThreadId = tab.session.threadId;
@@ -531,7 +547,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         },
         updatedAt: switchedAt,
       }));
-      if (provider === "claude") await syncClaudeHistory(storage, tabId, session.sessionId, session.transcriptPath);
+      if (provider === "codex") {
+        const thread = await readCodexRolloutThread(session.sessionId, session.transcriptPath);
+        if (thread) await syncHistory(storage, tabId, thread, { mode: "merge" });
+      } else if (provider === "claude") await syncClaudeHistory(storage, tabId, session.sessionId, session.transcriptPath);
       else await syncCursorHistoryIfAvailable(tabId, session.sessionId, session.transcriptPath);
       await clearSessionNotReadyError(storage, tabId);
       emit(tabId, { type: "thread.switched", switch: { fromThreadId, toThreadId: session.sessionId, method: "session/start", switchedAt } });
@@ -555,10 +574,45 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return task;
   };
 
+  const markSubmissionUnconfirmed = (tabId: string): void => {
+    void (async () => {
+      let changed = false;
+      await storage.withTabLock(tabId, async () => {
+        const bundle = await storage.readTab(tabId);
+        if (!bundle.runtime.runner.activePromptId || bundle.runtime.runner.activeTurnId || bundle.runtime.runner.state !== "dispatching") return;
+        await storage.writeRuntime(tabId, RuntimeFileSchema.parse({
+          ...bundle.runtime,
+          revision: bundle.runtime.revision + 1,
+          runner: { ...bundle.runtime.runner, state: "reconciling", lastTransitionAt: isoNow() },
+        }));
+        changed = true;
+      });
+      if (changed) emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
+    })().catch(() => undefined);
+  };
+
+  codexTui.on("created", ({ tabId, manager }: { tabId: string; manager: CodexTuiManager }) => {
+    manager.on("submissionUnconfirmed", () => markSubmissionUnconfirmed(tabId));
+    manager.on("session", (session) => void scheduleNativeSessionSwitch("codex", tabId, manager, session));
+    manager.on("compacted", () => scheduleCompactionTerminalResync(tabId));
+    manager.on("turnCompleted", async (event: any) => {
+      try {
+        if (event.origin === "queue") return;
+        const tab = await storage.getTabMeta(tabId);
+        if (tab.session.provider !== "codex" || tab.session.threadId !== event.threadId) return;
+        const bundle = await storage.readTab(tabId);
+        if (bundle.runtime.runner.activeTurnId === event.turnId) return;
+        await recordTurn(storage, tabId, { threadId: event.threadId, turn: event.turn, items: event.items, origin: "manual" });
+      } catch { /* explicit history sync reconstructs a missed manual turn */ }
+    });
+  });
+
   claude.on("created", ({ tabId, manager }: { tabId: string; manager: ClaudeCodeManager }) => {
+    manager.on("submissionUnconfirmed", () => markSubmissionUnconfirmed(tabId));
     manager.on("session", (session) => void scheduleNativeSessionSwitch("claude", tabId, manager, session));
     manager.on("turnCompleted", async (event: any) => {
       try {
+        if (event.origin === "queue") return;
         const tab = await storage.getTabMeta(tabId);
         if (tab.session.provider !== "claude" || tab.session.threadId !== event.threadId) return;
         const bundle = await storage.readTab(tabId);
@@ -575,9 +629,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   });
 
   cursor.on("created", ({ tabId, manager }: { tabId: string; manager: CursorCliManager }) => {
+    manager.on("submissionUnconfirmed", () => markSubmissionUnconfirmed(tabId));
     manager.on("session", (session) => void scheduleNativeSessionSwitch("cursor", tabId, manager, session));
     manager.on("turnCompleted", async (event: any) => {
       try {
+        if (event.origin === "queue") return;
         const tab = await storage.getTabMeta(tabId);
         if (tab.session.provider !== "cursor" || tab.session.threadId !== event.threadId) return;
         const bundle = await storage.readTab(tabId);
@@ -592,16 +648,72 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     catch { /* the tab may have been deleted while a restore was finishing */ }
   };
 
-  const claudeHookUrl = (tabId: string): string => {
-    const address = app.server.address();
-    const port = typeof address === "object" && address ? address.port : Number(process.env.PORT ?? 4317);
-    return `http://127.0.0.1:${port}/hooks/claude/${encodeURIComponent(tabId)}?token=${encodeURIComponent(token)}`;
+  const issueHookLease = (provider: "codex" | "claude" | "cursor", tabId: string) => {
+    const lease = { nonce: randomUUID(), secret: randomBytes(32).toString("base64url") };
+    hookLeases.set(`${provider}:${tabId}`, lease);
+    return lease;
+  };
+  const revokeHookLease = (provider: "codex" | "claude" | "cursor", tabId: string): void => {
+    hookLeases.delete(`${provider}:${tabId}`);
+  };
+  const hookAuthorized = (provider: "codex" | "claude" | "cursor", tabId: string, nonce: string, authorization: unknown): boolean => {
+    const lease = hookLeases.get(`${provider}:${tabId}`);
+    return Boolean(lease && lease.nonce === nonce && authorization === `Bearer ${lease.secret}`);
   };
 
-  const cursorHookUrl = (tabId: string): string => {
+  const codexHookUrl = (tabId: string, nonce: string): string => {
     const address = app.server.address();
     const port = typeof address === "object" && address ? address.port : Number(process.env.PORT ?? 4317);
-    return `http://127.0.0.1:${port}/hooks/cursor/${encodeURIComponent(tabId)}?token=${encodeURIComponent(token)}`;
+    return `http://127.0.0.1:${port}/hooks/codex/${encodeURIComponent(tabId)}/${encodeURIComponent(nonce)}`;
+  };
+
+  const claudeHookUrl = (tabId: string, nonce: string): string => {
+    const address = app.server.address();
+    const port = typeof address === "object" && address ? address.port : Number(process.env.PORT ?? 4317);
+    return `http://127.0.0.1:${port}/hooks/claude/${encodeURIComponent(tabId)}/${encodeURIComponent(nonce)}`;
+  };
+
+  const cursorHookUrl = (tabId: string, nonce: string): string => {
+    const address = app.server.address();
+    const port = typeof address === "object" && address ? address.port : Number(process.env.PORT ?? 4317);
+    return `http://127.0.0.1:${port}/hooks/cursor/${encodeURIComponent(tabId)}/${encodeURIComponent(nonce)}`;
+  };
+
+  const startCodexNativeTui = async (
+    tabId: string,
+    cwd: string,
+    launch: { mode: "new" } | { mode: "resume"; sessionId: string },
+  ) => {
+    const lease = issueHookLease("codex", tabId);
+    try {
+      const manager = codexTui.get(tabId);
+      const theme = (await storage.readIndex()).ui.theme;
+      const hookScriptPath = path.join(rootDir, "scripts", "codex-hook.mjs");
+      const launcherPath = path.join(rootDir, "scripts", "launch-agent.ps1");
+      await fs.access(launcherPath);
+      const exitMarker = sessionExitMarker(CODEX_EXIT_MARKER);
+      const processLaunch = await resolveCodexTuiLaunch(await manager.beginLaunch({
+        cwd,
+        launch,
+        hookScriptPath,
+        // Intended only for isolated hook compatibility probes. Normal use
+        // keeps Codex's trust boundary intact and fails closed when untrusted.
+        bypassHookTrust: process.env.CODEX_PROMPTOR_CODEX_BYPASS_HOOK_TRUST === "1",
+      }));
+      await restoreTerminalSize(storage, pty, tabId);
+      await pty.startArgvCommand(tabId, cwd, processLaunch, launcherPath, "Codex", exitMarker, {
+        CODEX_PROMPTOR_CODEX_HOOK_URL: codexHookUrl(tabId, lease.nonce),
+        CODEX_PROMPTOR_HOOK_SECRET: lease.secret,
+      }, theme);
+      const session = await manager.waitForSession(30_000, () => pty.startupError(tabId) ?? codexHookStartupError(pty.recentOutput(tabId)));
+      if (launch.mode === "resume" && session.sessionId !== launch.sessionId) {
+        throw new Error(`CODEX_RESUME_ID_MISMATCH:${launch.sessionId}:${session.sessionId}`);
+      }
+      return { manager, session };
+    } catch (error) {
+      revokeHookLease("codex", tabId);
+      throw error;
+    }
   };
 
   const startClaudeTui = async (
@@ -611,21 +723,28 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   ) => {
     const availability = await claudeVersion;
     if (!availability.available) throw new Error("CLAUDE_CLI_NOT_FOUND");
-    const manager = claude.get(tabId);
-    const theme = (await storage.readIndex()).ui.theme;
-    const settingsPath = path.join(storage.tabDir(tabId), "cache", "claude-hooks.settings.json");
-    const hookScriptPath = path.join(rootDir, "scripts", "claude-hook.mjs");
-    const exitMarker = sessionExitMarker(CLAUDE_EXIT_MARKER);
-    const command = await manager.beginLaunch({ cwd, launch, hookScriptPath, settingsPath, theme, exitMarker });
-    await restoreTerminalSize(storage, pty, tabId);
-    await pty.startCommand(tabId, cwd, command, "Claude Code", exitMarker, {
-      CODEX_PROMPTOR_CLAUDE_HOOK_URL: claudeHookUrl(tabId),
-    }, theme);
-    const session = await manager.waitForSession(30_000, () => pty.startupError(tabId));
-    if (launch.mode === "resume" && session.sessionId !== launch.sessionId) {
-      throw new Error(`CLAUDE_RESUME_ID_MISMATCH:${launch.sessionId}:${session.sessionId}`);
+    const lease = issueHookLease("claude", tabId);
+    try {
+      const manager = claude.get(tabId);
+      const theme = (await storage.readIndex()).ui.theme;
+      const settingsPath = path.join(storage.tabDir(tabId), "cache", "claude-hooks.settings.json");
+      const hookScriptPath = path.join(rootDir, "scripts", "claude-hook.mjs");
+      const exitMarker = sessionExitMarker(CLAUDE_EXIT_MARKER);
+      const command = await manager.beginLaunch({ cwd, launch, hookScriptPath, settingsPath, theme, exitMarker });
+      await restoreTerminalSize(storage, pty, tabId);
+      await pty.startCommand(tabId, cwd, command, "Claude Code", exitMarker, {
+        CODEX_PROMPTOR_CLAUDE_HOOK_URL: claudeHookUrl(tabId, lease.nonce),
+        CODEX_PROMPTOR_HOOK_SECRET: lease.secret,
+      }, theme);
+      const session = await manager.waitForSession(30_000, () => pty.startupError(tabId));
+      if (launch.mode === "resume" && session.sessionId !== launch.sessionId) {
+        throw new Error(`CLAUDE_RESUME_ID_MISMATCH:${launch.sessionId}:${session.sessionId}`);
+      }
+      return { manager, session };
+    } catch (error) {
+      revokeHookLease("claude", tabId);
+      throw error;
     }
-    return { manager, session };
   };
 
   const startCursorTui = async (
@@ -635,26 +754,32 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   ) => {
     const availability = await cursorVersion;
     if (!availability.available) throw new Error("CURSOR_CLI_NOT_FOUND");
-    await ensureCursorHookBridge(rootDir, storage.backupsDir);
-    const manager = cursor.get(tabId);
-    manager.beginLaunch(cwd);
-    const theme = (await storage.readIndex()).ui.theme;
-    await restoreTerminalSize(storage, pty, tabId);
-    const exitMarker = sessionExitMarker(CURSOR_EXIT_MARKER);
-    await pty.startCommand(
-      tabId,
-      cwd,
-      buildCursorCommand(cwd, launch, theme, exitMarker),
-      "Cursor CLI",
-      exitMarker,
-      { CODEX_PROMPTOR_CURSOR_HOOK_URL: cursorHookUrl(tabId) },
-      theme,
-    );
-    const session = await manager.waitForSession(30_000, () => pty.startupError(tabId));
-    if (launch.mode === "resume" && session.sessionId !== launch.sessionId) {
-      throw new Error(`CURSOR_RESUME_ID_MISMATCH:${launch.sessionId}:${session.sessionId}`);
+    const lease = issueHookLease("cursor", tabId);
+    try {
+      await ensureCursorHookBridge(rootDir, storage.backupsDir);
+      const manager = cursor.get(tabId);
+      manager.beginLaunch(cwd);
+      const theme = (await storage.readIndex()).ui.theme;
+      await restoreTerminalSize(storage, pty, tabId);
+      const exitMarker = sessionExitMarker(CURSOR_EXIT_MARKER);
+      await pty.startCommand(
+        tabId,
+        cwd,
+        buildCursorCommand(cwd, launch, theme, exitMarker),
+        "Cursor CLI",
+        exitMarker,
+        { CODEX_PROMPTOR_CURSOR_HOOK_URL: cursorHookUrl(tabId, lease.nonce), CODEX_PROMPTOR_HOOK_SECRET: lease.secret },
+        theme,
+      );
+      const session = await manager.waitForSession(30_000, () => pty.startupError(tabId));
+      if (launch.mode === "resume" && session.sessionId !== launch.sessionId) {
+        throw new Error(`CURSOR_RESUME_ID_MISMATCH:${launch.sessionId}:${session.sessionId}`);
+      }
+      return { manager, session };
+    } catch (error) {
+      revokeHookLease("cursor", tabId);
+      throw error;
     }
-    return { manager, session };
   };
 
   const syncCursorHistoryIfAvailable = async (tabId: string, sessionId: string, transcriptPath?: string | null) => {
@@ -667,6 +792,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
   };
 
+  const syncCodexNativeHistory = async (tabId: string, sessionId: string, transcriptPath?: string | null) => {
+    const thread = await readCodexRolloutThread(sessionId, transcriptPath);
+    if (!thread) return { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
+    return syncHistory(storage, tabId, thread, { mode: "merge" });
+  };
+
   const performClaudeTerminalReopen = async (tab: TabMeta, recorder: PhaseRecorder = createPhaseRecorder()): Promise<TerminalReopenResult> => {
     const tabId = tab.id;
     try {
@@ -674,6 +805,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         return { ok: false, statusCode: 400, code: "SESSION_NOT_READY", message: "This tab has no active session." };
       }
       await pty.stop(tabId, false);
+      await codexTui.stop(tabId);
       await cursor.stop(tabId);
       await claude.stop(tabId);
       await tuiProxy.stop(tabId);
@@ -710,6 +842,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const message = error instanceof Error ? error.message : String(error);
       await pty.stop(tabId, false).catch(() => undefined);
       await claude.stop(tabId).catch(() => undefined);
+      revokeHookLease("claude", tabId);
       await updateTerminalRuntime(storage, tabId, { state: "stopped", appServer: null }).catch(() => undefined);
       try {
         await storage.updateTab(tabId, (current) => ({
@@ -730,6 +863,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         return { ok: false, statusCode: 400, code: "SESSION_NOT_READY", message: "This tab has no active session." };
       }
       await pty.stop(tabId, false);
+      await codexTui.stop(tabId);
       await cursor.stop(tabId);
       await claude.stop(tabId);
       await tuiProxy.stop(tabId);
@@ -753,6 +887,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const message = error instanceof Error ? error.message : String(error);
       await pty.stop(tabId, false).catch(() => undefined);
       await cursor.stop(tabId).catch(() => undefined);
+      revokeHookLease("cursor", tabId);
       await updateTerminalRuntime(storage, tabId, { state: "stopped", appServer: null }).catch(() => undefined);
       try {
         await storage.updateTab(tabId, (current) => ({ ...current, session: { ...current.session, state: "closed", lastError: { code: "TERMINAL_REOPEN_FAILED", message } }, updatedAt: isoNow() }));
@@ -786,6 +921,73 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }));
     await clearSessionNotReadyError(storage, tab.id);
     return { ok: true, bundle: await readClientTab(tab.id) };
+  };
+
+  const performCodexNativeTerminalReopen = async (tab: TabMeta, recorder: PhaseRecorder = createPhaseRecorder()): Promise<TerminalReopenResult> => {
+    const tabId = tab.id;
+    try {
+      if (!tab.session.threadId || !tab.session.workingDirectory) {
+        return { ok: false, statusCode: 400, code: "SESSION_NOT_READY", message: "This tab has no active session." };
+      }
+      await pty.stop(tabId, false);
+      await codexTui.stop(tabId);
+      await tuiProxy.stop(tabId);
+      await stopAppServer(storage, codex, tabId);
+      const now = isoNow();
+      await storage.updateTab(tabId, (current) => ({
+        ...current,
+        session: { ...current.session, state: "connecting", lastError: null },
+        updatedAt: now,
+      }));
+      await emitSnapshot(tabId);
+      await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null, appServer: null });
+      const { manager, session } = await recorder.step("start", () => startCodexNativeTui(
+        tabId,
+        tab.session.workingDirectory!,
+        { mode: "resume", sessionId: tab.session.threadId! },
+      ));
+      const historyError = await recorder.step("history", async (): Promise<string | null> => {
+        try {
+          await syncCodexNativeHistory(tabId, session.sessionId, session.transcriptPath ?? manager.session?.transcriptPath);
+          return null;
+        } catch (error) { return error instanceof Error ? error.message : String(error); }
+      });
+      await storage.updateTab(tabId, (current) => ({
+        ...current,
+        session: {
+          ...current.session,
+          provider: "codex",
+          state: "ready",
+          reopenOnLaunch: true,
+          threadId: session.sessionId,
+          sessionId: session.sessionId,
+          connectedAt: isoNow(),
+          lastError: historyError ? { code: "HISTORY_SYNC_FAILED", message: historyError } : null,
+        },
+        updatedAt: isoNow(),
+      }));
+      await clearSessionNotReadyError(storage, tabId);
+      const bundle = await readClientTab(tabId);
+      emit(tabId, { type: "snapshot", data: bundle }, true);
+      return { ok: true, bundle };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await pty.stop(tabId, false).catch(() => undefined);
+      await codexTui.stop(tabId).catch(() => undefined);
+      revokeHookLease("codex", tabId);
+      await updateTerminalRuntime(storage, tabId, { state: "stopped", appServer: null }).catch(() => undefined);
+      const activeWriter = isActiveWriterError(message);
+      const code = activeWriter ? "SESSION_ACTIVE_WRITER" : "TERMINAL_REOPEN_FAILED";
+      try {
+        await storage.updateTab(tabId, (current) => ({
+          ...current,
+          session: { ...current.session, state: "closed", lastError: { code, message } },
+          updatedAt: isoNow(),
+        }));
+      } catch { /* missing tab */ }
+      await emitSnapshot(tabId);
+      return { ok: false, statusCode: activeWriter ? 409 : 500, code, message };
+    }
   };
 
   /**
@@ -829,10 +1031,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (tab.session.provider === "claude") return performClaudeTerminalReopen(tab, recorder);
       if (tab.session.provider === "cursor") return performCursorTerminalReopen(tab, recorder);
       if (tab.session.provider === "shell") return performShellTerminalReopen(tab, recorder);
+      if (codexConnectionMode === "pty-hooks") return performCodexNativeTerminalReopen(tab, recorder);
       if (!tab.session.threadId || !tab.session.workingDirectory) {
         return { ok: false, statusCode: 400, code: "SESSION_NOT_READY", message: "This tab has no active session." };
       }
       await pty.stop(tabId, false);
+      await codexTui.stop(tabId);
       await tuiProxy.stop(tabId);
       await stopAppServer(storage, codex, tabId);
       const now = isoNow();
@@ -1100,7 +1304,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   trafficPruneTimer?.unref?.();
   if (trafficLoggingEnabled) void trafficLog.prune();
 
-  app.promptor = { storage, codex, claude, cursor, pty, runners, timers, ui, traffic, documents, token, restoreOpenSessions, close: async () => {
+  app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, token, restoreOpenSessions, close: async () => {
     clearInterval(stallTimer);
     if (trafficFlushTimer) clearInterval(trafficFlushTimer);
     if (trafficPruneTimer) clearInterval(trafficPruneTimer);
@@ -1128,7 +1332,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     await tuiProxy.stopAll();
     await cursor.stopAll();
     await claude.stopAll();
+    await codexTui.stopAll();
     await codex.stopAll();
+    hookLeases.clear();
   } };
 
   const apiAuth = async (request: FastifyRequest, reply: FastifyReply) => {
@@ -1234,12 +1440,27 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     },
   });
 
-  // Claude Code invokes these hooks from the local TUI process. The per-launch
-  // URL carries Promptor's random local token; this route intentionally lives
-  // outside /api so it is not subject to browser-origin authentication.
-  app.post("/hooks/claude/:tabId", async (request, reply) => {
-    if ((request.query as any)?.token !== token) return reply.code(401).send();
+  // Native CLI hooks use a per-terminal nonce plus a short-lived bearer secret.
+  // The secret is inherited only by that child process and never appears in a
+  // URL, proxy log or browser state. Reopening a terminal invalidates the old
+  // lease immediately.
+  app.post("/hooks/codex/:tabId/:nonce", async (request, reply) => {
     const tabId = String((request.params as any).tabId);
+    if (!hookAuthorized("codex", tabId, String((request.params as any).nonce), request.headers.authorization)) return reply.code(401).send();
+    const manager = codexTui.existing(tabId);
+    if (!manager) return reply.code(410).send();
+    try {
+      await manager.handleHook(request.body ?? {});
+      return reply.code(204).send();
+    } catch (error) {
+      emit(tabId, { type: "error", error: { code: "CODEX_HOOK_FAILED", message: error instanceof Error ? error.message : String(error) } });
+      return reply.code(400).send();
+    }
+  });
+
+  app.post("/hooks/claude/:tabId/:nonce", async (request, reply) => {
+    const tabId = String((request.params as any).tabId);
+    if (!hookAuthorized("claude", tabId, String((request.params as any).nonce), request.headers.authorization)) return reply.code(401).send();
     const manager = claude.existing(tabId);
     if (!manager) return reply.code(410).send();
     try {
@@ -1251,9 +1472,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
   });
 
-  app.post("/hooks/cursor/:tabId", async (request, reply) => {
-    if ((request.query as any)?.token !== token) return reply.code(401).send();
+  app.post("/hooks/cursor/:tabId/:nonce", async (request, reply) => {
     const tabId = String((request.params as any).tabId);
+    if (!hookAuthorized("cursor", tabId, String((request.params as any).nonce), request.headers.authorization)) return reply.code(401).send();
     const manager = cursor.existing(tabId);
     if (!manager) return reply.code(410).send();
     try {
@@ -1273,7 +1494,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return payload;
   });
 
-  app.get("/api/health", async (_request, reply) => reply.send({ data: { ok: true, codex: codex.status, claude: await claudeVersion, cursor: await cursorVersion } }));
+  app.get("/api/health", async (_request, reply) => reply.send({ data: { ok: true, codex: codex.status, codexConnectionMode, claude: await claudeVersion, cursor: await cursorVersion } }));
 
   app.get("/api/common-prompts", async (request, reply) => {
     try { return sendRevalidatable(request, reply, await storage.readCommonPrompts()); }
@@ -1465,6 +1686,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       app: {
         version: "0.1.0",
         codex: codex.status,
+        codexConnectionMode,
         claude: await claudeVersion,
         cursor: await cursorVersion,
         protocol: "multi-provider",
@@ -1612,6 +1834,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     await runners.remove(tabId);
     await cursor.stop(tabId);
     await claude.stop(tabId);
+    await codexTui.stop(tabId);
+    revokeHookLease("codex", tabId);
+    revokeHookLease("claude", tabId);
+    revokeHookLease("cursor", tabId);
     await stopAppServer(storage, codex, tabId);
     await timers.detachTab(tabId);
     try { await storage.deleteTab(tabId); }
@@ -1689,8 +1915,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await awaitThreadSwitch(tabId);
       await pty.stop(tabId, false);
       await tuiProxy.stop(tabId);
+      await codexTui.stop(tabId);
       await cursor.stop(tabId);
       await claude.stop(tabId);
+      revokeHookLease("codex", tabId);
+      revokeHookLease("claude", tabId);
+      revokeHookLease("cursor", tabId);
       await stopAppServer(storage, codex, tabId);
       await storage.updateTab(tabId, (tab) => ({
         ...tab,
@@ -1791,6 +2021,36 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         await clearSessionNotReadyError(storage, tabId);
         return reply.send({ data: { bundle: await readClientTab(tabId), report } });
       }
+      if (codexConnectionMode === "pty-hooks") {
+        const now = isoNow();
+        await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null, appServer: null });
+        const { manager, session } = await startCodexNativeTui(
+          tabId,
+          cwd,
+          mode === "resume" ? { mode: "resume", sessionId: resumeId } : { mode: "new" },
+        );
+        const report = mode === "resume"
+          ? await syncCodexNativeHistory(tabId, session.sessionId, session.transcriptPath ?? manager.session?.transcriptPath)
+          : { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
+        await storage.updateTab(tabId, (current) => ({
+          ...current,
+          session: {
+            provider: "codex",
+            state: "ready",
+            reopenOnLaunch: true,
+            workingDirectory: cwd,
+            threadId: session.sessionId,
+            sessionId: session.sessionId,
+            createdAt: current.session.createdAt ?? now,
+            connectedAt: isoNow(),
+            lastError: null,
+            lastThreadSwitch: null,
+          },
+          updatedAt: isoNow(),
+        }));
+        await clearSessionNotReadyError(storage, tabId);
+        return reply.send({ data: { bundle: await readClientTab(tabId), report } });
+      }
       let manager = codex.get(tabId);
       let rpc = await manager.ensureReady();
       await rememberAppServer(storage, tabId, manager);
@@ -1874,8 +2134,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const message = error instanceof Error ? error.message : String(error);
       await pty.stop(tabId, false).catch(() => undefined);
       await tuiProxy.stop(tabId).catch(() => undefined);
+      await codexTui.stop(tabId).catch(() => undefined);
       await cursor.stop(tabId).catch(() => undefined);
       await claude.stop(tabId).catch(() => undefined);
+      if (provider !== "shell") revokeHookLease(provider, tabId);
       await stopAppServer(storage, codex, tabId).catch(() => undefined);
       await updateTerminalRuntime(storage, tabId, { state: "stopped" }).catch(() => undefined);
       const activeWriter = provider === "codex" && isActiveWriterError(message);
@@ -1905,6 +2167,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         const result = await syncCursorHistory(storage, tabId, tab.session.threadId, manager?.session?.transcriptPath);
         return reply.send({ data: { report: result.report, bundle: await readClientTab(tabId) } });
       }
+      if (codexConnectionMode === "pty-hooks") {
+        const manager = codexTui.existing(tabId);
+        const report = await syncCodexNativeHistory(tabId, tab.session.threadId, manager?.session?.transcriptPath);
+        return reply.send({ data: { report, bundle: await readClientTab(tabId) } });
+      }
       const rpc = await codex.get(tabId).ensureReady();
       const thread = await readCodexThreadForHistory(rpc, tab.session.threadId, cachedRollout(tabId));
       const report = await syncHistory(storage, tabId, thread);
@@ -1931,7 +2198,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       // rather than leaning on the guard above having ruled null out.
       const codexThreadId = tab.session.provider === "codex" ? tab.session.threadId : null;
       if (codexThreadId) {
-        const manager = codex.existing(tabId);
+        const manager = codexConnectionMode === "pty-hooks" ? codexTui.existing(tabId) : codex.existing(tabId);
         if (manager) {
           const activeTurns = manager.rpc.activeTurnIds(codexThreadId);
           await Promise.all(activeTurns.map((turnId) => manager.rpc.interruptTurn(codexThreadId, turnId).catch(() => undefined)));
@@ -1942,6 +2209,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await tuiProxy.stop(tabId);
       await cursor.stop(tabId);
       await claude.stop(tabId);
+      await codexTui.stop(tabId);
+      revokeHookLease("codex", tabId);
+      revokeHookLease("claude", tabId);
+      revokeHookLease("cursor", tabId);
       await stopAppServer(storage, codex, tabId);
       const now = isoNow();
       await storage.updateTab(tabId, (current) => ({
@@ -2289,6 +2560,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             rawBatcher.markInteractive(tabId);
             projectionScheduler.markInteractive(tabId);
             pty.write(tabId, data);
+            if (tab.session.provider === "codex" && codexConnectionMode === "pty-hooks") codexTui.existing(tabId)?.observeTerminalInput(data);
             if (tab.session.provider === "claude") claude.existing(tabId)?.observeTerminalInput(data);
             if (tab.session.provider === "cursor") cursor.existing(tabId)?.observeTerminalInput(data);
             if (typeof message.inputId === "string" && message.inputId.length <= 128) {
@@ -2350,8 +2622,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         const agentName = provider === "claude" ? "Claude Code" : provider === "cursor" ? "Cursor CLI" : "Codex";
         if (state === "error" || state === "exited") {
           const message = event.message ?? `${agentName} TUI exited.`;
+          if (provider === "codex" && codexConnectionMode === "pty-hooks") codexTui.existing(event.tabId)?.observeTerminalExit(message);
           if (provider === "claude") claude.existing(event.tabId)?.observeTerminalExit(message);
           if (provider === "cursor") cursor.existing(event.tabId)?.observeTerminalExit(message);
+          if (provider === "codex" || provider === "claude" || provider === "cursor") revokeHookLease(provider, event.tabId);
         }
         await updateTerminalRuntime(storage, event.tabId, {
         state,

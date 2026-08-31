@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildCursorCommand, CursorCliManager, ensureCursorHookBridge } from "./cursor.js";
 
 const temporaryDirectories: string[] = [];
@@ -58,8 +58,8 @@ describe("Cursor CLI provider", () => {
     expect((await manager.waitForSession()).sessionId).toBe("session");
 
     const starting = manager.rpc.startTurn("session", "cursor prompt", "client", "D:\\work");
-    await Promise.resolve();
-    expect(submitted).toEqual(["cursor prompt"]);
+    await expect(manager.rpc.startTurn("session", "racing prompt", "client-race", "D:\\work")).rejects.toThrow("CURSOR_PROMPT_SUBMISSION_IN_FLIGHT");
+    await vi.waitFor(() => expect(submitted).toEqual(["cursor prompt"]));
     expect(await manager.handleHook({ hook_event_name: "beforeSubmitPrompt", conversation_id: "session", generation_id: "generation", prompt: "cursor prompt" })).toEqual({ continue: true });
     expect((await starting).turnId).toBe("generation");
     await manager.handleHook({ hook_event_name: "beforeSubmitPrompt", conversation_id: "session", generation_id: "manual-steer", prompt: "manual follow-up" });
@@ -71,7 +71,7 @@ describe("Cursor CLI provider", () => {
     expect(manager.rpc.activeTurnIds("session")).toEqual([]);
 
     const interrupted = manager.rpc.startTurn("session", "stop", "client-2", "D:\\work");
-    await Promise.resolve();
+    await vi.waitFor(() => expect(submitted).toContain("stop"));
     await manager.handleHook({ hook_event_name: "beforeSubmitPrompt", conversation_id: "session", generation_id: "generation-2", prompt: "stop" });
     await interrupted;
     await manager.rpc.interruptTurn("session", "generation-2");
@@ -79,7 +79,7 @@ describe("Cursor CLI provider", () => {
     expect((await manager.rpc.waitForTurn("generation-2")).turn.status).toBe("interrupted");
 
     const exiting = manager.rpc.startTurn("session", "terminal exits", "client-3", "D:\\work");
-    await Promise.resolve();
+    await vi.waitFor(() => expect(submitted).toContain("terminal exits"));
     await manager.handleHook({ hook_event_name: "beforeSubmitPrompt", conversation_id: "session", generation_id: "generation-3", prompt: "terminal exits" });
     await exiting;
     await manager.handleHook({ hook_event_name: "sessionStart", conversation_id: "session-2", session_id: "narrow-2", workspace_roots: ["D:\\work"], transcript_path: "D:\\cursor-2.jsonl" });
@@ -88,7 +88,7 @@ describe("Cursor CLI provider", () => {
     await expect(manager.rpc.startTurn("session", "old session", "client-old", "D:\\work")).rejects.toThrow("SESSION_NOT_READY");
 
     const afterSwitch = manager.rpc.startTurn("session-2", "new session prompt", "client-4", "D:\\work");
-    await Promise.resolve();
+    await vi.waitFor(() => expect(submitted).toContain("new session prompt"));
     await manager.handleHook({ hook_event_name: "beforeSubmitPrompt", conversation_id: "session-2", generation_id: "generation-4", prompt: "new session prompt" });
     await afterSwitch;
     manager.observeTerminalExit();

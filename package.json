@@ -13,7 +13,8 @@
     "typecheck": "tsc -p config/tsconfig.client.json --noEmit && tsc -p config/tsconfig.server.json --noEmit",
     "test": "vitest --config config/vitest.config.ts run",
     "test:watch": "vitest --config config/vitest.config.ts",
-    "check:codex": "node scripts/check-codex-compat.mjs"
+    "check:codex": "node --import tsx scripts/check-codex-compat.mjs",
+    "migrate:legacy-history": "node --import tsx scripts/migrate-legacy-history.mjs"
   },
   "dependencies": {
     "@fastify/compress": "9.2.0",

@@ -4,28 +4,20 @@ import { EventEmitter } from "node:events";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { CLAUDE_EXIT_MARKER, type PtyManager, type TerminalTheme } from "./pty.js";
+import type { AgentProcessLaunch, PtyManager } from "./pty.js";
 import type { QueueBinding, QueueRpc } from "./queue.js";
 import { clearSubmitTimers, sameSubmittedPrompt, scheduleSubmitRecovery, type SubmitEvidence, type SubmitTimers } from "./prompt-submit.js";
-import { inspectClaudeSubmission, reconcileClaudeTurn, transcriptCursor, type TranscriptCursor } from "./transcript-reconciliation.js";
+import { inspectCodexSubmission, reconcileCodexTurn, transcriptCursor, type TranscriptCursor } from "./transcript-reconciliation.js";
 
-const execFileAsync = promisify(execFile);
 const COMPLETED_CACHE_LIMIT = 100;
+const execFileAsync = promisify(execFile);
 
-export type ClaudeLaunch = { mode: "new" } | { mode: "resume"; sessionId: string };
-export type ClaudeSessionInfo = {
+export type CodexTuiLaunch = { mode: "new" } | { mode: "resume"; sessionId: string };
+export type CodexTuiSessionInfo = {
   sessionId: string;
   cwd: string;
   transcriptPath: string | null;
   source: string | null;
-};
-
-export type ClaudeTurnCompletedEvent = {
-  threadId: string;
-  turnId: string;
-  turn: any;
-  items: any[];
-  origin: "queue" | "manual";
 };
 
 type Deferred<T> = {
@@ -61,10 +53,7 @@ function deferred<T>(): Deferred<T> {
   let rejectPromise!: (error: Error) => void;
   const value: Deferred<T> = {
     settled: false,
-    promise: new Promise<T>((resolve, reject) => {
-      resolvePromise = resolve;
-      rejectPromise = reject;
-    }),
+    promise: new Promise<T>((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; }),
     resolve: (result) => {
       if (value.settled) return;
       value.settled = true;
@@ -79,10 +68,11 @@ function deferred<T>(): Deferred<T> {
   return value;
 }
 
-export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
+/** Native Codex TUI adapter used by the experimental PTY/hooks transport. */
+export class CodexTuiManager extends EventEmitter implements QueueBinding {
   readonly rpc: QueueRpc;
-  private launchReady: Deferred<ClaudeSessionInfo> | null = null;
-  private attached: ClaudeSessionInfo | null = null;
+  private launchReady: Deferred<CodexTuiSessionInfo> | null = null;
+  private attached: CodexTuiSessionInfo | null = null;
   private readonly turns = new Map<string, TurnState>();
   private readonly completed = new Map<string, { turn: any; items: any[] }>();
   private submission: Submission | null = null;
@@ -101,44 +91,38 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
       interruptPendingSubmission: (threadId) => this.interruptPendingSubmission(threadId),
       waitForTurn: (turnId) => this.waitForTurn(turnId),
     };
-    // Keep EventEmitter's special error event non-fatal for isolated tests.
     this.on("error", () => undefined);
   }
 
-  get session(): ClaudeSessionInfo | null { return this.attached ? { ...this.attached } : null; }
+  get session(): CodexTuiSessionInfo | null { return this.attached ? { ...this.attached } : null; }
 
   async beginLaunch(options: {
     cwd: string;
-    launch: ClaudeLaunch;
+    launch: CodexTuiLaunch;
     hookScriptPath: string;
-    settingsPath: string;
-    theme: TerminalTheme;
-    exitMarker: string;
-  }): Promise<string> {
-    this.reset("Claude Code session is restarting.");
-    this.launchReady = deferred<ClaudeSessionInfo>();
+    bypassHookTrust?: boolean;
+  }): Promise<AgentProcessLaunch> {
+    this.reset("Codex session is restarting.");
+    this.launchReady = deferred<CodexTuiSessionInfo>();
     await fs.access(options.hookScriptPath);
-    await fs.mkdir(path.dirname(options.settingsPath), { recursive: true });
-    await fs.writeFile(options.settingsPath, `${JSON.stringify(buildClaudeHookSettings(options.hookScriptPath), null, 2)}\n`, "utf8");
-    return buildClaudeCommand(options.cwd, options.settingsPath, options.launch, options.theme, options.exitMarker);
+    return buildCodexTuiLaunch(options.cwd, options.launch, options.hookScriptPath, process.execPath, options.bypassHookTrust);
   }
 
-  async waitForSession(timeoutMs = 30_000, startupError?: () => string | null): Promise<ClaudeSessionInfo> {
+  async waitForSession(timeoutMs = 30_000, startupError?: () => string | null): Promise<CodexTuiSessionInfo> {
     const ready = this.launchReady;
-    if (!ready) throw new Error("CLAUDE_LAUNCH_NOT_PREPARED");
+    if (!ready) throw new Error("CODEX_TUI_LAUNCH_NOT_PREPARED");
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (ready.settled) return ready.promise;
       const error = startupError?.();
       if (error) throw new Error(error);
-      const remaining = Math.max(1, deadline - Date.now());
       const result = await Promise.race([
         ready.promise.then((value) => ({ value })),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), Math.min(150, remaining))),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), Math.min(150, Math.max(1, deadline - Date.now())))),
       ]);
       if (result) return result.value;
     }
-    throw new Error("CLAUDE_SESSION_START_TIMEOUT");
+    throw new Error("CODEX_HOOK_TRUST_REQUIRED_OR_SESSION_START_TIMEOUT");
   }
 
   async handleHook(payload: any): Promise<void> {
@@ -146,14 +130,15 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
     const sessionId = String(payload?.session_id ?? payload?.sessionId ?? this.attached?.sessionId ?? "");
     const transcriptPath = stringOrNull(payload?.transcript_path ?? payload?.transcriptPath);
     if (this.attached && transcriptPath) this.attached.transcriptPath = transcriptPath;
+
     if (eventName === "SessionStart") {
-      if (!sessionId) throw new Error("CLAUDE_SESSION_ID_MISSING");
+      if (!sessionId) throw new Error("CODEX_SESSION_ID_MISSING");
       if (this.attached?.sessionId && this.attached.sessionId !== sessionId) {
-        const message = `Claude Code switched from session ${this.attached.sessionId} to ${sessionId}.`;
+        const message = `Codex switched from session ${this.attached.sessionId} to ${sessionId}.`;
         if (this.submission) this.rejectSubmission(this.submission, new Error(message));
         for (const turn of [...this.turns.values()]) this.completeTurn(turn, "interrupted", "", message);
       }
-      const info: ClaudeSessionInfo = {
+      const info: CodexTuiSessionInfo = {
         sessionId,
         cwd: String(payload?.cwd ?? this.attached?.cwd ?? ""),
         transcriptPath,
@@ -174,24 +159,22 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
       this.finishTurn(payload, sessionId, "completed");
       return;
     }
-    if (eventName === "StopFailure") {
-      this.finishTurn(payload, sessionId, "failed");
+    if (eventName === "PostCompact") {
+      this.emit("compacted", { sessionId, transcriptPath: this.attached?.transcriptPath ?? null });
       return;
     }
     if (eventName === "SessionEnd") {
-      this.observeTerminalExit("Claude Code session ended before a final answer was produced.");
+      this.observeTerminalExit("Codex session ended before a final answer was produced.");
       this.emit("sessionEnd", { sessionId, reason: payload?.reason ?? null });
     }
   }
 
   observeTerminalInput(data: string): void {
-    // Claude's Stop hook intentionally does not fire for user interrupts. Only
-    // treat Escape/Ctrl-C as an interrupt while an agent turn is actually live.
-    if ((data !== "\x03" && data !== "\x1b") || !this.turns.size) return;
-    for (const turn of [...this.turns.values()]) this.completeTurn(turn, "interrupted", "", "Claude Code turn was interrupted in the terminal.");
+    if ((data !== "\x03" && data !== "\x1b" && data !== "\x1b\x1b") || !this.turns.size) return;
+    for (const turn of [...this.turns.values()]) this.completeTurn(turn, "interrupted", "", "Codex turn was interrupted in the terminal.");
   }
 
-  observeTerminalExit(message = "Claude Code TUI exited before the turn produced a final answer."): void {
+  observeTerminalExit(message = "Codex TUI exited before the turn produced a final answer."): void {
     if (this.submission) this.rejectSubmission(this.submission, new Error(message));
     for (const turn of [...this.turns.values()]) this.completeTurn(turn, "interrupted", "", message);
     if (this.launchReady && !this.launchReady.settled) {
@@ -201,36 +184,36 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
     this.attached = null;
   }
 
-  async stop(): Promise<void> {
-    this.reset("Claude Code session was closed.");
-  }
+  async stop(): Promise<void> { this.reset("Codex session was closed."); }
 
   private async startTurn(threadId: string, text: string, clientUserMessageId: string): Promise<{ turnId: string }> {
     this.assertAttached(threadId);
-    if (this.activeTurnIds(threadId).length) throw new Error("CLAUDE_SESSION_BUSY");
-    const accepted = await this.reserveSubmission("turn", text, clientUserMessageId, null);
+    if (this.activeTurnIds(threadId).length) throw new Error("CODEX_SESSION_BUSY");
+    const submission = await this.reserveSubmission("turn", text, clientUserMessageId, null);
     if (!this.pty.submitPrompt(this.tabId, text)) {
-      this.rejectSubmission(accepted, new Error("CLAUDE_TERMINAL_NOT_RUNNING"));
+      this.rejectSubmission(submission, new Error("CODEX_TERMINAL_NOT_RUNNING"));
     }
-    return { turnId: await accepted.accepted.promise };
+    return { turnId: await submission.accepted.promise };
   }
 
   private async steerTurn(threadId: string, turnId: string, text: string, clientUserMessageId: string): Promise<void> {
     this.assertAttached(threadId);
-    if (!this.turns.has(turnId)) throw new Error("CLAUDE_TURN_NOT_ACTIVE");
-    const accepted = await this.reserveSubmission("steer", text, clientUserMessageId, turnId);
+    if (!this.turns.has(turnId)) throw new Error("CODEX_TURN_NOT_ACTIVE");
+    const submission = await this.reserveSubmission("steer", text, clientUserMessageId, turnId);
     if (!this.pty.submitPrompt(this.tabId, text)) {
-      this.rejectSubmission(accepted, new Error("CLAUDE_TERMINAL_NOT_RUNNING"));
+      this.rejectSubmission(submission, new Error("CODEX_TERMINAL_NOT_RUNNING"));
     }
-    await accepted.accepted.promise;
+    await submission.accepted.promise;
   }
 
   private async interruptTurn(threadId: string, turnId: string): Promise<void> {
     this.assertAttached(threadId);
     const turn = this.turns.get(turnId);
     if (!turn) return;
+    // Codex 0.147.0 uses Escape to interrupt a live turn. Keep this in the
+    // provider adapter so a future CLI change does not alter other agents.
     this.pty.write(this.tabId, "\x1b");
-    this.completeTurn(turn, "interrupted", "", "Claude Code turn was interrupted before a final answer was produced.");
+    this.completeTurn(turn, "interrupted", "", "Codex turn was interrupted before a final answer was produced.");
   }
 
   private async interruptPendingSubmission(threadId: string): Promise<boolean> {
@@ -242,7 +225,7 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
       this.reservationInFlight = false;
       return true;
     }
-    const evidence = await inspectClaudeSubmission(this.submissionCursor(submission), submission.prompt);
+    const evidence = await inspectCodexSubmission(this.submissionCursor(submission), submission.prompt, threadId);
     if (evidence.state === "accepted") {
       this.acceptRecoveredSubmission(submission, evidence);
       const turnId = submission.kind === "steer" ? submission.logicalTurnId : evidence.turnId;
@@ -259,14 +242,14 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
     if (completed) return completed;
     while (true) {
       const active = this.turns.get(turnId);
-      if (!active) throw new Error(`CLAUDE_TURN_NOT_FOUND:${turnId}`);
+      if (!active) throw new Error(`CODEX_TURN_NOT_FOUND:${turnId}`);
       const result = await Promise.race([
         active.completion.promise.then((value) => ({ value })),
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
       ]);
       if (result) return result.value;
-      const recovered = await reconcileClaudeTurn(active.recordCursor, active.turnId, active.prompt);
-      if (recovered) this.completeTurn(active, recovered.status, recovered.answer, "Claude Code turn ended without a completion hook.", recovered.completedAt);
+      const recovered = await reconcileCodexTurn(active.recordCursor, active.threadId, active.turnId, active.prompt);
+      if (recovered) this.completeTurn(active, recovered.status, recovered.answer, "Codex turn ended without a completion hook.", recovered.completedAt);
     }
   }
 
@@ -291,25 +274,20 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
 
   private acceptPrompt(payload: any, sessionId: string): void {
     const prompt = String(payload?.prompt ?? payload?.user_prompt ?? "");
+    const hookTurnId = String(payload?.turn_id ?? payload?.turnId ?? "") || randomUUID();
     const pending = this.submission;
-    // A manual terminal prompt can race an injected queue prompt. A hook that
-    // omits or changes the text is ambiguous, so leave the slot pending for
-    // transcript reconciliation instead of claiming it by arrival order.
     if (pending && !prompt.trim()) {
-      this.emit("submissionAmbiguous", { threadId: sessionId, reason: "CLAUDE_HOOK_PROMPT_MISSING" });
+      this.emit("submissionAmbiguous", { threadId: sessionId, reason: "CODEX_HOOK_PROMPT_MISSING" });
       return;
     }
     const submission = pending && sameSubmittedPrompt(pending.prompt, prompt)
       ? this.takeSubmission(pending)
       : null;
-    const hookPromptId = String(payload?.prompt_id ?? payload?.promptId ?? "") || randomUUID();
     if (submission?.kind === "steer") {
       submission.accepted.resolve(submission.logicalTurnId!);
+      this.emit("turnSteered", { threadId: sessionId, turnId: submission.logicalTurnId, prompt: submission.prompt, origin: "queue" });
       return;
     }
-    // Claude accepts terminal follow-ups while an answer is active. They are
-    // steering for that logical turn, not a second independently completing
-    // turn; Stop will finalize the existing turn once.
     const active = [...this.turns.values()].find((candidate) => candidate.threadId === sessionId);
     if (submission && active) {
       submission.accepted.resolve(active.turnId);
@@ -320,20 +298,26 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
       this.emit("turnSteered", { threadId: sessionId, turnId: active.turnId, prompt, origin: "manual" });
       return;
     }
-    this.createTurn(hookPromptId, sessionId, prompt || submission?.prompt || "[non-text input]", submission);
+    this.createTurn(hookTurnId, sessionId, prompt || submission?.prompt || "[non-text input]", submission);
   }
 
   private finishTurn(payload: any, sessionId: string, status: "completed" | "failed"): void {
-    const requestedId = String(payload?.prompt_id ?? payload?.promptId ?? "");
+    const requestedId = String(payload?.turn_id ?? payload?.turnId ?? "");
     const turn = (requestedId ? this.turns.get(requestedId) : null)
       ?? [...this.turns.values()].find((candidate) => candidate.threadId === sessionId);
     if (!turn) return;
     const answer = String(payload?.last_assistant_message ?? payload?.lastAssistantMessage ?? "");
-    const error = String(payload?.error ?? payload?.message ?? "Claude Code failed before a final answer was produced.");
+    const error = String(payload?.error ?? payload?.message ?? "Codex failed before a final answer was produced.");
     this.completeTurn(turn, status, answer, error);
   }
 
-  private completeTurn(turn: TurnState, status: "completed" | "failed" | "interrupted", answer: string, errorMessage: string, recoveredCompletedAt?: string | null): void {
+  private completeTurn(
+    turn: TurnState,
+    status: "completed" | "failed" | "interrupted",
+    answer: string,
+    errorMessage: string,
+    recoveredCompletedAt?: string | null,
+  ): void {
     if (!this.turns.delete(turn.turnId)) return;
     const completedAt = recoveredCompletedAt ?? new Date().toISOString();
     const items: any[] = [{
@@ -355,13 +339,12 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
     this.completed.set(turn.turnId, result);
     while (this.completed.size > COMPLETED_CACHE_LIMIT) this.completed.delete(this.completed.keys().next().value!);
     turn.completion.resolve(result);
-    const event: ClaudeTurnCompletedEvent = { threadId: turn.threadId, turnId: turn.turnId, ...result, origin: turn.origin };
-    this.emit("turnCompleted", event);
+    this.emit("turnCompleted", { threadId: turn.threadId, turnId: turn.turnId, ...result, origin: turn.origin });
     void this.refreshSessionCursor();
   }
 
   private async reserveSubmission(kind: Submission["kind"], prompt: string, clientUserMessageId: string, logicalTurnId: string | null): Promise<Submission> {
-    if (this.submission || this.reservationInFlight) throw new Error("CLAUDE_PROMPT_SUBMISSION_IN_FLIGHT");
+    if (this.submission || this.reservationInFlight) throw new Error("CODEX_PROMPT_SUBMISSION_IN_FLIGHT");
     const attached = this.attached;
     const reservation = ++this.submissionReservation;
     this.reservationInFlight = true;
@@ -373,7 +356,7 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
       let submission!: Submission;
       submission = { kind, prompt, clientUserMessageId, logicalTurnId, recordCursor, accepted, timers: null as unknown as SubmitTimers };
       submission.timers = scheduleSubmitRecovery({
-        inspect: () => inspectClaudeSubmission(this.submissionCursor(submission), prompt),
+        inspect: () => inspectCodexSubmission(this.submissionCursor(submission), prompt, this.attached?.sessionId ?? ""),
         resend: () => { this.pty.submitEnter(this.tabId); },
         accept: (evidence) => this.acceptRecoveredSubmission(submission, evidence),
         unconfirmed: (evidence) => this.emit("submissionUnconfirmed", { threadId: this.attached?.sessionId, prompt, reason: evidence.reason ?? null }),
@@ -416,10 +399,14 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
       this.emit("turnSteered", { threadId: active.threadId, turnId: active.turnId, prompt: submission.prompt, origin: "queue" });
       return;
     }
-    this.createTurn(evidence.turnId, this.attached?.sessionId ?? "", submission.prompt, submission);
+    const turn = this.createTurn(evidence.turnId, this.attached?.sessionId ?? "", submission.prompt, submission);
+    if (evidence.turn?.status && evidence.turn.status !== "running") {
+      const answer = answerFromItems(evidence.items ?? evidence.turn.items ?? []);
+      this.completeTurn(turn, evidence.turn.status === "completed" ? "completed" : "interrupted", answer, "Codex turn ended before its hook was observed.", evidence.turn.completedAt ?? null);
+    }
   }
 
-  private createTurn(turnId: string, threadId: string, prompt: string, submission: Submission | null): void {
+  private createTurn(turnId: string, threadId: string, prompt: string, submission: Submission | null): TurnState {
     const turn: TurnState = {
       turnId,
       threadId,
@@ -427,12 +414,16 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
       clientUserMessageId: submission?.clientUserMessageId ?? null,
       origin: submission ? "queue" : "manual",
       startedAt: new Date().toISOString(),
+      // SessionStart snapshots the rollout tail, so a manual prompt after a
+      // long resume never makes the low-frequency completion check rescan the
+      // whole conversation. Queue submissions keep their own pre-write cursor.
       recordCursor: submission ? this.submissionCursor(submission) : { ...this.sessionCursor },
       completion: deferred(),
     };
     this.turns.set(turnId, turn);
     submission?.accepted.resolve(turnId);
     this.emit("turnStarted", { threadId, turnId, prompt, origin: turn.origin });
+    return turn;
   }
 
   private assertAttached(threadId: string): void {
@@ -452,8 +443,6 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
     if (this.submission) this.rejectSubmission(this.submission, new Error(message));
     for (const turn of [...this.turns.values()]) this.completeTurn(turn, "interrupted", "", message);
     this.launchReady?.reject(new Error(message));
-    // Avoid an unhandled rejection when a prepared launch is replaced before
-    // the caller starts waiting for SessionStart.
     void this.launchReady?.promise.catch(() => undefined);
     this.launchReady = null;
     this.attached = null;
@@ -461,21 +450,21 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
   }
 }
 
-export class ClaudeCodePool extends EventEmitter {
-  private readonly managers = new Map<string, ClaudeCodeManager>();
+export class CodexTuiPool extends EventEmitter {
+  private readonly managers = new Map<string, CodexTuiManager>();
 
   constructor(private readonly pty: PtyManager) { super(); }
 
-  get(tabId: string): ClaudeCodeManager {
+  get(tabId: string): CodexTuiManager {
     let manager = this.managers.get(tabId);
     if (manager) return manager;
-    manager = new ClaudeCodeManager(tabId, this.pty);
+    manager = new CodexTuiManager(tabId, this.pty);
     this.managers.set(tabId, manager);
     this.emit("created", { tabId, manager });
     return manager;
   }
 
-  existing(tabId: string): ClaudeCodeManager | null { return this.managers.get(tabId) ?? null; }
+  existing(tabId: string): CodexTuiManager | null { return this.managers.get(tabId) ?? null; }
 
   async stop(tabId: string): Promise<void> {
     const manager = this.managers.get(tabId);
@@ -485,53 +474,76 @@ export class ClaudeCodePool extends EventEmitter {
     this.emit("removed", { tabId });
   }
 
-  async stopAll(): Promise<void> {
-    await Promise.all([...this.managers.keys()].map((tabId) => this.stop(tabId)));
-  }
+  async stopAll(): Promise<void> { await Promise.all([...this.managers.keys()].map((tabId) => this.stop(tabId))); }
 }
 
-export function buildClaudeHookSettings(hookScriptPath: string, nodePath = process.execPath): Record<string, unknown> {
-  return {
-    hooks: Object.fromEntries(["SessionStart", "UserPromptSubmit", "Stop", "StopFailure", "SessionEnd"]
-      .map((event) => [event, [{
-        matcher: "",
-        hooks: [{ type: "command", command: `${quoteCommandArg(nodePath)} ${quoteCommandArg(hookScriptPath)} ${event}`, timeout: 10 }],
-      }]])),
-  };
+export function buildCodexHookOverride(hookScriptPath: string, nodePath = process.execPath): string {
+  const events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd", "PreCompact", "PostCompact"];
+  const fields = events.map((event) => {
+    const command = `${quoteHookArg(nodePath)} ${quoteHookArg(hookScriptPath)} ${event}`;
+    return `${event}=[{hooks=[{type="command",command=${tomlString(command)},timeout=10}]}]`;
+  });
+  return `hooks={${fields.join(",")}}`;
 }
 
-export function buildClaudeCommand(cwd: string, settingsPath: string, launch: ClaudeLaunch, theme: TerminalTheme = "light", exitMarker = CLAUDE_EXIT_MARKER): string {
-  const foreground = theme === "light" ? "Black" : "Gray";
-  const background = theme === "light" ? "White" : "Black";
-  const ansi = theme === "light" ? "30;47" : "37;40";
-  const resume = launch.mode === "resume" ? ` --resume ${quotePowerShellArg(launch.sessionId)}` : "";
-  const invocation = `& claude${resume} --settings ${quotePowerShellArg(settingsPath)}`;
-  // Claude's fullscreen renderer uses the terminal alternate screen, whose
-  // contents never enter xterm's native scrollback. Promptor is itself the
-  // terminal emulator, so keep Claude on the classic main-screen renderer.
-  return `$env:NO_COLOR = "1"; $env:CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN = "1"; Set-Location -LiteralPath ${quotePowerShellArg(cwd)}; $Host.UI.RawUI.ForegroundColor = "${foreground}"; $Host.UI.RawUI.BackgroundColor = "${background}"; $promptorEsc = [char]27; Write-Host -NoNewline "$promptorEsc[${ansi}m"; Clear-Host; ${invocation}; $promptorClaudeOk = $?; $promptorClaudeExit = $LASTEXITCODE; if ($null -eq $promptorClaudeExit) { if ($promptorClaudeOk) { $promptorClaudeExit = 0 } else { $promptorClaudeExit = 1 } }; Write-Output "${exitMarker}$promptorClaudeExit"`;
+export function buildCodexTuiLaunch(
+  cwd: string,
+  launch: CodexTuiLaunch,
+  hookScriptPath: string,
+  nodePath = process.execPath,
+  bypassHookTrust = false,
+): AgentProcessLaunch {
+  const args = launch.mode === "resume" ? ["resume", launch.sessionId] : [];
+  args.push("--no-alt-screen", "-C", cwd, "-c", "check_for_update_on_startup=false", "-c", buildCodexHookOverride(hookScriptPath, nodePath));
+  if (bypassHookTrust) args.push("--dangerously-bypass-hook-trust");
+  return { executable: "codex", args };
 }
 
-export async function probeClaudeVersion(): Promise<{ available: boolean; version: string | null; error: string | null }> {
+/** Resolve the npm `.cmd` shim to Node + codex.js before the exact-argv launch. */
+export async function resolveCodexTuiLaunch(launch: AgentProcessLaunch): Promise<AgentProcessLaunch> {
+  const configured = String(process.env.CODEX_PROMPTOR_CODEX_EXECUTABLE ?? "").trim();
+  if (configured) return { ...launch, executable: configured };
+  if (process.platform !== "win32") return launch;
   try {
-    const result = process.platform === "win32"
-      ? await execFileAsync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "claude --version"], { windowsHide: true })
-      : await execFileAsync("claude", ["--version"], { windowsHide: true });
-    return { available: true, version: String(result.stdout).trim() || null, error: null };
-  } catch (error) {
-    return { available: false, version: null, error: error instanceof Error ? error.message : String(error) };
-  }
+    const result = await execFileAsync("where.exe", ["codex"], { windowsHide: true });
+    const candidates = String(result.stdout).split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    const executable = candidates.find((value) => /\.exe$/i.test(value));
+    if (executable) return { ...launch, executable };
+    const shim = candidates.find((value) => /\.cmd$/i.test(value));
+    if (shim) {
+      const cli = path.join(path.dirname(shim), "node_modules", "@openai", "codex", "bin", "codex.js");
+      await fs.access(cli);
+      return { executable: process.execPath, args: [cli, ...launch.args] };
+    }
+  } catch { /* report the stable adapter error below */ }
+  throw new Error("CODEX_NATIVE_EXECUTABLE_NOT_FOUND");
+}
+
+export function codexHookStartupError(output: string): string | null {
+  const plain = output
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, " ");
+  return /(?:hook[^\r\n]{0,80}(?:not trusted|untrusted|trust required)|(?:not trusted|untrusted)[^\r\n]{0,80}hook)/i.test(plain)
+    ? "CODEX_HOOK_TRUST_REQUIRED"
+    : null;
 }
 
 function stringOrNull(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
-function quotePowerShellArg(value: string): string {
-  if (/^[A-Za-z0-9_:/.-]+$/.test(value)) return value;
-  return `'${value.replace(/'/g, "''")}'`;
+function quoteHookArg(value: string): string {
+  return /\s|["']/u.test(value) ? `"${value.replace(/(["\\])/g, "\\$1")}"` : value;
 }
 
-function quoteCommandArg(value: string): string {
-  return `"${value.replace(/"/g, '\\"')}"`;
+function tomlString(value: string): string { return JSON.stringify(value); }
+
+function answerFromItems(items: any[]): string {
+  const agents = items.filter((item) => String(item?.type ?? "").toLowerCase() === "agentmessage");
+  for (let index = agents.length - 1; index >= 0; index -= 1) {
+    const item = agents[index];
+    if (String(item?.phase ?? "").toLowerCase() === "final_answer") return String(item?.text ?? "");
+  }
+  return String(agents.at(-1)?.text ?? "");
 }

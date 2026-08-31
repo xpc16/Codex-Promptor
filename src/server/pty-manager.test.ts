@@ -150,3 +150,40 @@ describe("PtyManager prompt submission", () => {
     vi.useRealTimers();
   });
 });
+
+describe("PtyManager argv launch", () => {
+  it("passes an encoded argv specification to the tracked PowerShell launcher", async () => {
+    vi.useFakeTimers();
+    mocks.spawn.mockReset();
+    const term = fakePty();
+    mocks.spawn.mockReturnValueOnce(term.process);
+    const manager = new PtyManager();
+    await manager.startArgvCommand(
+      "tab-argv",
+      "D:\\work dir",
+      { executable: "codex", args: ["resume", "session", "-c", "hooks={value=\"x y\"}"] },
+      "D:\\Promptor dir\\scripts\\launch-agent.ps1",
+      "Codex",
+      "__EXIT__:test:",
+      { CODEX_PROMPTOR_HOOK_SECRET: "secret" },
+      "dark",
+    );
+    const [, shellArgs, options] = mocks.spawn.mock.calls[0];
+    expect(shellArgs).toContain("D:\\Promptor dir\\scripts\\launch-agent.ps1");
+    const decoded = JSON.parse(Buffer.from(options.env.CODEX_PROMPTOR_AGENT_SPEC_BASE64, "base64").toString("utf8"));
+    expect(decoded).toEqual({
+      executable: "codex",
+      args: ["resume", "session", "-c", "hooks={value=\"x y\"}"],
+      cwd: "D:\\work dir",
+      theme: "dark",
+      exitMarker: "__EXIT__:test:",
+      nodePath: process.execPath,
+    });
+    expect(options.env.CODEX_PROMPTOR_HOOK_SECRET).toBe("secret");
+    vi.advanceTimersByTime(180);
+    expect(term.process.write).not.toHaveBeenCalled();
+    term.exit();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+});

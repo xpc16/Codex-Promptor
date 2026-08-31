@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildClaudeCommand, buildClaudeHookSettings, ClaudeCodeManager } from "./claude.js";
 
 const temporaryDirectories: string[] = [];
@@ -45,8 +45,8 @@ describe("Claude Code provider", () => {
     expect((await manager.waitForSession()).sessionId).toBe("session-1");
 
     const starting = manager.rpc.startTurn("session-1", "queue prompt", "client-1", directory);
-    await Promise.resolve();
-    expect(submitted).toEqual(["queue prompt"]);
+    await expect(manager.rpc.startTurn("session-1", "racing prompt", "client-race", directory)).rejects.toThrow("CLAUDE_PROMPT_SUBMISSION_IN_FLIGHT");
+    await vi.waitFor(() => expect(submitted).toEqual(["queue prompt"]));
     await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-1", prompt_id: "prompt-1", prompt: "queue prompt" });
     const { turnId } = await starting;
     expect(turnId).toBe("prompt-1");
@@ -62,7 +62,7 @@ describe("Claude Code provider", () => {
     expect(manager.rpc.activeTurnIds("session-1")).toEqual([]);
 
     const second = manager.rpc.startTurn("session-1", "interrupt me", "client-2", directory);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(submitted).toContain("interrupt me"));
     await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-1", prompt_id: "prompt-2", prompt: "interrupt me" });
     await second;
     await manager.rpc.interruptTurn("session-1", "prompt-2");
@@ -70,7 +70,7 @@ describe("Claude Code provider", () => {
     expect((await manager.rpc.waitForTurn("prompt-2")).turn.status).toBe("interrupted");
 
     const exiting = manager.rpc.startTurn("session-1", "terminal exits", "client-3", directory);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(submitted).toContain("terminal exits"));
     await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-1", prompt_id: "prompt-3", prompt: "terminal exits" });
     await exiting;
     await manager.handleHook({ hook_event_name: "SessionStart", session_id: "session-2", cwd: directory, transcript_path: path.join(directory, "session-2.jsonl"), source: "resume" });
@@ -79,7 +79,7 @@ describe("Claude Code provider", () => {
     await expect(manager.rpc.startTurn("session-1", "old session", "client-old", directory)).rejects.toThrow("SESSION_NOT_READY");
 
     const afterSwitch = manager.rpc.startTurn("session-2", "new session prompt", "client-4", directory);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(submitted).toContain("new session prompt"));
     await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-2", prompt_id: "prompt-4", prompt: "new session prompt" });
     await afterSwitch;
     manager.observeTerminalExit();

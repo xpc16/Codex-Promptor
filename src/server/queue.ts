@@ -14,6 +14,8 @@ export type QueueRpc = {
   startTurn(threadId: string, text: string, clientUserMessageId: string, cwd: string): Promise<{ turnId: string }>;
   steerTurn(threadId: string, turnId: string, text: string, clientUserMessageId: string): Promise<unknown>;
   interruptTurn(threadId: string, turnId: string): Promise<unknown>;
+  /** Interrupt a PTY submission before its hook/record has yielded a turn id. */
+  interruptPendingSubmission?(threadId: string): Promise<boolean>;
   waitForTurn(turnId: string): Promise<{ turn: any; items: any[] }>;
 };
 export type QueueBinding = { rpc: QueueRpc };
@@ -126,7 +128,7 @@ export class QueueRunner extends EventEmitter {
       runner: {
         ...runtime.runner,
         desiredState: "paused",
-        state: runtime.runner.activeTurnId ? "pausing" : "paused",
+        state: runtime.runner.activePromptId ? "pausing" : "paused",
         lastTransitionAt: isoNow(),
       },
     }));
@@ -208,11 +210,12 @@ export class QueueRunner extends EventEmitter {
     let bundle = await this.storage.readTab(this.tabId);
     const threadId = bundle.tab.session.threadId;
     let turnId = bundle.runtime.runner.activeTurnId;
+    const interruptPendingSubmission = this.agent().rpc.interruptPendingSubmission;
     // turn/start can be in flight after the prompt was reserved but before its
     // turn id is persisted. Keep Interrupt effective in that short window by
     // waiting for the id instead of abandoning a request that may already have
     // reached the provider.
-    if (threadId && bundle.runtime.runner.activePromptId && !turnId && activeLoop) {
+    if (threadId && bundle.runtime.runner.activePromptId && !turnId && activeLoop && !interruptPendingSubmission) {
       const deadline = Date.now() + this.freezeTimeoutMs;
       while (Date.now() < deadline && !turnId) {
         await new Promise((resolve) => setTimeout(resolve, Math.min(50, Math.max(1, deadline - Date.now()))));
@@ -222,6 +225,20 @@ export class QueueRunner extends EventEmitter {
       }
     }
     if (!threadId || !turnId) {
+      if (threadId && bundle.runtime.runner.activePromptId && interruptPendingSubmission) {
+        const interrupted = await interruptPendingSubmission(threadId).catch(() => false);
+        if (interrupted) {
+          let loopSettled = !activeLoop;
+          if (activeLoop) {
+            await Promise.race([
+              activeLoop.then(() => { loopSettled = true; }, () => { loopSettled = true; }),
+              new Promise<void>((resolve) => setTimeout(resolve, this.freezeTimeoutMs)),
+            ]);
+          }
+          if (!loopSettled) this.abandonLoop(activeLoop);
+          return true;
+        }
+      }
       this.abandonLoop(activeLoop);
       return false;
     }
@@ -525,6 +542,10 @@ export class QueueRunner extends EventEmitter {
         }
       }
       const message = error instanceof Error ? error.message : String(error);
+      if (!turnId && message === "PROMPT_SUBMISSION_INTERRUPTED") {
+        await this.finalizeInterruptedSubmission(threadId, dispatched.prompt.id, dispatched.clientUserMessageId);
+        return false;
+      }
       await this.markFailure(dispatched.prompt.id, dispatched.clientUserMessageId, turnId ? "TURN_FAILED" : "TURN_START_FAILED", message, turnId || null);
       await this.clearActive({ code: turnId ? "TURN_FAILED" : "TURN_START_FAILED", message }, dispatched.prompt.id, turnId || null);
       return true;
@@ -722,6 +743,25 @@ export class QueueRunner extends EventEmitter {
     });
     if (interruptedAnswer) this.emit("answer", interruptedAnswer);
     if (interruptedRuntime) this.emit("runtime", interruptedRuntime);
+  }
+
+  private async finalizeInterruptedSubmission(threadId: string, promptId: string, clientId: string): Promise<void> {
+    // There is intentionally no invented provider turn id. This names a local
+    // submission lifecycle record so the interrupted attempt can be displayed
+    // and retried without pretending the provider acknowledged it.
+    const localTurnId = `submission-interrupted:${clientId}`;
+    await this.storage.withTabLock(this.tabId, async () => {
+      const bundle = await this.storage.readTab(this.tabId);
+      const prompt = bundle.prompts.prompts.find((item) => item.id === promptId && item.clientUserMessageId === clientId);
+      const attempt = prompt?.attempts.find((item) => item.clientUserMessageId === clientId && item.status === "dispatching");
+      if (!prompt || !attempt || prompt.status !== "dispatching") return;
+      prompt.codexTurnId = localTurnId;
+      attempt.codexTurnId = localTurnId;
+      bundle.prompts.revision += 1;
+      bundle.prompts.updatedAt = isoNow();
+      await this.storage.writePrompts(this.tabId, bundle.prompts);
+    });
+    await this.finalizeInterruptedTurn(threadId, localTurnId);
   }
 
   private async clearActive(error: { code: string; message: string } | null, promptId: string, turnId: string | null): Promise<void> {

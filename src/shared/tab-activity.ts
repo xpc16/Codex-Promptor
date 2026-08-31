@@ -19,7 +19,7 @@ export type TabVisualState = "closed" | "idle" | "running" | "error" | "neutral"
  * working. What the pause changed is whether the queue keeps rolling, and
  * that is a separate indicator.
  */
-const WORKING_RUNNER_STATES: ReadonlySet<RuntimeFile["runner"]["state"]> = new Set(["dispatching", "running", "pausing"]);
+const WORKING_RUNNER_STATES: ReadonlySet<RuntimeFile["runner"]["state"]> = new Set(["dispatching", "reconciling", "running", "pausing"]);
 
 export function runnerIsWorking(state: RuntimeFile["runner"]["state"]): boolean {
   return WORKING_RUNNER_STATES.has(state);

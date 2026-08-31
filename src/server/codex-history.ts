@@ -47,6 +47,26 @@ function textOf(content: unknown): string {
     .trim();
 }
 
+/**
+ * Legacy/early Codex rollouts persist transport context as user-role messages
+ * next to the actual prompt. Keep only human input; otherwise every imported
+ * turn displays the same environment/plugin envelope instead of its prompt.
+ */
+function userTextOf(content: unknown): string {
+  const parts = Array.isArray(content) ? content : [content];
+  return parts
+    .map((part: any) => typeof part === "string" ? part : String(part?.text ?? part?.input_text ?? ""))
+    .map((text) => text.trim())
+    .filter((text) => text && !isTransportUserEnvelope(text))
+    .join("\n\n")
+    .trim();
+}
+
+function isTransportUserEnvelope(text: string): boolean {
+  return /^\s*<(?:recommended_plugins|environment_context|permissions_instructions|apps_instructions|plugins_instructions|skills_instructions)\b/i.test(text)
+    || /^\s*\/compact(?:\s|$)/i.test(text);
+}
+
 /** Rollout timestamps are ISO strings; the event payloads carry epoch seconds or millis. */
 function timeOf(...values: unknown[]): string | null {
   for (const value of values) {
@@ -83,6 +103,7 @@ function createRolloutParser(threadId: string): RolloutParser {
   const drafts = new Map<string, Draft>();
   let order = 0;
   let lineOffset = 0;
+  let activeTurnId: string | null = null;
   const draftFor = (turnId: string): Draft => {
     const existing = drafts.get(turnId);
     if (existing) return existing;
@@ -112,14 +133,16 @@ function createRolloutParser(threadId: string): RolloutParser {
     const payload = record?.payload;
     const kind = String(payload?.type ?? "");
     const turnId = String(payload?.turn_id ?? payload?.turnId ?? "");
-    if (!turnId) return;
 
     if (kind === "task_started") {
+      if (!turnId) return;
+      activeTurnId = turnId;
       const draft = draftFor(turnId);
       draft.startedAt = timeOf(payload.started_at, payload.startedAt, record.timestamp) ?? draft.startedAt;
       return;
     }
     if (kind === "task_complete") {
+      if (!turnId) return;
       const draft = draftFor(turnId);
       draft.status = "completed";
       draft.completedAt = timeOf(record.timestamp, payload.completed_at) ?? draft.completedAt;
@@ -127,14 +150,49 @@ function createRolloutParser(threadId: string): RolloutParser {
       // guessing which of the turn's agent messages was the closing one.
       const answer = String(payload.last_agent_message ?? payload.lastAgentMessage ?? "").trim();
       if (answer) draft.finalAnswer = answer;
+      if (activeTurnId === turnId) activeTurnId = null;
       return;
     }
     if (kind === "turn_aborted" || kind === "turn_failed") {
+      if (!turnId) return;
       const draft = draftFor(turnId);
       draft.status = "interrupted";
       draft.completedAt = timeOf(record.timestamp) ?? draft.completedAt;
+      if (activeTurnId === turnId) activeTurnId = null;
       return;
     }
+
+    // Before paginated history, turn content was written as response_item
+    // messages. Their direct payload has no turn_id, but the passthrough
+    // metadata does; activeTurnId is a fallback for still older samples.
+    if (String(record?.type ?? "") === "response_item" && kind === "message") {
+      const responseTurnId = String(
+        payload?.internal_chat_message_metadata_passthrough?.turn_id
+        ?? payload?.internalChatMessageMetadataPassthrough?.turnId
+        ?? activeTurnId
+        ?? "",
+      );
+      if (!responseTurnId) return;
+      const role = String(payload?.role ?? "").toLowerCase();
+      if (role === "user") {
+        const text = userTextOf(payload?.content);
+        if (!text) return;
+        const draft = draftFor(responseTurnId);
+        if (!draft.userTexts.includes(text)) draft.userTexts.push(text);
+        draft.startedAt = draft.startedAt ?? timeOf(record.timestamp);
+        return;
+      }
+      if (role === "assistant") {
+        const text = textOf(payload?.content);
+        if (!text) return;
+        const draft = draftFor(responseTurnId);
+        draft.lastAgentText = text;
+        if (String(payload?.phase ?? "").toLowerCase() === "final_answer") draft.finalAnswer = text;
+      }
+      return;
+    }
+
+    if (!turnId) return;
     if (kind !== "item_completed") return;
 
     const item = payload?.item;
@@ -142,7 +200,7 @@ function createRolloutParser(threadId: string): RolloutParser {
     if (itemType === "usermessage") {
       const draft = draftFor(turnId);
       const text = textOf(item?.content);
-      if (text) draft.userTexts.push(text);
+      if (text && !draft.userTexts.includes(text)) draft.userTexts.push(text);
       const clientId = String(item?.client_id ?? item?.clientId ?? "");
       if (clientId) draft.clientId = clientId;
       draft.startedAt = draft.startedAt ?? timeOf(payload.started_at_ms, record.timestamp);
