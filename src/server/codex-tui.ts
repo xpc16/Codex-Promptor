@@ -12,6 +12,21 @@ import { inspectCodexSubmission, reconcileCodexTurn, transcriptCursor, type Tran
 const COMPLETED_CACHE_LIMIT = 100;
 const execFileAsync = promisify(execFile);
 
+/**
+ * A launch that ended with Codex still waiting for an answer on screen.
+ *
+ * The distinction matters to the caller: nothing is broken and nothing should
+ * be torn down. The terminal has to stay up, still writable, still holding the
+ * question -- killing it is what turned "answer this" into "cannot open".
+ */
+export const CODEX_STARTUP_QUESTION_UNANSWERED = "CODEX_STARTUP_QUESTION_UNANSWERED";
+
+/** The question text, when a failure is one nobody answered. */
+export function codexStartupQuestionFrom(message: string): string | null {
+  const match = new RegExp(`${CODEX_STARTUP_QUESTION_UNANSWERED}:(.*)$`, "s").exec(message);
+  return match ? match[1].trim() || "Codex 启动提问" : null;
+}
+
 export type CodexTuiLaunch = { mode: "new" } | { mode: "resume"; sessionId: string };
 export type CodexTuiSessionInfo = {
   sessionId: string;
@@ -112,24 +127,25 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
 async waitForSession(
     timeoutMs = 30_000,
     startupError?: () => string | null,
-    awaitingReview?: () => boolean,
-    reviewTimeoutMs = 10 * 60_000,
+    pendingQuestion?: () => string | null,
+    questionTimeoutMs = 10 * 60_000,
   ): Promise<CodexTuiSessionInfo> {
     const ready = this.launchReady;
     if (!ready) throw new Error("CODEX_TUI_LAUNCH_NOT_PREPARED");
     let deadline = Date.now() + timeoutMs;
-    const latest = Date.now() + Math.max(timeoutMs, reviewTimeoutMs);
-    let asked = false;
+    const latest = Date.now() + Math.max(timeoutMs, questionTimeoutMs);
+    let asked: string | null = null;
     while (Date.now() < deadline) {
       if (ready.settled) return ready.promise;
       const error = startupError?.();
       if (error) throw new Error(error);
-      // Codex is asking whether to trust the hooks. Counting down through that
+      // Codex is waiting for an answer, not stuck. Counting down through the
       // question and then killing the terminal would take away the very prompt
       // the reader has to answer, so the clock stops while it is on screen.
-      if (awaitingReview?.()) {
-        asked = true;
-        deadline = Math.min(latest, Date.now() + reviewTimeoutMs);
+      const question = pendingQuestion?.();
+      if (question) {
+        asked = question;
+        deadline = Math.min(latest, Date.now() + questionTimeoutMs);
       }
       const result = await Promise.race([
         ready.promise.then((value) => ({ value })),
@@ -137,7 +153,7 @@ async waitForSession(
       ]);
       if (result) return result.value;
     }
-    throw new Error(asked ? "CODEX_HOOKS_NEED_REVIEW" : "CODEX_HOOK_TRUST_REQUIRED_OR_SESSION_START_TIMEOUT");
+    throw new Error(asked ? `${CODEX_STARTUP_QUESTION_UNANSWERED}:${asked}` : "CODEX_HOOK_TRUST_REQUIRED_OR_SESSION_START_TIMEOUT");
   }
 
   async handleHook(payload: any): Promise<void> {
@@ -574,16 +590,42 @@ export async function resolveCodexTuiLaunch(launch: AgentProcessLaunch): Promise
   throw new Error("CODEX_NATIVE_EXECUTABLE_NOT_FOUND");
 }
 
+const QUESTION_OPTION = /^›\s*\d+[.)]\s+\S/u;
+const QUESTION_HEADING_LINES = 8;
+
 /**
- * Whether Codex is showing its startup hooks review screen.
+ * The question Codex is waiting on before any session exists, or null.
  *
- * This is a question, not a failure (tui/src/startup_hooks_review.rs). Nothing
- * proceeds until the reader answers it, so the wait for SessionStart has to
- * stay open rather than time out and tear down the terminal holding the
- * prompt -- which is exactly what made this look like a broken conversation.
+ * More than one screen can stop a launch here: the working-directory trust
+ * prompt, then the hooks review (tui/src/startup_hooks_review.rs), and a later
+ * Codex may add others. From this side every one of them looks the same as a
+ * hang -- no SessionStart, no error, just a screen -- so the wait used to count
+ * down through the question and then tear down the terminal holding it, taking
+ * away the prompt the reader was supposed to answer.
+ *
+ * They share a shape rather than a wording: a numbered list whose current row
+ * is marked with U+203A, under a heading, above a "press enter" footer.
+ * Matching the shape parks the clock for a question this code has never seen.
  */
-export function codexHooksNeedReview(output: string): boolean {
-  return /hooks need review|trust all and continue|continue without trusting/i.test(stripTerminalControls(output));
+export function codexStartupQuestion(output: string): string | null {
+  const lines = stripTerminalControls(output).split(/\r?\n/).map((line) => line.trim());
+  let selected = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (QUESTION_OPTION.test(lines[index])) { selected = index; break; }
+  }
+  if (selected < 0) return null;
+  if (!lines.slice(selected).some((line) => /press enter/i.test(line))) return null;
+  // The heading sits a few lines above the options, past the wrapped detail
+  // text. Keep the topmost line of that run: it is the question itself, where
+  // the lines below it only qualify the answer.
+  let heading: string | null = null;
+  for (let index = selected - 1; index >= 0 && index > selected - QUESTION_HEADING_LINES; index -= 1) {
+    const line = lines[index];
+    // ">" prefixes Codex's own working-directory banner, not the question.
+    if (!line || line.startsWith(">") || /^\d+[.)]\s/u.test(line) || QUESTION_OPTION.test(line)) continue;
+    heading = line;
+  }
+  return heading;
 }
 
 export function codexHookStartupError(output: string): string | null {
@@ -601,7 +643,11 @@ export function codexHookStartupError(output: string): string | null {
  * command. Reporting the raw code leaves the reader with nothing to do.
  */
 export function codexHookFailureText(message: string): string | null {
-  if (message.includes("CODEX_HOOKS_NEED_REVIEW") || message.includes("CODEX_HOOK_TRUST_REQUIRED")) {
+  const question = codexStartupQuestionFrom(message);
+  if (question) {
+    return `Codex 正在下方终端里等你回答：「${question}」。用方向键选择后回车（钩子信任请选 Trust all and continue），答案会被 Codex 记住；随后点「重新打开」即可连上。`;
+  }
+  if (message.includes("CODEX_HOOK_TRUST_REQUIRED")) {
     return "Codex 正在终端里请求信任本应用的钩子。请在下方终端选择「Trust all and continue」，然后重新打开该对话。";
   }
   const spaces = /CODEX_HOOK_PATH_HAS_SPACES:(.*)$/.exec(message);

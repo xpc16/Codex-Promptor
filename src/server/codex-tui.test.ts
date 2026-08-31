@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildCodexHookOverride, buildCodexTuiLaunch, codexHookFailureText, codexHooksNeedReview, codexHookStartupError, CodexTuiManager, resolveHookCommandPaths, spaceFreePath } from "./codex-tui.js";
+import { buildCodexHookOverride, buildCodexTuiLaunch, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, CodexTuiManager, resolveHookCommandPaths, spaceFreePath } from "./codex-tui.js";
 
 describe("Codex native PTY/hooks provider", () => {
   it("builds per-run hooks and keeps every Codex argument in an argv slot", () => {
@@ -95,32 +95,76 @@ describe("hook commands Codex can actually run", () => {
   });
 });
 
-describe("the hooks review screen", () => {
-  const screen = [
+describe("the questions Codex asks before a session exists", () => {
+  // Both captured from codex-cli 0.147.0 through the PTY this app launches.
+  const hooksReview = [
     "  Hooks need review",
+    "  6 hooks are new or changed.",
     "  Hooks can run outside the sandbox after you trust them.",
-    "  Trust all and continue",
-    "  Continue without trusting (hooks won't run)",
+    "",
+    "› 1. Review hooks",
+    "  2. Trust all and continue",
+    "  3. Continue without trusting (hooks won't run)",
+    "",
+    "  Press enter to confirm or esc to go back",
+  ].join(String.fromCharCode(10));
+  const directoryTrust = [
+    "> You are in C:\\work\\project",
+    "",
+    "  Do you trust the contents of this directory? Working with untrusted contents",
+    "  comes with higher risk of prompt injection. Trusting the directory allows",
+    "  project-local config, hooks, and exec policies to load.",
+    "",
+    "› 1. Yes, continue",
+    "  2. No, quit",
+    "",
+    "  Press enter to continue",
   ].join(String.fromCharCode(10));
 
-  it("is recognised as a question, not as a startup failure", () => {
-    // Treating it as an error tore the terminal down, taking away the prompt
+  it("reads a question as a question, not as a startup failure", () => {
+    // Treating one as an error tore the terminal down, taking away the prompt
     // the reader was supposed to answer.
-    expect(codexHooksNeedReview(screen)).toBe(true);
-    expect(codexHookStartupError(screen)).toBeNull();
+    expect(codexStartupQuestion(hooksReview)).toBe("Hooks need review");
+    expect(codexHookStartupError(hooksReview)).toBeNull();
+  });
+
+  it("recognises a question this code has never seen by its shape", () => {
+    // The hooks review is not the only screen that can stop a launch, and the
+    // trust prompt comes first: matching wordings would still time out here.
+    expect(codexStartupQuestion(directoryTrust))
+      .toBe("Do you trust the contents of this directory? Working with untrusted contents");
   });
 
   it("survives the control sequences a real terminal wraps it in", () => {
-    const painted = "\u001b[2J\u001b[1;1H\u001b[33m" + screen + "\u001b[0m";
-    expect(codexHooksNeedReview(painted)).toBe(true);
+    const painted = "\u001b[2J\u001b[1;1H\u001b[33m" + hooksReview + "\u001b[0m";
+    expect(codexStartupQuestion(painted)).toBe("Hooks need review");
   });
 
   it("is not seen in ordinary output", () => {
-    expect(codexHooksNeedReview("codex resuming thread 01a0...")).toBe(false);
+    expect(codexStartupQuestion("codex resuming thread 01a0...")).toBeNull();
+    // A list with no one waiting on it is not a question.
+    expect(codexStartupQuestion("› 1. Review hooks\n  2. Trust all and continue")).toBeNull();
+  });
+
+  it("stops the clock while a question is on screen, and names it when it is never answered", async () => {
+    const manager = new CodexTuiManager("tab-question", { write: () => undefined } as any);
+    await manager.beginLaunch({ cwd: "D:\\work", launch: { mode: "new" }, hookScriptPath: "scripts/codex-hook.mjs" });
+    let onScreen = true;
+    const started = Date.now();
+    // A 20ms budget would have expired long before this resolves; the question
+    // has to hold it open for the reader, then hand back what to answer.
+    const waiting = manager.waitForSession(20, undefined, () => (onScreen ? codexStartupQuestion(hooksReview) : null), 400);
+    setTimeout(() => { onScreen = false; }, 250);
+    await expect(waiting).rejects.toThrow("CODEX_STARTUP_QUESTION_UNANSWERED:Hooks need review");
+    expect(Date.now() - started).toBeGreaterThan(200);
   });
 
   it("tells the reader what to do about each hook failure", () => {
-    expect(codexHookFailureText("CODEX_HOOKS_NEED_REVIEW")).toContain("Trust all and continue");
+    const unanswered = codexHookFailureText("CODEX_STARTUP_QUESTION_UNANSWERED:Hooks need review");
+    expect(unanswered).toContain("Hooks need review");
+    expect(unanswered).toContain("Trust all and continue");
+    expect(codexStartupQuestionFrom("CODEX_STARTUP_QUESTION_UNANSWERED:Hooks need review")).toBe("Hooks need review");
+    expect(codexStartupQuestionFrom("CODEX_HOOK_TRUST_REQUIRED")).toBeNull();
     expect(codexHookFailureText("CODEX_HOOK_PATH_HAS_SPACES:C:/Program Files/node.exe")).toContain("空格");
     expect(codexHookFailureText("CODEX_TUI_LAUNCH_NOT_PREPARED")).toBeNull();
   });
