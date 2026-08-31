@@ -105,24 +105,39 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
     this.reset("Codex session is restarting.");
     this.launchReady = deferred<CodexTuiSessionInfo>();
     await fs.access(options.hookScriptPath);
-    return buildCodexTuiLaunch(options.cwd, options.launch, options.hookScriptPath, process.execPath, options.bypassHookTrust);
+    const { node, script } = await resolveHookCommandPaths(options.hookScriptPath, process.execPath);
+    return buildCodexTuiLaunch(options.cwd, options.launch, script, node, options.bypassHookTrust);
   }
 
-  async waitForSession(timeoutMs = 30_000, startupError?: () => string | null): Promise<CodexTuiSessionInfo> {
+async waitForSession(
+    timeoutMs = 30_000,
+    startupError?: () => string | null,
+    awaitingReview?: () => boolean,
+    reviewTimeoutMs = 10 * 60_000,
+  ): Promise<CodexTuiSessionInfo> {
     const ready = this.launchReady;
     if (!ready) throw new Error("CODEX_TUI_LAUNCH_NOT_PREPARED");
-    const deadline = Date.now() + timeoutMs;
+    let deadline = Date.now() + timeoutMs;
+    const latest = Date.now() + Math.max(timeoutMs, reviewTimeoutMs);
+    let asked = false;
     while (Date.now() < deadline) {
       if (ready.settled) return ready.promise;
       const error = startupError?.();
       if (error) throw new Error(error);
+      // Codex is asking whether to trust the hooks. Counting down through that
+      // question and then killing the terminal would take away the very prompt
+      // the reader has to answer, so the clock stops while it is on screen.
+      if (awaitingReview?.()) {
+        asked = true;
+        deadline = Math.min(latest, Date.now() + reviewTimeoutMs);
+      }
       const result = await Promise.race([
         ready.promise.then((value) => ({ value })),
         new Promise<null>((resolve) => setTimeout(() => resolve(null), Math.min(150, Math.max(1, deadline - Date.now())))),
       ]);
       if (result) return result.value;
     }
-    throw new Error("CODEX_HOOK_TRUST_REQUIRED_OR_SESSION_START_TIMEOUT");
+    throw new Error(asked ? "CODEX_HOOKS_NEED_REVIEW" : "CODEX_HOOK_TRUST_REQUIRED_OR_SESSION_START_TIMEOUT");
   }
 
   async handleHook(payload: any): Promise<void> {
@@ -477,10 +492,50 @@ export class CodexTuiPool extends EventEmitter {
   async stopAll(): Promise<void> { await Promise.all([...this.managers.keys()].map((tabId) => this.stop(tabId))); }
 }
 
+/**
+ * A path Codex's hook runner can actually execute.
+ *
+ * Codex splits a hook command on whitespace and does not honour quotes.
+ * Measured on 0.147.0: the same executable runs when written bare and reports
+ * `hook: SessionStart Failed` when wrapped in quotes, because the quote
+ * characters become part of the program name. So the command may contain no
+ * whitespace anywhere, and quoting cannot rescue a path that does. On Windows
+ * the 8.3 short path is a space-free alias for the same file, which is what
+ * makes `C:\Program Files\nodejs\node.exe` expressible at all.
+ */
+export async function spaceFreePath(value: string): Promise<string | null> {
+  if (!/\s/u.test(value)) return value;
+  if (process.platform !== "win32") return null;
+  try {
+    const script = `(New-Object -ComObject Scripting.FileSystemObject).GetFile('${value.replace(/'/g, "''")}').ShortPath`;
+    const result = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true });
+    const short = String(result.stdout).trim();
+    return short && !/\s/u.test(short) ? short : null;
+  } catch {
+    // 8.3 name creation can be disabled per volume; there is no other alias.
+    return null;
+  }
+}
+
+/** Both halves of the hook command, in a form Codex can run. */
+export async function resolveHookCommandPaths(hookScriptPath: string, nodePath = process.execPath): Promise<{ node: string; script: string }> {
+  const [node, script] = await Promise.all([spaceFreePath(nodePath), spaceFreePath(hookScriptPath)]);
+  // Better a named failure than a hook that is silently never runnable: without
+  // it the only symptom is SessionStart never arriving, thirty seconds later.
+  if (!node) throw new Error(`CODEX_HOOK_PATH_HAS_SPACES:${nodePath}`);
+  if (!script) throw new Error(`CODEX_HOOK_PATH_HAS_SPACES:${hookScriptPath}`);
+  return { node, script };
+}
+
 export function buildCodexHookOverride(hookScriptPath: string, nodePath = process.execPath): string {
   const events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd", "PreCompact", "PostCompact"];
+  for (const value of [nodePath, hookScriptPath]) {
+    if (/\s/u.test(value)) throw new Error(`CODEX_HOOK_PATH_HAS_SPACES:${value}`);
+  }
   const fields = events.map((event) => {
-    const command = `${quoteHookArg(nodePath)} ${quoteHookArg(hookScriptPath)} ${event}`;
+    // Deliberately unquoted: see spaceFreePath. Both halves are whitespace-free
+    // by the check above, so splitting on whitespace yields the right argv.
+    const command = `${nodePath} ${hookScriptPath} ${event}`;
     return `${event}=[{hooks=[{type="command",command=${tomlString(command)},timeout=10}]}]`;
   });
   return `hooks={${fields.join(",")}}`;
@@ -519,22 +574,55 @@ export async function resolveCodexTuiLaunch(launch: AgentProcessLaunch): Promise
   throw new Error("CODEX_NATIVE_EXECUTABLE_NOT_FOUND");
 }
 
+/**
+ * Whether Codex is showing its startup hooks review screen.
+ *
+ * This is a question, not a failure (tui/src/startup_hooks_review.rs). Nothing
+ * proceeds until the reader answers it, so the wait for SessionStart has to
+ * stay open rather than time out and tear down the terminal holding the
+ * prompt -- which is exactly what made this look like a broken conversation.
+ */
+export function codexHooksNeedReview(output: string): boolean {
+  return /hooks need review|trust all and continue|continue without trusting/i.test(stripTerminalControls(output));
+}
+
 export function codexHookStartupError(output: string): string | null {
-  const plain = output
-    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
-    .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "")
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, " ");
+  const plain = stripTerminalControls(output);
   return /(?:hook[^\r\n]{0,80}(?:not trusted|untrusted|trust required)|(?:not trusted|untrusted)[^\r\n]{0,80}hook)/i.test(plain)
     ? "CODEX_HOOK_TRUST_REQUIRED"
     : null;
 }
 
-function stringOrNull(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value : null;
+/**
+ * Turns the two hook-setup failures into something the reader can act on.
+ *
+ * Neither is a broken conversation: one is Codex asking a question in the
+ * terminal below, the other is a path this machine cannot express in a hook
+ * command. Reporting the raw code leaves the reader with nothing to do.
+ */
+export function codexHookFailureText(message: string): string | null {
+  if (message.includes("CODEX_HOOKS_NEED_REVIEW") || message.includes("CODEX_HOOK_TRUST_REQUIRED")) {
+    return "Codex 正在终端里请求信任本应用的钩子。请在下方终端选择「Trust all and continue」，然后重新打开该对话。";
+  }
+  const spaces = /CODEX_HOOK_PATH_HAS_SPACES:(.*)$/.exec(message);
+  if (spaces) {
+    return `钩子命令里的路径含空格，而 Codex 会按空格拆分命令且不识别引号：${spaces[1].trim()}。请把 Node 或本应用安装到不含空格的路径，或启用该盘符的 8.3 短路径。`;
+  }
+  if (message.includes("SESSION_START_TIMEOUT")) {
+    return "Codex 启动后一直没有回报 SessionStart 钩子。若终端里有信任提示请先同意；否则用 npm run check:codex 确认钩子是否可用。";
+  }
+  return null;
 }
 
-function quoteHookArg(value: string): string {
-  return /\s|["']/u.test(value) ? `"${value.replace(/(["\\])/g, "\\$1")}"` : value;
+function stripTerminalControls(output: string): string {
+  return output
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "")
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, " ");
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
 }
 
 function tomlString(value: string): string { return JSON.stringify(value); }

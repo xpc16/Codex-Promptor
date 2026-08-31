@@ -17,7 +17,7 @@ import {
   MAX_WINDOW_RECORDS,
 } from "../shared/tab-window.js";
 import { AppServerPool, type AppServerManager, type CodexRpcClient, terminateStaleAppServer, waitForThreadLoaded } from "./codex.js";
-import { CodexTuiPool, codexHookStartupError, resolveCodexTuiLaunch, type CodexTuiManager } from "./codex-tui.js";
+import { CodexTuiPool, codexHookFailureText, codexHooksNeedReview, codexHookStartupError, resolveCodexTuiLaunch, type CodexTuiManager } from "./codex-tui.js";
 import { ClaudeCodePool, type ClaudeCodeManager, probeClaudeVersion } from "./claude.js";
 import { syncClaudeHistory } from "./claude-history.js";
 import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorHookBridge, probeCursorVersion } from "./cursor.js";
@@ -705,7 +705,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         CODEX_PROMPTOR_CODEX_HOOK_URL: codexHookUrl(tabId, lease.nonce),
         CODEX_PROMPTOR_HOOK_SECRET: lease.secret,
       }, theme);
-      const session = await manager.waitForSession(30_000, () => pty.startupError(tabId) ?? codexHookStartupError(pty.recentOutput(tabId)));
+      const session = await manager.waitForSession(
+        30_000,
+        () => pty.startupError(tabId) ?? codexHookStartupError(pty.recentOutput(tabId)),
+        () => codexHooksNeedReview(pty.recentOutput(tabId)),
+      );
       if (launch.mode === "resume" && session.sessionId !== launch.sessionId) {
         throw new Error(`CODEX_RESUME_ID_MISMATCH:${launch.sessionId}:${session.sessionId}`);
       }
@@ -978,15 +982,18 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await updateTerminalRuntime(storage, tabId, { state: "stopped", appServer: null }).catch(() => undefined);
       const activeWriter = isActiveWriterError(message);
       const code = activeWriter ? "SESSION_ACTIVE_WRITER" : "TERMINAL_REOPEN_FAILED";
+      // A hook that could never have run, or a question nobody answered, both
+      // arrive here as a bare code. Say what to do about it instead.
+      const display = codexHookFailureText(message) ?? message;
       try {
         await storage.updateTab(tabId, (current) => ({
           ...current,
-          session: { ...current.session, state: "closed", lastError: { code, message } },
+          session: { ...current.session, state: "closed", lastError: { code, message: display } },
           updatedAt: isoNow(),
         }));
       } catch { /* missing tab */ }
       await emitSnapshot(tabId);
-      return { ok: false, statusCode: activeWriter ? 409 : 500, code, message };
+      return { ok: false, statusCode: activeWriter ? 409 : 500, code, message: display };
     }
   };
 

@@ -1,15 +1,19 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildCodexHookOverride, buildCodexTuiLaunch, codexHookStartupError, CodexTuiManager } from "./codex-tui.js";
+import { buildCodexHookOverride, buildCodexTuiLaunch, codexHookFailureText, codexHooksNeedReview, codexHookStartupError, CodexTuiManager, resolveHookCommandPaths, spaceFreePath } from "./codex-tui.js";
 
 describe("Codex native PTY/hooks provider", () => {
   it("builds per-run hooks and keeps every Codex argument in an argv slot", () => {
-    const hookPath = "D:\\Promptor dir\\scripts\\codex-hook.mjs";
-    const nodePath = "C:\\Program Files\\nodejs\\node.exe";
+    const hookPath = "D:\\promptor\\scripts\\codex-hook.mjs";
+    const nodePath = "C:\\PROGRA~1\\nodejs\\node.exe";
     const override = buildCodexHookOverride(hookPath, nodePath);
     expect(override).toContain("SessionStart=[{hooks=[{");
     expect(override).toContain("UserPromptSubmit=[{hooks=[{");
     expect(override).toContain("PostCompact=[{hooks=[{");
     expect(override).toContain("codex-hook.mjs");
+    // Codex splits a hook command on whitespace and does not honour quotes:
+    // measured on 0.147.0, the same executable runs bare and reports
+    // "SessionStart Failed" the moment it is wrapped in quotes.
+    expect(override).not.toContain('\\"');
 
     const launch = buildCodexTuiLaunch(
       "D:\\work dir",
@@ -62,5 +66,62 @@ describe("Codex native PTY/hooks provider", () => {
   it("fails closed when Codex reports that hooks are untrusted", () => {
     expect(codexHookStartupError("Warning: hook configuration is not trusted")).toBe("CODEX_HOOK_TRUST_REQUIRED");
     expect(codexHookStartupError("Codex ready")).toBeNull();
+  });
+});
+
+describe("hook commands Codex can actually run", () => {
+  it("refuses a path with a space rather than emitting a command that cannot run", () => {
+    // Quoting does not rescue it -- quotes become part of the program name --
+    // so a spaced path has no representation here at all. Failing by name beats
+    // a hook that is silently never invoked, whose only symptom is SessionStart
+    // never arriving thirty seconds later.
+    expect(() => buildCodexHookOverride("D:\\p\\hook.mjs", "C:\\Program Files\\nodejs\\node.exe"))
+      .toThrow("CODEX_HOOK_PATH_HAS_SPACES:C:" + String.fromCharCode(92) + "Program Files" + String.fromCharCode(92) + "nodejs" + String.fromCharCode(92) + "node.exe");
+    expect(() => buildCodexHookOverride("D:\\Promptor dir\\hook.mjs", "C:\\node.exe"))
+      .toThrow("CODEX_HOOK_PATH_HAS_SPACES");
+  });
+
+  it("passes a path through untouched when it has no whitespace", async () => {
+    await expect(spaceFreePath("C:\\PROGRA~1\\nodejs\\node.exe")).resolves.toBe("C:\\PROGRA~1\\nodejs\\node.exe");
+  });
+
+  it("resolves the real Node path into something runnable", async () => {
+    // process.execPath is "C:\\Program Files\\nodejs\\node.exe" on this
+    // machine, which is exactly the case that used to produce a dead hook.
+    const resolved = await resolveHookCommandPaths(process.execPath, process.execPath).catch(() => null);
+    if (!resolved) return; // 8.3 names can be disabled per volume; nothing to assert
+    expect(resolved.node).not.toMatch(/\s/u);
+    expect(resolved.script).not.toMatch(/\s/u);
+  });
+});
+
+describe("the hooks review screen", () => {
+  const screen = [
+    "  Hooks need review",
+    "  Hooks can run outside the sandbox after you trust them.",
+    "  Trust all and continue",
+    "  Continue without trusting (hooks won't run)",
+  ].join(String.fromCharCode(10));
+
+  it("is recognised as a question, not as a startup failure", () => {
+    // Treating it as an error tore the terminal down, taking away the prompt
+    // the reader was supposed to answer.
+    expect(codexHooksNeedReview(screen)).toBe(true);
+    expect(codexHookStartupError(screen)).toBeNull();
+  });
+
+  it("survives the control sequences a real terminal wraps it in", () => {
+    const painted = "\u001b[2J\u001b[1;1H\u001b[33m" + screen + "\u001b[0m";
+    expect(codexHooksNeedReview(painted)).toBe(true);
+  });
+
+  it("is not seen in ordinary output", () => {
+    expect(codexHooksNeedReview("codex resuming thread 01a0...")).toBe(false);
+  });
+
+  it("tells the reader what to do about each hook failure", () => {
+    expect(codexHookFailureText("CODEX_HOOKS_NEED_REVIEW")).toContain("Trust all and continue");
+    expect(codexHookFailureText("CODEX_HOOK_PATH_HAS_SPACES:C:/Program Files/node.exe")).toContain("空格");
+    expect(codexHookFailureText("CODEX_TUI_LAUNCH_NOT_PREPARED")).toBeNull();
   });
 });
