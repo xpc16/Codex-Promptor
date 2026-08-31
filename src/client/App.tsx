@@ -24,7 +24,7 @@ import { EARLIER_ANSWER_PAGE, EARLIER_PROMPT_PAGE, INITIAL_ANSWER_WINDOW, INITIA
 import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { sameTerminalSize, terminalFrameLooksSettled, terminalResetNeedsSettling, TerminalCursorQuietScheduler, TerminalResizeScheduler } from "./terminal-resize.js";
+import { sameTerminalSize, TerminalCursorQuietScheduler, TerminalResizeScheduler } from "./terminal-resize.js";
 import { terminalVisibilityAction } from "./terminal-visibility.js";
 import { TERMINAL_INPUT_COMPACT_TYPE, terminalInputHandle, terminalInputIsPlain } from "../shared/terminal-input.js";
 import { loadTabWithRetry, retainRecentTabIds } from "./tab-load.js";
@@ -1419,12 +1419,9 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     let reconnectTimer: number | null = null;
     let connectFrame: number | null = null;
     let resizeFrame: number | null = null;
-    let settlingQuietTimer: number | null = null;
-    let settlingMaxTimer: number | null = null;
     let terminalWriteSequence = 0;
     let terminalWriteEpoch = 0;
     let terminalWriteQueue = Promise.resolve();
-    let longTerminal = false;
     let connectedOnce = false;
     const alarm = createConnectionAlarm();
     const projectionMode = transportMode === "projection";
@@ -1466,48 +1463,8 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     const resizeScheduler = new TerminalResizeScheduler(({ cols, rows }) => {
       if (documentVisibleRef.current || projectionMode || !rawLeaseWritable) return;
       const ws = socket.current;
-      if (ws?.readyState === WebSocket.OPEN) {
-        if (longTerminal) {
-          beginTerminalSettling();
-          scheduleTerminalSettled(2_500);
-        }
-        ws.send(JSON.stringify({ type: "terminal.resize", tabId, cols, rows }));
-      }
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "terminal.resize", tabId, cols, rows }));
     }, 220, initialSize);
-    const forceFinishTerminalSettling = () => {
-      if (settlingQuietTimer !== null) { window.clearTimeout(settlingQuietTimer); settlingQuietTimer = null; }
-      if (settlingMaxTimer !== null) { window.clearTimeout(settlingMaxTimer); settlingMaxTimer = null; }
-      host.current?.classList.remove("terminal-settling");
-    };
-    const terminalLooksSettled = () => {
-      const buffer = term.buffer.active;
-      const lines: string[] = [];
-      for (let index = Math.max(0, buffer.length - 12); index < buffer.length; index += 1) {
-        lines.push(buffer.getLine(index)?.translateToString(true) ?? "");
-      }
-      return terminalFrameLooksSettled(lines);
-    };
-    const finishTerminalSettlingWhenReady = () => {
-      settlingQuietTimer = null;
-      if (!host.current?.classList.contains("terminal-settling")) return;
-      if (terminalLooksSettled()) {
-        forceFinishTerminalSettling();
-        return;
-      }
-      // A long TUI repaint can pause between historical frames. Keep polling
-      // without exposing that frame; fresh output below resets this timer.
-      settlingQuietTimer = window.setTimeout(finishTerminalSettlingWhenReady, 800);
-    };
-    const scheduleTerminalSettled = (delay = 800) => {
-      if (!host.current?.classList.contains("terminal-settling")) return;
-      if (settlingQuietTimer !== null) window.clearTimeout(settlingQuietTimer);
-      settlingQuietTimer = window.setTimeout(finishTerminalSettlingWhenReady, delay);
-    };
-    const beginTerminalSettling = () => {
-      host.current?.classList.add("terminal-settling");
-      if (settlingQuietTimer !== null) { window.clearTimeout(settlingQuietTimer); settlingQuietTimer = null; }
-      if (settlingMaxTimer === null) settlingMaxTimer = window.setTimeout(forceFinishTerminalSettling, 20_000);
-    };
     const beginTerminalUpdate = () => {
       const sequence = ++terminalWriteSequence;
       cursorQuietScheduler.beginWrite();
@@ -1530,7 +1487,6 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
         }
         term.options.cursorBlink = false;
         finishTerminalUpdate(sequence);
-        scheduleTerminalSettled();
       }).catch(() => finishTerminalUpdate(sequence));
     };
     const protocol = location.protocol === "https:" ? "wss" : "ws";
@@ -1736,14 +1692,8 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       const startOffset = Number(message.startOffset);
       const endOffset = Number(message.endOffset);
       if (!generation || !Number.isSafeInteger(startOffset) || !Number.isSafeInteger(endOffset) || endOffset < startOffset) return;
-      // The settled-frame recognizer is deliberately Codex-specific (input
-      // glyph plus model status). Do not hold Claude/Cursor snapshots behind a
-      // 20-second fallback while looking for a frame they never render.
-      if (providerRef.current === "codex" && endOffset >= 200_000) longTerminal = true;
       let updateSequence: number | null = null;
       if (message.reset || cursor.generation !== generation || cursor.nextOffset === null) {
-        if (terminalResetNeedsSettling(providerRef.current, longTerminal, message.reason)) beginTerminalSettling();
-        else if (message.reason === "context_compacted") forceFinishTerminalSettling();
         terminalWriteEpoch += 1;
         updateSequence = beginTerminalUpdate();
         term.reset();
@@ -1761,9 +1711,6 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       cursor.nextOffset = endOffset;
       rememberRawTerminal(tabId, generation, endOffset, fresh, Boolean(message.reset) || updateSequence !== null);
       if (fresh.length) {
-        if (host.current?.classList.contains("terminal-settling")) {
-          if (settlingQuietTimer !== null) { window.clearTimeout(settlingQuietTimer); settlingQuietTimer = null; }
-        }
         updateSequence ??= beginTerminalUpdate();
         setHasOutput(true);
         const sequence = updateSequence;
@@ -1771,7 +1718,6 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       } else {
         if (endOffset > 0) setHasOutput(true);
         if (updateSequence !== null) finishTerminalUpdate(updateSequence);
-        scheduleTerminalSettled(120);
       }
     };
     const handleScreen = (message: TerminalScreenFrame) => {
@@ -1905,8 +1851,6 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       if (connectFrame !== null) cancelAnimationFrame(connectFrame);
       if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
-      if (settlingQuietTimer !== null) window.clearTimeout(settlingQuietTimer);
-      if (settlingMaxTimer !== null) window.clearTimeout(settlingMaxTimer);
       resizeScheduler.dispose();
       cursorQuietScheduler.dispose();
       terminalWriteSequence += 1;
@@ -1996,7 +1940,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       </span>
     </div>
     {runtime.terminal.lastError && <div className="terminal-error">{i18n.errorText(runtime.terminal.lastError)}</div>}
-    <div className={`terminal-body ${theme} ${transportMode} ${closed ? "locked" : ""}`} onMouseDown={() => { if (!closed && !documentVisible) terminal.current?.focus(); }}><div className={`terminal-host ${documentVisible ? "document-hidden" : ""}`} ref={host} />{documentVisible ? <DocumentView state={documentState} loader={documentLoader} onClose={() => documentLoader.close()} /> : <><div className="terminal-settling-overlay" role="status"><span className="terminal-settling-spinner" />{t("terminal.settling")}</div>{!hasOutput && <div className="terminal-placeholder">{closed ? t("terminal.closedPlaceholder") : placeholder}</div>}</>}</div>
+    <div className={`terminal-body ${theme} ${transportMode} ${closed ? "locked" : ""}`} onMouseDown={() => { if (!closed && !documentVisible) terminal.current?.focus(); }}><div className={`terminal-host ${documentVisible ? "document-hidden" : ""}`} ref={host} />{documentVisible ? <DocumentView state={documentState} loader={documentLoader} onClose={() => documentLoader.close()} /> : <>{!hasOutput && <div className="terminal-placeholder">{closed ? t("terminal.closedPlaceholder") : placeholder}</div>}</>}</div>
   </div>;
 }
 

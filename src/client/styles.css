@@ -424,11 +424,6 @@ input, textarea, select { color: var(--text); }
 .terminal-host.projection .xterm-screen { min-width: max-content; }
 .terminal-host.terminal-updating .xterm-cursor,
 .terminal-card.runner-busy .terminal-host .xterm-cursor { visibility: hidden !important; }
-.terminal-settling-overlay { position: absolute; inset: 8px; z-index: 3; display: none; place-items: center; align-content: center; gap: 10px; pointer-events: none; color: var(--muted); font-size: 13px; }
-.terminal-body.light .terminal-settling-overlay { background: #f8fafcf2; }
-.terminal-body.dark .terminal-settling-overlay { background: #0f1722f2; }
-.terminal-host.terminal-settling + .terminal-settling-overlay { display: grid; }
-.terminal-settling-spinner { width: 19px; height: 19px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; opacity: .72; }
 .terminal-placeholder { position: absolute; inset: 8px; display: grid; place-items: center; pointer-events: none; color: var(--muted); background: color-mix(in srgb, var(--panel) 82%, transparent); font-size: 13px; }
 .terminal-card.document-open .terminal-body { overflow: hidden; }
 .terminal-host.document-hidden { visibility: hidden; pointer-events: none; }

@@ -1,27 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { terminalFrameLooksSettled, terminalResetNeedsSettling, TerminalCursorQuietScheduler, TerminalResizeScheduler } from "./terminal-resize.js";
-
-describe("terminalFrameLooksSettled", () => {
-  it("recognizes the Codex input prompt together with its model status", () => {
-    expect(terminalFrameLooksSettled([
-      "› Use /skills to list available skills",
-      "  gpt-5.6-luna max · weekly 97% left",
-    ])).toBe(true);
-  });
-
-  it("does not mistake a quiet historical code frame or a quoted prompt for the final screen", () => {
-    expect(terminalFrameLooksSettled(["function(e,t,n){", "  return module.exports;"])).toBe(false);
-    expect(terminalFrameLooksSettled(["› an old prompt rendered in history", "ordinary output"])).toBe(false);
-  });
-});
-
-describe("terminalResetNeedsSettling", () => {
-  it("replays a compacted Codex frame immediately instead of covering an active turn", () => {
-    expect(terminalResetNeedsSettling("codex", true, "context_compacted")).toBe(false);
-    expect(terminalResetNeedsSettling("codex", true, undefined)).toBe(true);
-    expect(terminalResetNeedsSettling("claude", true, undefined)).toBe(false);
-  });
-});
+import { TerminalCursorQuietScheduler, TerminalResizeScheduler } from "./terminal-resize.js";
 
 describe("TerminalResizeScheduler", () => {
   afterEach(() => vi.useRealTimers());
@@ -150,7 +128,7 @@ describe("emulator and PTY size agreement", () => {
     expect(scheduler.effectiveSize({ cols: 83, rows: 24 })).toEqual({ cols: 83, rows: 24 });
   });
 
-  it("does not strand the emulator after a settling drag walks back inside tolerance", () => {
+  it("does not strand the emulator after a drag walks back inside tolerance", () => {
     const sent: Array<{ cols: number; rows: number }> = [];
     const scheduler = new TerminalResizeScheduler((size) => sent.push(size), 220, { cols: 80, rows: 24 });
 
@@ -168,7 +146,7 @@ describe("emulator and PTY size agreement", () => {
   });
 
   it("absorbs a row of vertical noise that it would not absorb across", () => {
-    // A banner or the settling overlay appearing and disappearing costs a row
+    // A banner appearing and disappearing costs a row
     // or two. Repainting a whole TUI screen for that is a bad trade, and the
     // emulator sitting one row short of the pane is only unused space. The same
     // slack sideways is not free: the two would wrap text differently.

@@ -5,7 +5,7 @@ export type TerminalSize = { cols: number; rows: number };
  * ConPTY, which makes a TUI repaint its whole screen.
  *
  * Rows are looser than columns because vertical noise is routine and cheap to
- * absorb: an error banner or the settling overlay appearing takes a row or two
+ * absorb: an error banner appearing takes a row or two
  * and gives them straight back, and the only cost of the emulator holding the
  * PTY's row count meanwhile is a little unused space at the bottom. A column
  * disagreement is not cosmetic -- the two sides then wrap text differently and
@@ -25,16 +25,6 @@ export function terminalSizeWithinTolerance(
   return Boolean(left && right
     && Math.abs(left.cols - right.cols) <= tolerance.cols
     && Math.abs(left.rows - right.rows) <= tolerance.rows);
-}
-
-export function terminalFrameLooksSettled(lines: string[]): boolean {
-  const hasInputPrompt = lines.some((line) => /^\s*›(?:\s|$)/u.test(line));
-  const hasModelStatus = lines.some((line) => /\b(?:gpt(?:-[\w.]+)+|o\d(?:-[\w.]+)*)\b/iu.test(line));
-  return hasInputPrompt && hasModelStatus;
-}
-
-export function terminalResetNeedsSettling(provider: string, longTerminal: boolean, reason: unknown): boolean {
-  return provider === "codex" && longTerminal && reason !== "context_compacted";
 }
 
 /**
