@@ -10,8 +10,16 @@
  */
 export const SUBMIT_TIMEOUT_MS = 20_000;
 
-/** When to re-send Enter, in ms after the prompt text went out. */
-export const SUBMIT_RETRY_DELAYS_MS: readonly number[] = [1_500, 4_000, 9_000];
+/**
+ * When to re-send Enter, in ms after the prompt text went out.
+ *
+ * The first attempt used to be at 1.5s, which is inside the window a hook
+ * routinely takes to come back. A merely slow hook therefore looked identical
+ * to a dropped Enter, and the resend submitted a prompt that had already gone
+ * -- two `UserPromptSubmit` for one submission, which is what left the queue
+ * unable to match either of them. Recovery now starts after that window.
+ */
+export const SUBMIT_RETRY_DELAYS_MS: readonly number[] = [4_000, 9_000];
 
 export type SubmitTimers = {
   retries: ReturnType<typeof setTimeout>[];

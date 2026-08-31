@@ -45,4 +45,11 @@ describe("dropped-Enter recovery", () => {
     expect(SUBMIT_RETRY_DELAYS_MS.every((delay) => delay > 0 && delay < SUBMIT_TIMEOUT_MS)).toBe(true);
     expect([...SUBMIT_RETRY_DELAYS_MS]).toEqual([...SUBMIT_RETRY_DELAYS_MS].sort((a, b) => a - b));
   });
+
+  it("does not resend inside the window a hook routinely takes to answer", () => {
+    // A resend at 1.5s could not tell a slow hook from a dropped Enter, so it
+    // submitted a prompt that had already gone: two UserPromptSubmit for one
+    // submission, and then neither could be matched to it.
+    expect(Math.min(...SUBMIT_RETRY_DELAYS_MS)).toBeGreaterThanOrEqual(4_000);
+  });
 });
