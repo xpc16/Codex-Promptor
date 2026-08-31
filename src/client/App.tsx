@@ -26,6 +26,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { sameTerminalSize, terminalFrameLooksSettled, terminalResetNeedsSettling, TerminalCursorQuietScheduler, TerminalResizeScheduler } from "./terminal-resize.js";
 import { terminalVisibilityAction } from "./terminal-visibility.js";
+import { TERMINAL_INPUT_COMPACT_TYPE, terminalInputHandle, terminalInputIsPlain } from "../shared/terminal-input.js";
 import { loadTabWithRetry, retainRecentTabIds } from "./tab-load.js";
 import { MOBILE_PANES, type MobilePane } from "./mobile-pane.js";
 import { dialogSurvivesIndex, nextSelectedTabId, shouldAdoptIndexRevision } from "./index-sync.js";
@@ -267,6 +268,10 @@ export function App() {
         // Only this socket wants navigation pushes; the per-tab terminal
         // sockets would just receive copies they have no use for.
         index: true,
+        // What this page already holds. Every subscribe used to be answered
+        // with the whole index -- and a subscribe is far more often a tab
+        // change or a reconnect than a navigation change anyone made.
+        indexRevision: indexRef.current?.revision ?? null,
       }));
       socket.onmessage = (event) => {
         let message: any;
@@ -305,6 +310,9 @@ export function App() {
             // the whole index, so ask for that instead of guessing.
             const next = indexRef.current ? applyIndexDelta(indexRef.current, message.delta) : null;
             if (next) adoptIndex(next);
+            // Deliberately without indexRevision: this page has just proved
+            // it cannot line up with what the server holds, so it wants the
+            // whole index, which is the one thing that always applies.
             else socket?.send(JSON.stringify({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {} }));
           }
         }
@@ -1526,9 +1534,17 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       }).catch(() => finishTerminalUpdate(sequence));
     };
     const protocol = location.protocol === "https:" ? "wss" : "ws";
+    const inputHandle = terminalInputHandle(tabId);
     const writeInput = (data: string) => {
       const ws = socket.current;
-      if (!closedRef.current && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "terminal.input", tabId, dataBase64: encodeBase64(data) }));
+      if (closedRef.current || ws?.readyState !== WebSocket.OPEN) return;
+      // 92 bytes to carry one character, 21,759 times in a measured day, at
+      // 1.03x compression. The tab id becomes a handle the server resolves
+      // against this socket's own subscriptions, and printable text skips
+      // base64 -- together about 36 bytes for the same keystroke.
+      ws.send(JSON.stringify(terminalInputIsPlain(data)
+        ? { type: TERMINAL_INPUT_COMPACT_TYPE, s: inputHandle, d: data }
+        : { type: TERMINAL_INPUT_COMPACT_TYPE, s: inputHandle, b: encodeBase64(data) }));
     };
     // One frame per character: 3,682 of them in a measured hour, all 92 bytes,
     // none compressed. Typed characters are batched for less time than the gap

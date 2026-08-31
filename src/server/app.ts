@@ -1,3 +1,4 @@
+import { resolveTerminalInputHandle, TERMINAL_INPUT_COMPACT_TYPE } from "../shared/terminal-input.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -40,6 +41,7 @@ import { TimerService, TimerServiceError } from "./timer-service.js";
 import {
   BoundedWebSocketSender,
   decodeTerminalInput,
+  plainTerminalInput,
   RawTerminalBatcher,
   TERMINAL_PROTOCOL_VERSION,
   TerminalTrafficMeter,
@@ -2496,7 +2498,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           // path that needs it most -- a reconnect -- never did.
           client.terminalSubscriptions = parseTerminalSubscriptions(
             message.terminals,
-            client.scope === "local" ? null : REMOTE_RAW_CATCH_UP_BYTES,
+            RAW_CATCH_UP_BYTES,
           );
           // Only the selected TabView opens a terminal socket, so whatever a
           // page is watching is what it has selected. Remembered for the next
@@ -2557,11 +2559,21 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           // A reconnecting page missed every change made while it was away
           // (a phone that slept, a tunnel that dropped). Replay current
           // navigation on subscribe so it resyncs without a reload.
-          // Subscribe always replays the whole index: this is the path a
-          // reconnecting page uses precisely because it cannot know what it missed.
+          // A page that says which revision it holds does not need the whole
+          // index back. Measured on the tunnel: 51 subscribes in 95 minutes,
+          // 11.8 KB each, about three quarters of everything sent that way --
+          // almost none of it a change anyone had made.
           if (client.wantsIndex) {
             const index = await storage.readIndex();
-            if (sendClient(client, { type: "index.changed", index }, "index")) client.indexRevision = index.revision;
+            const claimed = Number((message as any).indexRevision);
+            if (Number.isSafeInteger(claimed) && claimed === index.revision) {
+              client.indexRevision = index.revision;
+            } else {
+              // Adopting the claim first lets the existing delta path answer a
+              // page that is exactly one revision behind.
+              if (Number.isSafeInteger(claimed)) client.indexRevision = claimed;
+              sendIndex(client, index);
+            }
           }
           if (message.snapshots !== false) {
             for (const tabId of client.stateSubscriptions) {
@@ -2612,10 +2624,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           }
           const data = await readClientTab(tabId);
           sendClient(client, { type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, data }, "snapshot");
-        } else if (message.type === "terminal.input" && message.tabId) {
-          const tabId = String(message.tabId);
-          const stream = client.terminalSubscriptions.get(tabId);
-          if (!stream) {
+        } else if (message.type === "terminal.input" || message.type === TERMINAL_INPUT_COMPACT_TYPE) {
+          // The compact form names its terminal by a prefix of the tab id,
+          // resolved against this client's own subscriptions -- so it can only
+          // ever reach a terminal the sender is already attached to.
+          const compact = message.type === TERMINAL_INPUT_COMPACT_TYPE;
+          const tabId = compact
+            ? resolveTerminalInputHandle(message.s, client.terminalSubscriptions.keys())
+            : (message.tabId ? String(message.tabId) : null);
+          const stream = tabId ? client.terminalSubscriptions.get(tabId) : undefined;
+          if (!tabId || !stream) {
             sendClient(client, wsError("TERMINAL_NOT_SUBSCRIBED", "Subscribe to the terminal before sending input."), "error");
             return;
           }
@@ -2623,7 +2641,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             sendClient(client, wsError("TERMINAL_READ_ONLY", "Another raw terminal client owns the input and responder lease."), "error");
             return;
           }
-          const data = decodeTerminalInput(message.dataBase64, transportConfig.maxInputMessageBytes);
+          const data = compact && typeof message.d === "string"
+            ? plainTerminalInput(message.d, transportConfig.maxInputMessageBytes)
+            : decodeTerminalInput(compact ? message.b : message.dataBase64, transportConfig.maxInputMessageBytes);
           if (data === null) {
             sendClient(client, wsError("TERMINAL_INPUT_INVALID", `Terminal input must be valid Base64 and no larger than ${transportConfig.maxInputMessageBytes} bytes.`), "error");
             return;
@@ -2740,8 +2760,20 @@ function parseTabSubscriptions(value: unknown): Set<string> {
   return new Set(ids);
 }
 
-/** What a non-local reconnect may replay at most when it does not ask for less. */
-const REMOTE_RAW_CATCH_UP_BYTES = 64 * 1024;
+/**
+ * What a reconnect may replay at most when it does not ask for less.
+ *
+ * The local page used to be exempt, on the reasoning that loopback bandwidth is
+ * free. The cost is not bandwidth. A busy TUI writes about 8 KB/s, so the 1 MB
+ * rolling buffer turns over roughly every two minutes; any resubscribe after
+ * that cannot be served incrementally and replayed the whole megabyte. Measured
+ * over 95 minutes on one machine: 59 such replays, 20.6 MB, one of them
+ * 1.33 MB -- and the browser paints a replay a chunk per frame, so the terminal
+ * visibly fast-forwards through it. Over the bound the reader gets one screen
+ * snapshot instead, which is what a redrawing TUI's scrollback amounts to
+ * anyway: thousands of stale partial frames.
+ */
+const RAW_CATCH_UP_BYTES = 64 * 1024;
 
 export function parseTerminalSubscriptions(value: unknown, defaultCatchUpBytes: number | null = null): Map<string, TerminalStream> {
   const result = new Map<string, TerminalStream>();

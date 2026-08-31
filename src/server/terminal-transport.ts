@@ -1,3 +1,4 @@
+import { terminalInputIsPlain } from "../shared/terminal-input.js";
 import { randomUUID } from "node:crypto";
 export { TERMINAL_PROTOCOL_VERSION } from "../shared/terminal-protocol.js";
 
@@ -340,6 +341,13 @@ export class BoundedWebSocketSender {
       return "closed";
     }
   }
+}
+
+/** Text accepted as sent, under the same ceiling the base64 form gets. */
+export function plainTerminalInput(text: unknown, maxBytes: number): string | null {
+  if (typeof text !== "string" || text.length === 0) return null;
+  if (Buffer.byteLength(text, "utf8") > maxBytes) return null;
+  return terminalInputIsPlain(text) ? text : null;
 }
 
 export function decodeTerminalInput(dataBase64: unknown, maxBytes: number): string | null {

@@ -130,6 +130,42 @@ describe("terminal WebSocket subscription isolation", () => {
     expect(JSON.stringify(metrics)).not.toContain("blocked");
   });
 
+  it("bounds what a local page may be replayed, like every other page", async () => {
+    // Loopback used to be exempt on the reasoning that its bandwidth is free.
+    // At the 8KB/s a busy TUI writes, the 1MB buffer turns over every two
+    // minutes, so every resubscribe after that replayed the whole megabyte --
+    // 59 times and 20.6MB in one measured 95-minute window.
+    const tab = await app.promptor.storage.createTab("bounded");
+    const cursors: any[] = [];
+    vi.spyOn(app.promptor.pty, "snapshot").mockImplementation((_tabId, cursor) => { cursors.push(cursor); return null; });
+    const socket = await connect(url, sockets);
+    socket.send(JSON.stringify({ type: "subscribe", tabIds: [tab.id], snapshots: false, terminals: { [tab.id]: { mode: "raw", generation: null, nextOffset: null } } }));
+    await eventually(() => cursors.length > 0);
+    expect(cursors[0].maxCatchUpBytes).toBe(64 * 1024);
+  });
+
+  it("accepts a keystroke addressed by handle, and only for a terminal the sender holds", async () => {
+    const tab = await app.promptor.storage.createTab("compact input");
+    const other = await app.promptor.storage.createTab("not subscribed");
+    const write = vi.spyOn(app.promptor.pty, "write");
+    const socket = await connect(url, sockets);
+    const messages = collect(socket);
+    socket.send(JSON.stringify({ type: "subscribe", tabIds: [tab.id], snapshots: false, terminals: { [tab.id]: { mode: "raw" } } }));
+
+    socket.send(JSON.stringify({ type: "ti", s: tab.id.slice(0, 8), d: "a" }));
+    await eventually(() => write.mock.calls.some(([, data]) => data === "a"));
+
+    // Control bytes still travel as base64: escaping them into JSON costs more.
+    socket.send(JSON.stringify({ type: "ti", s: tab.id.slice(0, 8), b: Buffer.from(String.fromCharCode(27) + "[A").toString("base64") }));
+    await eventually(() => write.mock.calls.some(([, data]) => data === String.fromCharCode(27) + "[A"));
+
+    // A handle is resolved against this sender's own subscriptions, so it can
+    // never reach a terminal the sender never attached to.
+    socket.send(JSON.stringify({ type: "ti", s: other.id.slice(0, 8), d: "x" }));
+    await eventually(() => messages.some((message) => message.error?.code === "TERMINAL_NOT_SUBSCRIBED"));
+    expect(write.mock.calls.some(([, data]) => data === "x")).toBe(false);
+  });
+
   it("sends structured projection frames without raw bytes and never lets a projection viewport resize the PTY", async () => {
     const tab = await app.promptor.storage.createTab("projection");
     const screenSnapshot = vi.spyOn(app.promptor.pty, "screenSnapshot").mockResolvedValue({

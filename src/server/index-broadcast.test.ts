@@ -57,6 +57,26 @@ describe("navigation broadcasts", () => {
     throw new Error("timed out");
   };
 
+  it("sends nothing back to a subscribe that already holds this revision", async () => {
+    // Measured on one tunnel: 51 subscribes in 95 minutes, 11.8KB of index
+    // each, about three quarters of everything sent that way -- and a
+    // subscribe is far more often a tab change or a reconnect than a change
+    // anyone made. A page that says what it holds does not need it repeated.
+    for (let n = 0; n < 12; n += 1) await app.promptor.storage.createTab(`对话 ${n}`);
+    const { socket, received } = await viewer();
+    const held = received[0].index as IndexFile;
+
+    socket.send(JSON.stringify({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {}, indexRevision: held.revision }));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(received).toHaveLength(1);
+
+    // A page that holds something older still gets the whole index: that is
+    // the one encoding which always applies to a viewer that fell behind.
+    socket.send(JSON.stringify({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {}, indexRevision: held.revision - 1 }));
+    await waitFor(() => received.length >= 2);
+    expect(received[1].index).toBeDefined();
+  });
+
   it("replays the whole index on subscribe and only what changed afterwards", async () => {
     // Enough tabs that a delta is worth its own bookkeeping. The measured
     // index this came from carried around forty of them at 13.5KB a broadcast.
