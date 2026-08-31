@@ -25,6 +25,7 @@ import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-pi
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
 import { locateCodexRollout, readCodexThreadForHistory } from "./codex-history.js";
 import { decideStall, noteRolloutSize, TURN_STALL_POLL_MS, type RolloutProgress } from "./turn-stall.js";
+import { appendBoundedLines } from "./log-file.js";
 import { readCodexRolloutCached } from "./codex-rollout-cache.js";
 import { RESTORE_STAGGER_MS, restoreOrder, runRestoreQueue, type RestoreQueue } from "./restore-plan.js";
 import { appendRestoreTimings, createPhaseRecorder, formatDuration, formatRestoreTimings, type PhaseRecorder, type RestoreTrace } from "./restore-timing.js";
@@ -1030,6 +1031,18 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (working && decision.action === "mark") {
         const settled = await settleTurnFromRollout(tab.id, tab.session.threadId, runtime.runner.activeTurnId!).catch(() => false);
         if (settled) continue;
+      }
+      if (decision.action === "mark") {
+        // A stall leaves nothing behind anywhere: no terminal event in the
+        // rollout, no error record, and ~/.codex/log is empty. Whatever the App
+        // Server said for itself is the only account there is, so it is kept
+        // where it can be read after the fact.
+        const said = codex.existing(tab.id)?.recentOutput().trim() ?? "";
+        void appendBoundedLines(path.join(storage.dataDir, "stalled-turns.log"), [
+          `${tab.name}  turn ${runtime.runner.activeTurnId}  quiet since ${decision.since}`,
+          `  rollout ${rolloutPaths.get(tab.session.threadId) ?? "?"}`,
+          ...(said ? said.split("\n").slice(-12).map((line) => `  app-server: ${line}`) : ["  app-server: (said nothing)"]),
+        ], 300);
       }
       if (decision.action === "none") continue;
       await storage.withTabLock(tab.id, async () => {

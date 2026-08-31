@@ -73,6 +73,19 @@ const RESPONSE_ID_PREFIX_BYTES = 256;
  */
 const RESUME_TIMEOUT_MS = 180_000;
 
+/**
+ * How much of the App Server's own output to keep.
+ *
+ * It is quiet by default -- measured at 222 bytes of banner at startup and
+ * nothing afterwards through connect, initialize and RPC -- but those pipes
+ * were opened and never read, so anything it did say was discarded. When a turn
+ * stops mid-flight there is no terminal event in the rollout, no error record,
+ * and nothing in ~/.codex/log, which leaves the process's own words as the only
+ * place an explanation could come from. Set CODEX_PROMPTOR_CODEX_LOG (it
+ * becomes RUST_LOG for the child) to make it say more when hunting one.
+ */
+const APP_SERVER_OUTPUT_BYTES = 32 * 1024;
+
 /** The `ws` error code for a frame that declares more bytes than `maxPayload` allows. */
 const WS_OVERSIZED_FRAME = "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH";
 
@@ -669,6 +682,8 @@ export class AppServerManager extends EventEmitter {
   private stopPromise: Promise<void> | null = null;
   private intentionalStop = false;
   private ownershipInfo: AppServerOwnership | null = null;
+  /** Bounded tail of whatever the child wrote to stdout/stderr. */
+  private output = "";
   private _status: CodexManagerStatus = { state: "stopped", url: null, error: null };
 
   constructor() {
@@ -683,6 +698,17 @@ export class AppServerManager extends EventEmitter {
   }
 
   get status(): CodexManagerStatus { return { ...this._status }; }
+
+  /** The last few KB the App Server wrote, oldest dropped. Empty when it said nothing. */
+  recentOutput(): string { return this.output; }
+
+  private captureOutput(child: ChildProcess): void {
+    const keep = (chunk: Buffer) => {
+      this.output = `${this.output}${chunk.toString("utf8")}`.slice(-APP_SERVER_OUTPUT_BYTES);
+    };
+    child.stdout?.on("data", keep);
+    child.stderr?.on("data", keep);
+  }
   get remoteUrl(): string | null { return this.url; }
   get ownership(): AppServerOwnership | null { return this.ownershipInfo ? { ...this.ownershipInfo } : null; }
 
@@ -704,12 +730,19 @@ export class AppServerManager extends EventEmitter {
       const startedAt = new Date().toISOString();
       this.port = port;
       this.url = `ws://127.0.0.1:${port}`;
+      this.output = "";
+      const logLevel = process.env.CODEX_PROMPTOR_CODEX_LOG;
       this.process = spawn(command, ["app-server", "--listen", this.url], {
         cwd: process.cwd(),
         windowsHide: true,
         shell: process.platform === "win32",
         stdio: ["ignore", "pipe", "pipe"],
+        env: logLevel ? { ...process.env, RUST_LOG: logLevel } : process.env,
       });
+      // Both pipes are read, not merely opened. An unread pipe wedges the child
+      // once the buffer fills, and everything it writes is the only account
+      // there is of a turn that stopped without saying why.
+      this.captureOutput(this.process);
       this.process.on("exit", (code) => {
         if (this.intentionalStop) return;
         if (this._status.state === "ready" || this._status.state === "starting") {

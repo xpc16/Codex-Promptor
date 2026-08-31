@@ -6,7 +6,7 @@
  * rollout. Any of those can dominate, and until they are measured separately
  * every claim about startup cost is a guess -- so they are measured.
  */
-import { promises as fs } from "node:fs";
+import { appendBoundedLines } from "./log-file.js";
 
 export type RestorePhase = { phase: string; ms: number };
 
@@ -75,10 +75,5 @@ const TIMING_LOG_LINES = 400;
  * answer -- did a change make startup faster -- still could not be checked.
  */
 export async function appendRestoreTimings(file: string, lines: readonly string[]): Promise<void> {
-  if (!lines.length) return;
-  try {
-    const previous = await fs.readFile(file, "utf8").catch(() => "");
-    const kept = [...previous.split("\n").filter(Boolean), `[${new Date().toISOString()}]`, ...lines];
-    await fs.writeFile(file, `${kept.slice(-TIMING_LOG_LINES).join("\n")}\n`, "utf8");
-  } catch { /* a diagnostic that cannot be written must never break a launch */ }
+  await appendBoundedLines(file, lines, TIMING_LOG_LINES);
 }
