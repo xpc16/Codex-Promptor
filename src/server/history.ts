@@ -769,6 +769,23 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       bundle.prompts.prompts = orderedPrompts;
       promptChanges += 1;
     }
+    // A previous sync can have removed an unconfirmed queue prompt after the
+    // provider imported the same turn as manual history, leaving only its
+    // synthetic interrupted answer behind. Merge mode intentionally preserves
+    // local lifecycle answers, but an answer with no matching prompt/attempt is
+    // not lifecycle data anymore -- it is an orphaned duplicate.
+    const beforeOrphanCleanup = bundle.answers.answers.length;
+    bundle.answers.answers = bundle.answers.answers.filter((answer) => {
+      if (!answer.codexTurnId.startsWith(INTERRUPTED_SUBMISSION_PREFIX)) return true;
+      const prompt = bundle.prompts.prompts.find((candidate) => candidate.id === answer.promptId);
+      return Boolean(prompt && (prompt.codexTurnId === answer.codexTurnId
+        || prompt.attempts.some((attempt) => attempt.codexTurnId === answer.codexTurnId)));
+    });
+    const orphanedAnswers = beforeOrphanCleanup - bundle.answers.answers.length;
+    if (orphanedAnswers) {
+      answerChanges += orphanedAnswers;
+      report.repaired += orphanedAnswers;
+    }
     if (promptChanges) {
       bundle.prompts.revision += 1;
       bundle.prompts.updatedAt = isoNow();

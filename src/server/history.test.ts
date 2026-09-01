@@ -615,4 +615,84 @@ describe("history sync", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("removes an orphaned interrupted-submission answer in merge mode", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-history-orphaned-submit-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      const tab = await storage.createTab("orphaned submission answer");
+      const bundle = await storage.readTab(tab.id);
+      const threadId = "thread-orphaned-submit";
+      const realTurnId = "turn-orphaned-submit";
+      const completed = newPrompt("repair no progress state", "manual");
+      Object.assign(completed, {
+        status: "completed",
+        threadId,
+        startedAt: "2026-09-01T13:04:58.700Z",
+        completedAt: "2026-09-01T13:12:18.652Z",
+        codexTurnId: realTurnId,
+      });
+      bundle.prompts.prompts = [completed];
+      bundle.answers.answers = [
+        {
+          id: "answer-real",
+          promptId: completed.id,
+          threadId,
+          codexTurnId: realTurnId,
+          origin: "manual",
+          prompt: completed.text,
+          status: "completed",
+          finalAnswer: "fixed",
+          captureMode: "phase_final_answer",
+          startedAt: completed.startedAt,
+          completedAt: completed.completedAt,
+          recordedAt: completed.completedAt!,
+          clientUserMessageId: null,
+          error: null,
+          metadata: { promptIds: [completed.id] },
+        },
+        {
+          id: "answer-orphaned",
+          promptId: "missing-queue-prompt",
+          threadId,
+          codexTurnId: "submission-interrupted:missing-client",
+          origin: "queue",
+          prompt: "repair \u201cno progress\u201d state",
+          status: "interrupted",
+          finalAnswer: "",
+          captureMode: null,
+          startedAt: "2026-09-01T13:04:54.777Z",
+          completedAt: "2026-09-01T13:25:26.349Z",
+          recordedAt: "2026-09-01T13:25:26.349Z",
+          clientUserMessageId: "missing-client",
+          error: { code: "TURN_INTERRUPTED", message: "Submission was interrupted." },
+          metadata: { promptIds: ["missing-queue-prompt"] },
+        },
+      ];
+      await storage.writePrompts(tab.id, bundle.prompts);
+      await storage.writeAnswers(tab.id, bundle.answers);
+
+      const report = await syncHistory(storage, tab.id, {
+        id: threadId,
+        turns: [{
+          id: realTurnId,
+          status: "completed",
+          startedAt: completed.startedAt,
+          completedAt: completed.completedAt,
+          items: [
+            { type: "userMessage", text: completed.text },
+            { type: "agentMessage", phase: "final_answer", text: "fixed" },
+          ],
+        }],
+      }, { mode: "merge" });
+
+      const synced = await storage.readTab(tab.id);
+      expect(report.repaired).toBeGreaterThanOrEqual(1);
+      expect(synced.prompts.prompts).toHaveLength(1);
+      expect(synced.answers.answers.map((answer) => answer.id)).toEqual(["answer-real"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
