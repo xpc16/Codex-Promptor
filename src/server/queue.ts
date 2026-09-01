@@ -776,6 +776,8 @@ export class QueueRunner extends EventEmitter {
           state: error ? "error" : runtime.runner.desiredState === "running" ? "dispatching" : "paused",
           activePromptId: null,
           activeTurnId: null,
+          // Whatever this prompt was waiting on, it is no longer waiting.
+          stalledSince: null,
           lastError: error,
           lastTransitionAt: isoNow(),
         },
@@ -796,7 +798,7 @@ export class QueueRunner extends EventEmitter {
         state,
         activePromptId,
         activeTurnId,
-        ...(working ? { lastError: null } : {}),
+        ...(working ? { lastError: null, stalledSince: null } : {}),
         lastTransitionAt: isoNow(),
       },
     }));

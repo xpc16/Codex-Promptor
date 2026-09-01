@@ -25,7 +25,7 @@ import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { sameTerminalSize, TerminalCursorQuietScheduler, TerminalResizeScheduler } from "./terminal-resize.js";
-import { terminalVisibilityAction } from "./terminal-visibility.js";
+import { terminalSubscriptionWanted } from "./terminal-visibility.js";
 import { TERMINAL_INPUT_COMPACT_TYPE, terminalInputHandle, terminalInputIsPlain } from "../shared/terminal-input.js";
 import { loadTabWithRetry, retainRecentTabIds } from "./tab-load.js";
 import { MOBILE_PANES, type MobilePane } from "./mobile-pane.js";
@@ -1440,7 +1440,10 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     let rawLeaseWritable = true;
     let awaitingRawOneShot = false;
     let rawOneShotAttempts = 0;
-    let pageHidden = typeof document !== "undefined" && document.visibilityState === "hidden";
+    // What was last asked for, so the wanted state can be reconciled against
+    // it from whatever the page's visibility actually is. A latched transition
+    // could not recover from an event that never arrived.
+    let terminalSubscribed = false;
     const pendingProjectionInput: string[] = [];
     const initialSize = !projectionMode && runtime.terminal.cols !== null && runtime.terminal.rows !== null
       ? { cols: runtime.terminal.cols, rows: runtime.terminal.rows }
@@ -1607,12 +1610,9 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     };
     scheduleLayout.current = scheduleSize;
     const applyPageVisibility = () => {
-      const hidden = document.visibilityState === "hidden";
-      if (hidden === pageHidden) return;
-      pageHidden = hidden;
-      const action = terminalVisibilityAction({ hidden, documentVisible: documentVisibleRef.current, projectionMode, active: activeRef.current });
-      if (action === "none") return;
-      if (action === "unsubscribe") {
+      const wanted = terminalSubscriptionWanted({ hidden: pageIsHidden(), documentVisible: documentVisibleRef.current, active: activeRef.current });
+      if (wanted === terminalSubscribed || socket.current?.readyState !== WebSocket.OPEN) return;
+      if (!wanted) {
         awaitingRawOneShot = false;
         sendSubscription(false);
         return;
@@ -1624,7 +1624,13 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       sendSubscription(true, false, true);
       scheduleSize();
     };
+    // Three listeners for one question: a browser that drops a visibilitychange
+    // (or never sends one because the page was restored from the back/forward
+    // cache) still tells us on focus or pageshow, and the reconciliation above
+    // makes acting on any of them idempotent.
     document.addEventListener("visibilitychange", applyPageVisibility);
+    window.addEventListener("pageshow", applyPageVisibility);
+    window.addEventListener("focus", applyPageVisibility);
     const observer = new ResizeObserver(scheduleSize); observer.observe(host.current);
     const releasePaneDrag = onPaneDragEnd(scheduleSize);
     const currentTerminalSubscription = (boundedCatchUp = false) => projectionMode
@@ -1642,9 +1648,11 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
         nextOffset: cursor.nextOffset,
         ...(boundedCatchUp ? { maxCatchUpBytes: DOCUMENT_RAW_CATCH_UP_BYTES } : {}),
       };
+    const pageIsHidden = () => typeof document !== "undefined" && document.visibilityState === "hidden";
     const sendSubscription = (includeTerminal: boolean, snapshots = false, boundedCatchUp = false) => {
       const ws = socket.current;
       if (ws?.readyState !== WebSocket.OPEN) return;
+      terminalSubscribed = includeTerminal;
       ws.send(JSON.stringify({
         type: "subscribe",
         terminalProtocolVersion: 2,
@@ -1784,8 +1792,9 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
           } else if (projectionMode) sendSubscription(true);
           else requestRawOneShot();
         };
-        sendSubscription(!documentVisibleRef.current && !pageHidden, reconnecting);
-        if (!projectionMode && !documentVisibleRef.current && !pageHidden) scheduleSize();
+        const wanted = terminalSubscriptionWanted({ hidden: pageIsHidden(), documentVisible: documentVisibleRef.current, active: activeRef.current });
+        sendSubscription(wanted, reconnecting);
+        if (!projectionMode && wanted) scheduleSize();
       };
       ws.onmessage = (event) => {
         try {
@@ -1859,6 +1868,8 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       terminalWriteSequence += 1;
       observer.disconnect();
       document.removeEventListener("visibilitychange", applyPageVisibility);
+      window.removeEventListener("pageshow", applyPageVisibility);
+      window.removeEventListener("focus", applyPageVisibility);
       releasePaneDrag();
       inputDisposable.dispose(); foregroundQuery.dispose(); backgroundQuery.dispose(); colorSchemeQuery.dispose(); cursorBlinkOn.dispose(); cursorBlinkOff.dispose();
       inputCoalescer.flush(); inputCoalescer.dispose();

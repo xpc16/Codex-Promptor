@@ -595,7 +595,17 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         await storage.writeRuntime(tabId, RuntimeFileSchema.parse({
           ...bundle.runtime,
           revision: bundle.runtime.revision + 1,
-          runner: { ...bundle.runtime.runner, state: "reconciling", lastTransitionAt: isoNow() },
+          runner: {
+            ...bundle.runtime.runner,
+            state: "reconciling",
+            // Reconciling forever is the right policy -- a prompt that may have
+            // run must not be failed -- but on its own it is indistinguishable
+            // from working. One observed here sat like that for an hour, with a
+            // prompt nothing could dislodge and no sign anywhere of why. Saying
+            // how long reuses the stall notice the queue already shows.
+            stalledSince: bundle.runtime.runner.stalledSince ?? isoNow(),
+            lastTransitionAt: isoNow(),
+          },
         }));
         changed = true;
       });
@@ -1274,6 +1284,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (tab.session.provider !== "codex" || !tab.session.threadId) continue;
       let runtime: RuntimeFile;
       try { runtime = await storage.readRuntime(tab.id); } catch { continue; }
+      // A prompt that was dispatched and never became a turn belongs to the
+      // submission recovery, not to the rollout: that file may well be growing
+      // from something else entirely -- a turn the reader typed by hand, as it
+      // was here -- and reading that as progress would clear the one notice
+      // saying anything is wrong.
+      if (runtime.runner.activePromptId && !runtime.runner.activeTurnId) continue;
       const working = Boolean(runtime.runner.activeTurnId) && runnerIsWorking(runtime.runner.state);
       const lastProgressAtMs = working ? await lastRolloutGrowth(tab.session.threadId, now) : null;
       const decision = decideStall({

@@ -21,6 +21,38 @@ describe("runner controls", () => {
     }
   });
 
+  it("says how long a submission has gone unconfirmed instead of just reconciling", async () => {
+    // Reconciling forever is the right policy -- a prompt that may have run
+    // must not be failed -- but on its own it looks exactly like working. One
+    // observed here sat like that for an hour, with a prompt nothing could
+    // dislodge and no sign anywhere of why.
+    root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-unconfirmed-"));
+    const staticRoot = path.join(root, "dist", "client");
+    await mkdir(staticRoot, { recursive: true });
+    await writeFile(path.join(staticRoot, "index.html"), "<!doctype html><title>test</title>", "utf8");
+    app = await createApp(root);
+    await app.ready();
+
+    const tab = await app.promptor.storage.createTab("未确认的提交");
+    await app.promptor.storage.updateTab(tab.id, (current) => ({
+      ...current,
+      updatedAt: isoNow(),
+      session: { ...current.session, provider: "codex", state: "ready", workingDirectory: root, threadId: "thread-1", sessionId: "thread-1", connectedAt: isoNow() },
+    }));
+    const runtime = await app.promptor.storage.readRuntime(tab.id);
+    runtime.runner.state = "dispatching";
+    runtime.runner.activePromptId = "prompt-1";
+    runtime.runner.activeTurnId = null;
+    await app.promptor.storage.writeRuntime(tab.id, runtime);
+
+    app.promptor.codexTui.get(tab.id).emit("submissionUnconfirmed", {});
+
+    await eventually(async () => Boolean((await app!.promptor.storage.readRuntime(tab.id)).runner.stalledSince));
+    const stalled = await app.promptor.storage.readRuntime(tab.id);
+    expect(stalled.runner.state).toBe("reconciling");
+    expect(stalled.runner.stalledSince).toBeTruthy();
+  });
+
   it("routes the interrupt action to the selected tab runner", async () => {
     root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-runner-control-"));
     const staticRoot = path.join(root, "dist", "client");
@@ -54,3 +86,12 @@ describe("runner controls", () => {
     expect(data.answers).toBeUndefined();
   });
 });
+
+async function eventually(check: () => Promise<boolean>, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("condition was not met");
+}

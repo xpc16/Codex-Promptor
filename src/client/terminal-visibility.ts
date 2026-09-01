@@ -1,30 +1,26 @@
 /**
- * What a terminal subscription should do when the page is hidden or shown.
+ * Whether a terminal stream should be subscribed right now.
  *
  * A hidden page still receives every byte the agent writes, and the browser
  * stops firing `requestAnimationFrame` while it is hidden -- which is what the
- * terminal write queue yields on between chunks. So the backlog piles up and
- * is replayed frame by frame on return: the terminal visibly fast-forwards
- * through everything that was missed instead of showing where it ended up.
+ * terminal write queue yields on between chunks. So the backlog piles up and is
+ * replayed frame by frame on return: the terminal visibly fast-forwards through
+ * everything that was missed instead of showing where it ended up.
  *
- * Dropping the stream while nobody is looking removes the backlog entirely,
- * and the bounded catch-up on return lets the server decide: a short absence
- * streams the few missed bytes, a long one exceeds the cap and comes back as
- * one screen snapshot.
+ * This is deliberately a state and not a transition. Driving the subscription
+ * from visibility *changes* meant a page that opened while hidden, or that
+ * missed the event turning it visible again, sat there unsubscribed with no way
+ * back -- a terminal that never loaded until something else happened to
+ * resubscribe it. Comparing the wanted state against what was last sent
+ * recovers from any missed event, on the next one that does arrive.
  */
-export type TerminalVisibilityAction = "none" | "unsubscribe" | "resubscribe";
-
-export function terminalVisibilityAction(input: {
+export function terminalSubscriptionWanted(input: {
+  /** document.visibilityState === "hidden". */
   hidden: boolean;
-  /** Already hidden behind an open document, which owns the subscription. */
+  /** An open document owns the subscription; it re-enters through its own path. */
   documentVisible: boolean;
-  /** Projection mode sends screen diffs, so there is no backlog to replay. */
-  projectionMode: boolean;
   /** The panel of a tab the reader is not looking at holds no socket. */
   active: boolean;
-}): TerminalVisibilityAction {
-  if (!input.active || input.documentVisible) return "none";
-  if (input.hidden) return "unsubscribe";
-  // Projection resubscribes too: its frames stopped arriving with the rest.
-  return "resubscribe";
+}): boolean {
+  return input.active && !input.documentVisible && !input.hidden;
 }
