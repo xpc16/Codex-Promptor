@@ -25,7 +25,7 @@ import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { sameTerminalSize, TerminalCursorQuietScheduler, TerminalResizeScheduler } from "./terminal-resize.js";
-import { terminalSubscriptionWanted } from "./terminal-visibility.js";
+import { terminalInputDisposition, terminalSubscriptionWanted } from "./terminal-visibility.js";
 import { TERMINAL_INPUT_COMPACT_TYPE, terminalInputHandle, terminalInputIsPlain } from "../shared/terminal-input.js";
 import { loadTabWithRetry, retainRecentTabIds } from "./tab-load.js";
 import { MOBILE_PANES, type MobilePane } from "./mobile-pane.js";
@@ -61,6 +61,9 @@ import { MarkdownView, preloadMarkdownView } from "./markdown-view.js";
 import { DocumentView, useDocumentViewer, type DocumentOpenIntent } from "./document-viewer.js";
 import { insertCommonPrompt, type DraftSelection } from "./prompt-insertion.js";
 import { placeGroupAfter, placeTab } from "./navigation-placement.js";
+
+/** How many keystrokes to hold while a terminal subscription is away. */
+const HELD_INPUT_KEYSTROKES = 32;
 
 const TimerDialog = lazy(async () => ({ default: (await import("./timer-dialog.js")).TimerDialog }));
 const CommonPromptDialog = lazy(async () => ({ default: (await import("./common-prompt-dialog.js")).CommonPromptDialog }));
@@ -1444,6 +1447,10 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     // it from whatever the page's visibility actually is. A latched transition
     // could not recover from an event that never arrived.
     let terminalSubscribed = false;
+    // Keys pressed while the subscription is briefly away, replayed in order
+    // once it is back. Bounded because a page that never resubscribes should
+    // forget what was typed at it, not accumulate it.
+    const heldInput: string[] = [];
     const pendingProjectionInput: string[] = [];
     const initialSize = !projectionMode && runtime.terminal.cols !== null && runtime.terminal.rows !== null
       ? { cols: runtime.terminal.cols, rows: runtime.terminal.rows }
@@ -1515,7 +1522,15 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     const inputCoalescer = createInputCoalescer(writeInput);
     const sendInputNow = (data: string) => {
       if (documentVisibleRef.current || (!projectionMode && !rawLeaseWritable)) return;
-      inputCoalescer.push(data);
+      const disposition = terminalInputDisposition({
+        subscribed: terminalSubscribed,
+        wanted: terminalSubscriptionWanted({ hidden: pageIsHidden(), documentVisible: documentVisibleRef.current, active: activeRef.current }),
+        snapshotInFlight: awaitingRawOneShot,
+      });
+      if (disposition === "send") { inputCoalescer.push(data); return; }
+      if (disposition === "drop") return;
+      if (heldInput.length < HELD_INPUT_KEYSTROKES) heldInput.push(data);
+      if (disposition === "hold-and-resubscribe") sendSubscription(true, false, true);
     };
     const flushProjectionInput = () => {
       if (projectionRenderPending > 0 || pendingProjectionInput.length === 0) return;
@@ -1653,6 +1668,10 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       const ws = socket.current;
       if (ws?.readyState !== WebSocket.OPEN) return;
       terminalSubscribed = includeTerminal;
+      if (!includeTerminal) heldInput.length = 0;
+      // After the subscribe, never before it: the socket keeps them in order,
+      // so the server has the stream back by the time the keys arrive.
+      else for (const held of heldInput.splice(0)) inputCoalescer.push(held);
       ws.send(JSON.stringify({
         type: "subscribe",
         terminalProtocolVersion: 2,
@@ -1811,6 +1830,14 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
               if (!projectionMode) scheduleSize();
             }
           } else if (message.type === "error" && message.error) {
+            // The server and this page disagree about whether the terminal is
+            // subscribed. That is something to fix, not something to report:
+            // reconciling puts the stream back if the page should have one.
+            if (String(message.error.code ?? "") === "TERMINAL_NOT_SUBSCRIBED") {
+              terminalSubscribed = false;
+              applyPageVisibility();
+              return;
+            }
             if (awaitingRawOneShot && String(message.error.code ?? "").startsWith("TERMINAL_")) awaitingRawOneShot = false;
             if (projectionMode && String(message.error.code ?? "").startsWith("TERMINAL_PROJECTION")) setProjectionFailed(true);
             callbacks.current.onError(message.error);

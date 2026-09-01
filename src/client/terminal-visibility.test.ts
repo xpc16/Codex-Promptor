@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { terminalSubscriptionWanted } from "./terminal-visibility.js";
+import { terminalInputDisposition, terminalSubscriptionWanted } from "./terminal-visibility.js";
 
 describe("whether a terminal stream should be subscribed", () => {
   const base = { hidden: false, documentVisible: false, active: true };
@@ -30,5 +30,31 @@ describe("whether a terminal stream should be subscribed", () => {
     const visible = { hidden: false, documentVisible: false, active: true };
     expect(terminalSubscriptionWanted(visible)).toBe(true);
     expect(terminalSubscriptionWanted(visible)).toBe(true);
+  });
+});
+
+describe("a keystroke while the subscription is away", () => {
+  const base = { subscribed: true, wanted: true, snapshotInFlight: false };
+
+  it("goes straight out when the terminal is subscribed", () => {
+    expect(terminalInputDisposition(base)).toBe("send");
+  });
+
+  it("is held and the stream asked for again when it should be there", () => {
+    // Sending it anyway is what produced "Subscribe to the terminal before
+    // sending input": an error about the transport, thrown at a reader who had
+    // only pressed a key.
+    expect(terminalInputDisposition({ ...base, subscribed: false })).toBe("hold-and-resubscribe");
+  });
+
+  it("is only held while a snapshot is already on its way", () => {
+    // That stream was retired on purpose to generate the snapshot; asking for
+    // it again here would undo the request the page is waiting on.
+    expect(terminalInputDisposition({ ...base, subscribed: false, snapshotInFlight: true })).toBe("hold");
+  });
+
+  it("is dropped for a page nobody is looking at", () => {
+    expect(terminalInputDisposition({ ...base, subscribed: false, wanted: false })).toBe("drop");
+    expect(terminalInputDisposition({ subscribed: false, wanted: false, snapshotInFlight: true })).toBe("drop");
   });
 });

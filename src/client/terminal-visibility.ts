@@ -24,3 +24,31 @@ export function terminalSubscriptionWanted(input: {
 }): boolean {
   return input.active && !input.documentVisible && !input.hidden;
 }
+
+/**
+ * What to do with a keystroke while the terminal subscription may be away.
+ *
+ * The subscription is no longer permanent: it is dropped while the page is
+ * hidden, and again for the moment a screen snapshot replaces a replay. Input
+ * that crossed either gap came back as "Subscribe to the terminal before
+ * sending input" -- an error about the transport, thrown at a reader who had
+ * only pressed a key.
+ *
+ * A snapshot already on its way is the one case not to ask again: the stream it
+ * is generated from was retired on purpose, and resubscribing now would undo
+ * that. It puts the subscription back itself when it lands.
+ */
+export type TerminalInputDisposition = "send" | "hold" | "hold-and-resubscribe" | "drop";
+
+export function terminalInputDisposition(input: {
+  subscribed: boolean;
+  /** Whether this page should be subscribed at all right now. */
+  wanted: boolean;
+  /** A screen snapshot was requested and has not arrived yet. */
+  snapshotInFlight: boolean;
+}): TerminalInputDisposition {
+  if (input.subscribed) return "send";
+  // Nothing is coming back for a page nobody is looking at.
+  if (!input.wanted) return "drop";
+  return input.snapshotInFlight ? "hold" : "hold-and-resubscribe";
+}
