@@ -21,11 +21,10 @@ describe("runner controls", () => {
     }
   });
 
-  it("says how long a submission has gone unconfirmed instead of just reconciling", async () => {
+  it("keeps an unconfirmed submission distinct from a stalled active turn", async () => {
     // Reconciling forever is the right policy -- a prompt that may have run
-    // must not be failed -- but on its own it looks exactly like working. One
-    // observed here sat like that for an hour, with a prompt nothing could
-    // dislodge and no sign anywhere of why.
+    // must not be failed. It still has no provider turn id, though, so calling
+    // it a stalled turn creates a warning that real turn progress cannot clear.
     root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-unconfirmed-"));
     const staticRoot = path.join(root, "dist", "client");
     await mkdir(staticRoot, { recursive: true });
@@ -47,10 +46,10 @@ describe("runner controls", () => {
 
     app.promptor.codexTui.get(tab.id).emit("submissionUnconfirmed", {});
 
-    await eventually(async () => Boolean((await app!.promptor.storage.readRuntime(tab.id)).runner.stalledSince));
-    const stalled = await app.promptor.storage.readRuntime(tab.id);
-    expect(stalled.runner.state).toBe("reconciling");
-    expect(stalled.runner.stalledSince).toBeTruthy();
+    await eventually(async () => (await app!.promptor.storage.readRuntime(tab.id)).runner.state === "reconciling");
+    const reconciling = await app.promptor.storage.readRuntime(tab.id);
+    expect(reconciling.runner.activeTurnId).toBeNull();
+    expect(reconciling.runner.stalledSince).toBeNull();
   });
 
   it("routes the interrupt action to the selected tab runner", async () => {

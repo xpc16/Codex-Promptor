@@ -26,6 +26,15 @@ export function runnerIsWorking(state: RuntimeFile["runner"]["state"]): boolean 
 }
 
 /**
+ * A stall mark describes one known provider turn, not an unconfirmed prompt
+ * submission or an idle runner. Keeping this check at the display boundary
+ * also hides stale marks written by older Promptor versions.
+ */
+export function displayedStallSince(runner: Pick<RuntimeFile["runner"], "state" | "activeTurnId" | "stalledSince">): string | null {
+  return runner.activeTurnId && runnerIsWorking(runner.state) ? runner.stalledSince : null;
+}
+
+/**
  * Whole minutes since a stalled turn last recorded anything, for the label the
  * reader sees. Shared because the server decides when to set the mark and the
  * client decides how to say it.

@@ -19,7 +19,7 @@ import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-li
 import type { TerminalScreenFrame, TerminalTransportMode } from "../shared/terminal-protocol.js";
 import { DOCUMENT_RAW_CATCH_UP_BYTES } from "../shared/document-protocol.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
-import { completionNoticeExpiresAt, latestQueueCompletion, runnerIsWorking, stalledMinutes, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
+import { completionNoticeExpiresAt, displayedStallSince, latestQueueCompletion, runnerIsWorking, stalledMinutes, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
 import { EARLIER_ANSWER_PAGE, EARLIER_PROMPT_PAGE, INITIAL_ANSWER_WINDOW, INITIAL_PROMPT_WINDOW } from "../shared/tab-window.js";
 import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
@@ -1148,7 +1148,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   // to move on its own or it would read "5 minutes" for an hour. Only ticks
   // while something is actually stalled.
   const [, stallTick] = useReducer((count: number) => count + 1, 0);
-  const stalledSince = bundle.runtime.runner.stalledSince;
+  const stalledSince = displayedStallSince(bundle.runtime.runner);
   useEffect(() => {
     if (!stalledSince) return;
     const timer = window.setInterval(stallTick, 30_000);

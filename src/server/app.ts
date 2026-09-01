@@ -598,12 +598,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           runner: {
             ...bundle.runtime.runner,
             state: "reconciling",
-            // Reconciling forever is the right policy -- a prompt that may have
-            // run must not be failed -- but on its own it is indistinguishable
-            // from working. One observed here sat like that for an hour, with a
-            // prompt nothing could dislodge and no sign anywhere of why. Saying
-            // how long reuses the stall notice the queue already shows.
-            stalledSince: bundle.runtime.runner.stalledSince ?? isoNow(),
+            // A prompt that may have run must stay pending, but it is not yet a
+            // known provider turn. `stalledSince` is reserved for known turns
+            // whose provider record actually stopped growing; reusing it here
+            // produced a no-progress label that no turn-progress sweep could
+            // clear because there was deliberately no activeTurnId yet.
+            stalledSince: null,
             lastTransitionAt: isoNow(),
           },
         }));
@@ -2998,7 +2998,7 @@ export async function recoverTerminalRuntime(storage: StorageService): Promise<n
           // The runner this error belonged to no longer exists. Carrying it
           // across a restart left a healthy conversation reporting a failure
           // from a previous run; the prompts it touched keep their own errors.
-          runner: { ...bundle.runtime.runner, desiredState: settledDesiredState(bundle.runtime.runner.desiredState), state: "paused", activePromptId: null, activeTurnId: null, lastError: null, lastTransitionAt: recoveredAt },
+          runner: { ...bundle.runtime.runner, desiredState: settledDesiredState(bundle.runtime.runner.desiredState), state: "paused", activePromptId: null, activeTurnId: null, lastError: null, stalledSince: null, lastTransitionAt: recoveredAt },
           terminal: {
             ...bundle.runtime.terminal,
             state: appServerCleanupError ? "error" : "stopped",

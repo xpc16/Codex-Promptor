@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { newPrompt } from "./schemas.js";
 import {
   completionNoticeExpiresAt,
+  displayedStallSince,
   latestQueueCompletion,
   promptIsExecuting,
   runnerIsWorking,
@@ -59,6 +60,13 @@ describe("what counts as the agent working", () => {
     expect(runnerIsWorking("waiting_for_thread")).toBe(false);
     expect(runnerIsWorking("starting")).toBe(false);
     expect(runnerIsWorking("error")).toBe(false);
+  });
+
+  it("shows no-progress time only for a known active turn", () => {
+    const since = "2026-09-01T12:00:00.000Z";
+    expect(displayedStallSince({ state: "running", activeTurnId: "turn-1", stalledSince: since })).toBe(since);
+    expect(displayedStallSince({ state: "reconciling", activeTurnId: null, stalledSince: since })).toBeNull();
+    expect(displayedStallSince({ state: "paused", activeTurnId: null, stalledSince: since })).toBeNull();
   });
 });
 
