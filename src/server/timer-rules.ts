@@ -29,7 +29,9 @@ export function hostTimeZone(): string {
 /**
  * Validate a timer rule and calculate its first occurrence strictly after
  * `now`. Local schedules intentionally use the host Date implementation's
- * compatible DST behaviour; interval schedules are fixed UTC durations.
+ * compatible DST behaviour. Interval anchors and recurrences use the same
+ * host-local wall clock, so a daily interval keeps its local clock time over
+ * daylight-saving transitions.
  */
 export function normalizeTimerRule(
   value: unknown,
@@ -67,8 +69,8 @@ export function normalizeTimerRule(
     return { schedule: normalized, nextRunAt: nextWeeklyRun(normalized, now) };
   }
 
-  const anchor = isoDate(schedule.anchorAt, "The interval anchor must be an ISO UTC timestamp.");
-  const end = schedule.endAt === null ? null : isoDate(schedule.endAt, "The interval end must be an ISO UTC timestamp.");
+  const anchor = intervalDateTime(schedule.anchorAt, "The interval anchor must be a local date and time.");
+  const end = schedule.endAt === null ? null : intervalDateTime(schedule.endAt, "The interval end must be a local date and time.");
   const step = schedule.every * (schedule.unit === "hours" ? HOUR_MS : DAY_MS);
   if (!Number.isSafeInteger(step) || step <= 0) throw new TimerRuleError("The interval is too large.");
   if (end && end.getTime() < anchor.getTime()) {
@@ -76,8 +78,8 @@ export function normalizeTimerRule(
   }
   const normalized: TimerSchedule = {
     ...schedule,
-    anchorAt: anchor.toISOString(),
-    endAt: end?.toISOString() ?? null,
+    anchorAt: formatLocalDateTime(anchor),
+    endAt: end ? formatLocalDateTime(end) : null,
   };
   return { schedule: normalized, nextRunAt: nextIntervalRun(normalized, now) };
 }
@@ -109,13 +111,35 @@ function nextWeeklyRun(schedule: Extract<TimerSchedule, { kind: "weekly" }>, now
 }
 
 function nextIntervalRun(schedule: Extract<TimerSchedule, { kind: "interval" }>, now: Date): string | null {
-  const anchor = isoDate(schedule.anchorAt, "Invalid interval anchor.").getTime();
-  const end = schedule.endAt === null ? null : isoDate(schedule.endAt, "Invalid interval end.").getTime();
+  const anchor = intervalDateTime(schedule.anchorAt, "Invalid interval anchor.");
+  const end = schedule.endAt === null ? null : intervalDateTime(schedule.endAt, "Invalid interval end.");
   const step = schedule.every * (schedule.unit === "hours" ? HOUR_MS : DAY_MS);
-  const elapsed = now.getTime() - anchor;
-  const occurrence = elapsed < 0 ? anchor : anchor + (Math.floor(elapsed / step) + 1) * step;
-  if (!Number.isFinite(occurrence) || (end !== null && occurrence > end)) return null;
-  return new Date(occurrence).toISOString();
+  const elapsed = now.getTime() - anchor.getTime();
+  let index = elapsed < 0 ? 0 : Math.floor(elapsed / step) + 1;
+  let occurrence = localIntervalOccurrence(anchor, schedule.every, schedule.unit, index);
+
+  // The nominal millisecond estimate is exact outside offset changes. These
+  // short corrections handle DST gaps/folds without walking old occurrences.
+  while (Number.isFinite(occurrence.getTime()) && occurrence.getTime() <= now.getTime()) {
+    occurrence = localIntervalOccurrence(anchor, schedule.every, schedule.unit, ++index);
+  }
+  while (index > 0) {
+    const previous = localIntervalOccurrence(anchor, schedule.every, schedule.unit, index - 1);
+    if (!Number.isFinite(previous.getTime()) || previous.getTime() <= now.getTime()) break;
+    occurrence = previous;
+    index -= 1;
+  }
+
+  if (!Number.isFinite(occurrence.getTime()) || (end !== null && occurrence.getTime() > end.getTime())) return null;
+  return occurrence.toISOString();
+}
+
+function localIntervalOccurrence(anchor: Date, every: number, unit: "hours" | "days", index: number): Date {
+  const amount = every * index;
+  if (!Number.isSafeInteger(amount)) return new Date(Number.NaN);
+  return unit === "hours"
+    ? new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate(), anchor.getHours() + amount, anchor.getMinutes(), 0, 0)
+    : new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + amount, anchor.getHours(), anchor.getMinutes(), 0, 0);
 }
 
 function localDateTime(value: string): Date {
@@ -126,6 +150,17 @@ function localDateTime(value: string): Date {
   const minute = Number(match[5]);
   if (hour > 23 || minute > 59) throw new TimerRuleError("The local time is invalid.");
   return new Date(parts.year, parts.month - 1, parts.day, hour, minute, 0, 0);
+}
+
+function intervalDateTime(value: string, message: string): Date {
+  if (LOCAL_DATE_TIME.test(value)) return localDateTime(value);
+  // Timers saved before local interval anchors were introduced used UTC ISO
+  // strings. Accept them once and normalize them to the host wall clock.
+  return isoDate(value, message);
+}
+
+function formatLocalDateTime(value: Date): string {
+  return `${value.getFullYear()}-${two(value.getMonth() + 1)}-${two(value.getDate())}T${two(value.getHours())}:${two(value.getMinutes())}`;
 }
 
 function parseLocalTime(value: string): [number, number] {

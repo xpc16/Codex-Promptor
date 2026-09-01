@@ -23,6 +23,10 @@ type Editor = {
   bindToCurrentThread: boolean;
 };
 
+const NEW_TIMER_DRAFT = "__new__";
+const timerEditorDrafts = new Map<string, Editor>();
+const timerEditorSelections = new Map<string, string | null>();
+
 export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provider, onClose, onError }: {
   open: boolean;
   tabId: string;
@@ -44,7 +48,18 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
   const [dragTemplateId, setDragTemplateId] = useState<string | null>(null);
   const runKeys = useRef(new Map<string, string>());
 
-  const selectTimer = (timer: Timer) => { setEditor(editorFromTimer(timer)); setDirty(false); };
+  const selectTimer = useCallback((timer: Timer) => {
+    const draft = timerEditorDrafts.get(timerDraftKey(tabId, timer.id));
+    timerEditorSelections.set(tabId, timer.id);
+    setEditor(draft ?? editorFromTimer(timer));
+    setDirty(Boolean(draft));
+  }, [tabId]);
+  const selectNew = useCallback(() => {
+    const draft = timerEditorDrafts.get(timerDraftKey(tabId, null));
+    timerEditorSelections.set(tabId, null);
+    setEditor(draft ?? newEditor());
+    setDirty(Boolean(draft));
+  }, [tabId]);
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
@@ -54,29 +69,41 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
       });
       if (response.data) {
         setFile(response.data);
-        const current = response.data.timers.find((timer) => timer.id === editor.id) ?? response.data.timers[0];
+        const hasSelection = timerEditorSelections.has(tabId);
+        const selectedId = timerEditorSelections.get(tabId);
+        const current = selectedId ? response.data.timers.find((timer) => timer.id === selectedId) : undefined;
         if (current) selectTimer(current);
-        else { setEditor(newEditor()); setDirty(false); }
+        else if (hasSelection && selectedId === null) selectNew();
+        else if (response.data.timers[0]) selectTimer(response.data.timers[0]);
+        else selectNew();
       }
       if (response.etag) setEtag(response.etag);
     } catch (error) { onError(error); }
     finally { setLoading(false); }
-  }, [editor.id, etag, onError, tabId]);
+  }, [etag, onError, selectNew, selectTimer, tabId]);
   useEffect(() => { if (open) void refresh(); }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const patch = (value: Partial<Editor>) => { setEditor((current) => ({ ...current, ...value })); setDirty(true); };
+  const patch = (value: Partial<Editor>) => {
+    setEditor((current) => {
+      const next = { ...current, ...value };
+      timerEditorDrafts.set(timerDraftKey(tabId, current.id), next);
+      timerEditorSelections.set(tabId, current.id);
+      return next;
+    });
+    setDirty(true);
+  };
   const setPrompts = (prompts: TimerPromptTemplate[]) => patch({ prompts });
-  const selectNew = () => { setEditor(newEditor()); setDirty(false); };
   const schedule = () => {
     if (editor.kind === "once") return { kind: "once", localDateTime: editor.onceAt };
     if (editor.kind === "weekly") return { kind: "weekly", daysOfWeek: editor.weeklyDays, localTime: editor.weeklyTime, startDate: editor.startDate || null, endDate: editor.endDate || null };
-    return { kind: "interval", every: Number(editor.every), unit: editor.unit, anchorAt: localInputToIso(editor.anchorAt), endAt: editor.intervalEnd ? localInputToIso(editor.intervalEnd) : null };
+    return { kind: "interval", every: editor.every, unit: editor.unit, anchorAt: editor.anchorAt, endAt: editor.intervalEnd || null };
   };
+  const validInterval = editor.kind !== "interval" || (Number.isSafeInteger(editor.every) && editor.every > 0 && isLocalDateTime(editor.anchorAt));
   const valid = Boolean(editor.title.trim()
     && editor.prompts.length > 0
     && editor.prompts.every((prompt) => prompt.text.trim())
     && (editor.kind !== "weekly" || editor.weeklyDays.length > 0)
-    && (editor.kind !== "interval" || editor.every > 0 && localInputToIso(editor.anchorAt)));
+    && validInterval);
 
   const save = async () => {
     if (!file || !etag || !valid || saving) return;
@@ -102,7 +129,11 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
         headers: { "If-Match": etag },
         body: JSON.stringify(body),
       });
-      if (response.data) { setFile(response.data.file); selectTimer(response.data.timer); }
+      if (response.data) {
+        timerEditorDrafts.delete(timerDraftKey(tabId, editor.id));
+        setFile(response.data.file);
+        selectTimer(response.data.timer);
+      }
       if (response.etag) setEtag(response.etag);
     } catch (error) { onError(error); }
     finally { setSaving(false); }
@@ -113,6 +144,7 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
     try {
       const response = await apiResponse(`/api/tabs/${tabId}/timers/${editor.id}`, { method: "DELETE", headers: { "If-Match": etag } });
       const remaining = file?.timers.filter((timer) => timer.id !== editor.id) ?? [];
+      timerEditorDrafts.delete(timerDraftKey(tabId, editor.id));
       setFile((current) => current ? { ...current, timers: remaining } : current);
       if (response.etag) setEtag(response.etag);
       if (remaining[0]) selectTimer(remaining[0]); else selectNew();
@@ -155,10 +187,13 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
     setPrompts(next);
     setDragTemplateId(null);
   };
-  const requestClose = () => { if (!dirty || window.confirm(c.discardConfirm)) { setDirty(false); onClose(); } };
+  const requestClose = () => { onClose(); };
+  const displayedTimeZone = file?.timers.find((timer) => timer.id === editor.id)?.timeZone
+    ?? file?.timers[0]?.timeZone
+    ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
 
   return <ModalShell open={open} wide title={c.title} closeLabel={c.close} onClose={requestClose}>
-    <div className="timer-toolbar"><button className="primary" onClick={selectNew}>{c.newTimer}</button><button className="ghost" disabled={loading} onClick={() => void refresh()}>{loading ? c.loading : c.refresh}</button><span>{c.hostZone}: {Intl.DateTimeFormat().resolvedOptions().timeZone}</span></div>
+    <div className="timer-toolbar"><button className="primary" onClick={selectNew}>{c.newTimer}</button><button className="ghost" disabled={loading} onClick={() => void refresh()}>{loading ? c.loading : c.refresh}</button><span>{c.hostZone}: {displayedTimeZone}</span></div>
     <div className="timer-layout">
       <div className="timer-list">{file?.timers.length ? file.timers.map((timer) => <button key={timer.id} className={`timer-item ${timer.id === editor.id ? "active" : ""}`} onClick={() => selectTimer(timer)}><span><i className={`status-dot ${timer.enabled ? "armed" : ""}`} /><strong>{timer.title}</strong></span><small>{ruleSummary(timer, c)} · {timer.prompts.length} {c.promptCount}</small><small>{timer.nextRunAt ? `${c.next}: ${i18n.formatTime(timer.nextRunAt)}` : c.disabled}</small>{timer.lastTrigger && <em>{c.last}: {triggerLabel(timer.lastTrigger.status, c)}</em>}</button>) : <div className="modal-empty">{c.empty}</div>}</div>
       <div className="timer-editor">
@@ -166,7 +201,7 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
         <fieldset className="timer-rule"><legend>{c.schedule}</legend><div className="mode-switch"><button className={editor.kind === "once" ? "active" : ""} onClick={() => patch({ kind: "once" })}>{c.once}</button><button className={editor.kind === "weekly" ? "active" : ""} onClick={() => patch({ kind: "weekly" })}>{c.weekly}</button><button className={editor.kind === "interval" ? "active" : ""} onClick={() => patch({ kind: "interval" })}>{c.interval}</button></div>
           {editor.kind === "once" && <label>{c.localTime}<input type="datetime-local" value={editor.onceAt} onChange={(event) => patch({ onceAt: event.target.value })} /></label>}
           {editor.kind === "weekly" && <div className="weekly-fields"><div className="weekday-picker">{c.weekdays.map((label, index) => { const day = index + 1; return <button key={day} className={editor.weeklyDays.includes(day) ? "active" : ""} onClick={() => patch({ weeklyDays: editor.weeklyDays.includes(day) ? editor.weeklyDays.filter((item) => item !== day) : [...editor.weeklyDays, day].sort() })}>{label}</button>; })}</div><label>{c.localClock}<input type="time" value={editor.weeklyTime} onChange={(event) => patch({ weeklyTime: event.target.value })} /></label><label>{c.startDate}<input type="date" value={editor.startDate} onChange={(event) => patch({ startDate: event.target.value })} /></label><label>{c.endDate}<input type="date" value={editor.endDate} onChange={(event) => patch({ endDate: event.target.value })} /></label></div>}
-          {editor.kind === "interval" && <div className="interval-fields"><label>{c.every}<input type="number" min={1} value={editor.every} onChange={(event) => patch({ every: Number(event.target.value) })} /></label><label>{c.unit}<select value={editor.unit} onChange={(event) => patch({ unit: event.target.value as Editor["unit"] })}><option value="hours">{c.hours}</option><option value="days">{c.days}</option></select></label><label>{c.anchor}<input type="datetime-local" value={editor.anchorAt} onChange={(event) => patch({ anchorAt: event.target.value })} /></label><label>{c.optionalEnd}<input type="datetime-local" value={editor.intervalEnd} onChange={(event) => patch({ intervalEnd: event.target.value })} /></label></div>}
+          {editor.kind === "interval" && <div className="interval-fields"><label>{c.every}<input type="number" min={1} step={1} value={editor.every} onChange={(event) => patch({ every: Number(event.target.value) })} /></label><label>{c.unit}<select value={editor.unit} onChange={(event) => patch({ unit: event.target.value as Editor["unit"] })}><option value="hours">{c.hours}</option><option value="days">{c.days}</option></select></label><label>{c.anchor}<input type="datetime-local" value={editor.anchorAt} onChange={(event) => patch({ anchorAt: event.target.value })} /></label><label>{c.optionalEnd}<input type="datetime-local" value={editor.intervalEnd} onChange={(event) => patch({ intervalEnd: event.target.value })} /></label></div>}
         </fieldset>
         <div className="timer-binding"><span>{c.binding}: <code>{editor.bindToCurrentThread && currentThreadId ? currentThreadId : file?.timers.find((timer) => timer.id === editor.id)?.threadId ?? currentThreadId ?? c.none}</code></span><button className="ghost" disabled={!currentThreadId || provider === "shell"} onClick={() => patch({ bindToCurrentThread: true })}>{c.rebind}</button></div>
         <div className="timer-prompts-heading"><strong>{c.templates}</strong><span>{editor.prompts.length}/20</span><button className="ghost" disabled={editor.prompts.length >= 20} onClick={addPrompt}>{c.addTemplate}</button></div>
@@ -190,20 +225,21 @@ function editorFromTimer(timer: Timer): Editor {
     ...newEditor(), id: timer.id, title: timer.title, enabled: timer.enabled, policy: timer.externalQueuePolicy, kind: timer.schedule.kind, prompts: timer.prompts.map((prompt) => ({ ...prompt })), bindToCurrentThread: false,
     ...(timer.schedule.kind === "once" ? { onceAt: timer.schedule.localDateTime } : {}),
     ...(timer.schedule.kind === "weekly" ? { weeklyDays: timer.schedule.daysOfWeek, weeklyTime: timer.schedule.localTime, startDate: timer.schedule.startDate ?? "", endDate: timer.schedule.endDate ?? "" } : {}),
-    ...(timer.schedule.kind === "interval" ? { every: timer.schedule.every, unit: timer.schedule.unit, anchorAt: isoToLocalInput(timer.schedule.anchorAt), intervalEnd: timer.schedule.endAt ? isoToLocalInput(timer.schedule.endAt) : "" } : {}),
+    ...(timer.schedule.kind === "interval" ? { every: timer.schedule.every, unit: timer.schedule.unit, anchorAt: timerDateTimeInput(timer.schedule.anchorAt), intervalEnd: timer.schedule.endAt ? timerDateTimeInput(timer.schedule.endAt) : "" } : {}),
   };
 }
 
 function dateTimeLocal(value: Date): string { return `${value.getFullYear()}-${two(value.getMonth() + 1)}-${two(value.getDate())}T${two(value.getHours())}:${two(value.getMinutes())}`; }
-function isoToLocalInput(value: string): string { return dateTimeLocal(new Date(value)); }
-function localInputToIso(value: string): string { const date = new Date(value); return Number.isFinite(date.getTime()) ? date.toISOString() : ""; }
+function isLocalDateTime(value: string): boolean { return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value); }
+function timerDateTimeInput(value: string): string { return isLocalDateTime(value) ? value : dateTimeLocal(new Date(value)); }
+function timerDraftKey(tabId: string, timerId: string | null): string { return `${tabId}\0${timerId ?? NEW_TIMER_DRAFT}`; }
 function two(value: number): string { return String(value).padStart(2, "0"); }
 function triggerLabel(status: Timer["lastTrigger"] extends infer _T ? "queued" | "coalesced" | "blocked" : never, c: typeof zh): string { return status === "queued" ? c.queued : status === "coalesced" ? c.coalesced : c.blocked; }
 function ruleSummary(timer: Timer, c: typeof zh): string { return timer.schedule.kind === "once" ? `${c.once} ${timer.schedule.localDateTime}` : timer.schedule.kind === "weekly" ? `${c.weekly} ${timer.schedule.localTime}` : `${c.every} ${timer.schedule.every} ${timer.schedule.unit === "hours" ? c.hours : c.days}`; }
 
 const zh = {
-  title: "定时 Prompt", close: "关闭", newTimer: "新建定时器", loading: "加载中…", refresh: "刷新", hostZone: "宿主机时区", empty: "当前对话还没有定时器。", promptCount: "条", next: "下次", disabled: "已停用", last: "最近触发", queued: "已排队", coalesced: "已合并", blocked: "受阻", timerTitle: "标题", enabled: "启用", queuePolicy: "队列位置", priority: "定时器优先", afterQueue: "等待当前队列", schedule: "规则", once: "一次", weekly: "每周", interval: "间隔", localTime: "本地日期与时间", localClock: "本地时间", startDate: "开始日期（可选）", endDate: "结束日期（可选）", every: "每", unit: "单位", hours: "小时", days: "天", anchor: "UTC 锚点（按本地输入）", optionalEnd: "结束时间（可选）", weekdays: ["一", "二", "三", "四", "五", "六", "日"], binding: "绑定对话", none: "无", rebind: "绑定当前对话", templates: "Prompt 模板", addTemplate: "添加模板", drag: "拖动排序", copy: "复制", delete: "删除", deleteTimer: "删除定时器", runNow: "立即运行", running: "登记中…", runDisabled: "重新打开并连接绑定的对话后才能立即运行", saving: "保存中…", save: "保存", create: "创建", deleteConfirm: "删除此定时器？已经进入队列和答案历史的记录会保留。", discardConfirm: "放弃尚未保存的定时器修改？", backgroundWarning: "启用定时器后，即使浏览器页面关闭，Promptor 后端也会继续保持运行并在到期时执行。确认启用？",
+  title: "定时 Prompt", close: "关闭", newTimer: "新建定时器", loading: "加载中…", refresh: "刷新", hostZone: "宿主机时区", empty: "当前对话还没有定时器。", promptCount: "条", next: "下次", disabled: "已停用", last: "最近触发", queued: "已排队", coalesced: "已合并", blocked: "受阻", timerTitle: "标题", enabled: "启用", queuePolicy: "队列位置", priority: "定时器优先", afterQueue: "等待当前队列", schedule: "规则", once: "一次", weekly: "每周", interval: "间隔", localTime: "本地日期与时间", localClock: "本地时间", startDate: "开始日期（可选）", endDate: "结束日期（可选）", every: "每", unit: "单位", hours: "小时", days: "天", anchor: "当地时间锚点", optionalEnd: "结束时间（可选）", weekdays: ["一", "二", "三", "四", "五", "六", "日"], binding: "绑定对话", none: "无", rebind: "绑定当前对话", templates: "Prompt 模板", addTemplate: "添加模板", drag: "拖动排序", copy: "复制", delete: "删除", deleteTimer: "删除定时器", runNow: "立即运行", running: "登记中…", runDisabled: "重新打开并连接绑定的对话后才能立即运行", saving: "保存中…", save: "保存", create: "创建", deleteConfirm: "删除此定时器？已经进入队列和答案历史的记录会保留。", backgroundWarning: "启用定时器后，即使浏览器页面关闭，Promptor 后端也会继续保持运行并在到期时执行。确认启用？",
 };
 const en: typeof zh = {
-  title: "Prompt timers", close: "Close", newTimer: "New timer", loading: "Loading…", refresh: "Refresh", hostZone: "Host time zone", empty: "No timers for this conversation.", promptCount: "prompts", next: "Next", disabled: "Disabled", last: "Last trigger", queued: "Queued", coalesced: "Coalesced", blocked: "Blocked", timerTitle: "Title", enabled: "Enabled", queuePolicy: "Queue position", priority: "Timer priority", afterQueue: "After current queue", schedule: "Schedule", once: "Once", weekly: "Weekly", interval: "Interval", localTime: "Local date and time", localClock: "Local time", startDate: "Start date (optional)", endDate: "End date (optional)", every: "Every", unit: "Unit", hours: "hours", days: "days", anchor: "UTC anchor (entered locally)", optionalEnd: "End time (optional)", weekdays: ["M", "T", "W", "T", "F", "S", "S"], binding: "Conversation binding", none: "None", rebind: "Bind current conversation", templates: "Prompt templates", addTemplate: "Add template", drag: "Drag to reorder", copy: "Duplicate", delete: "Delete", deleteTimer: "Delete timer", runNow: "Run now", running: "Registering…", runDisabled: "Reopen the bound conversation before running now", saving: "Saving…", save: "Save", create: "Create", deleteConfirm: "Delete this timer? Queue and answer history already created by it will remain.", discardConfirm: "Discard unsaved timer changes?", backgroundWarning: "An enabled timer keeps the Promptor backend running after browser pages close and executes when due. Enable it?",
+  title: "Prompt timers", close: "Close", newTimer: "New timer", loading: "Loading…", refresh: "Refresh", hostZone: "Host time zone", empty: "No timers for this conversation.", promptCount: "prompts", next: "Next", disabled: "Disabled", last: "Last trigger", queued: "Queued", coalesced: "Coalesced", blocked: "Blocked", timerTitle: "Title", enabled: "Enabled", queuePolicy: "Queue position", priority: "Timer priority", afterQueue: "After current queue", schedule: "Schedule", once: "Once", weekly: "Weekly", interval: "Interval", localTime: "Local date and time", localClock: "Local time", startDate: "Start date (optional)", endDate: "End date (optional)", every: "Every", unit: "Unit", hours: "hours", days: "days", anchor: "Local-time anchor", optionalEnd: "End time (optional)", weekdays: ["M", "T", "W", "T", "F", "S", "S"], binding: "Conversation binding", none: "None", rebind: "Bind current conversation", templates: "Prompt templates", addTemplate: "Add template", drag: "Drag to reorder", copy: "Duplicate", delete: "Delete", deleteTimer: "Delete timer", runNow: "Run now", running: "Registering…", runDisabled: "Reopen the bound conversation before running now", saving: "Saving…", save: "Save", create: "Create", deleteConfirm: "Delete this timer? Queue and answer history already created by it will remain.", backgroundWarning: "An enabled timer keeps the Promptor backend running after browser pages close and executes when due. Enable it?",
 };

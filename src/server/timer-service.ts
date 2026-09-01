@@ -253,7 +253,9 @@ export class TimerService {
       const now = this.now();
       let changed = false;
       const timers = file.timers.map((timer) => {
-        if (timer.timeZone === zone && (!timer.enabled || timer.nextRunAt !== null)) return timer;
+        const legacyUtcInterval = timer.schedule.kind === "interval"
+          && (/Z$/i.test(timer.schedule.anchorAt) || (timer.schedule.endAt !== null && /Z$/i.test(timer.schedule.endAt)));
+        if (!legacyUtcInterval && timer.timeZone === zone && (!timer.enabled || timer.nextRunAt !== null)) return timer;
         const normalized = normalizeTimerRule(timer.schedule, now);
         const enabled = timer.enabled && normalized.nextRunAt !== null;
         changed = true;
@@ -489,7 +491,15 @@ function assertPrecondition(header: string | string[] | undefined, currentEtag: 
 
 function parseDraft(input: unknown): z.output<typeof TimerDraftSchema> {
   try { return TimerDraftSchema.parse(input); }
-  catch (error) { throw new TimerServiceError(422, "INVALID_TIMER", error instanceof Error ? error.message : "Invalid timer."); }
+  catch (error) {
+    if (error instanceof z.ZodError && error.issues.some((issue) => issue.path.join(".") === "schedule.every")) {
+      throw new TimerServiceError(422, "INVALID_TIMER", "The interval must be a positive whole number.");
+    }
+    if (error instanceof z.ZodError) {
+      throw new TimerServiceError(422, "INVALID_TIMER", error.issues[0]?.message ?? "Invalid timer.");
+    }
+    throw new TimerServiceError(422, "INVALID_TIMER", error instanceof Error ? error.message : "Invalid timer.");
+  }
 }
 
 function normalizeDraftRule(schedule: unknown, now: Date) {

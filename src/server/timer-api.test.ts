@@ -94,6 +94,32 @@ describe("timer and common-prompt HTTP API", () => {
     expect(runOneShotBatch).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps interval anchors local and reports an invalid interval plainly", async () => {
+    const empty = await request("GET", `/api/tabs/${tabId}/timers`);
+    const etag = String(empty.headers.etag);
+    const interval = {
+      ...timerDraft(),
+      enabled: false,
+      schedule: { kind: "interval", every: 1.5, unit: "days", anchorAt: "2026-09-01T09:30", endAt: null },
+    };
+    const invalid = await request("POST", `/api/tabs/${tabId}/timers`, interval, { "if-match": etag });
+    expect(invalid.statusCode).toBe(422);
+    expect(invalid.json().error.message).toBe("The interval must be a positive whole number.");
+
+    const created = await request("POST", `/api/tabs/${tabId}/timers`, {
+      ...interval,
+      schedule: { ...interval.schedule, every: 1 },
+    }, { "if-match": etag });
+    expect(created.statusCode).toBe(200);
+    expect(created.json().data.timer.schedule).toEqual({
+      kind: "interval",
+      every: 1,
+      unit: "days",
+      anchorAt: "2026-09-01T09:30",
+      endAt: null,
+    });
+  });
+
   function request(method: string, url: string, payload?: unknown, extraHeaders: Record<string, string> = {}) {
     return app.inject({
       method: method as any,

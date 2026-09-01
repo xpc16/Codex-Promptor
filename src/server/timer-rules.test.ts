@@ -3,22 +3,24 @@ import { normalizeTimerRule, nextTimerRunAt, TimerRuleError } from "./timer-rule
 
 describe("timer rules", () => {
   it("normalizes an interval and coalesces missed occurrences", () => {
+    const anchor = new Date(2026, 7, 20, 0, 0);
+    const now = new Date(2026, 7, 27, 1, 0);
     const result = normalizeTimerRule({
       kind: "interval",
       every: 6,
       unit: "hours",
-      anchorAt: "2026-08-20T00:00:00Z",
+      anchorAt: anchor.toISOString(),
       endAt: null,
-    }, new Date("2026-08-27T01:00:00Z"));
+    }, now);
 
     expect(result.schedule).toEqual({
       kind: "interval",
       every: 6,
       unit: "hours",
-      anchorAt: "2026-08-20T00:00:00.000Z",
+      anchorAt: localDateTime(anchor),
       endAt: null,
     });
-    expect(result.nextRunAt).toBe("2026-08-27T06:00:00.000Z");
+    expect(result.nextRunAt).toBe(new Date(2026, 7, 27, 6, 0).toISOString());
   });
 
   it("returns the following interval when now is exactly an occurrence", () => {
@@ -26,9 +28,9 @@ describe("timer rules", () => {
       kind: "interval",
       every: 1,
       unit: "hours",
-      anchorAt: "2026-08-27T00:00:00.000Z",
+      anchorAt: "2026-08-27T00:00",
       endAt: null,
-    }, new Date("2026-08-27T03:00:00.000Z"))).toBe("2026-08-27T04:00:00.000Z");
+    }, new Date(2026, 7, 27, 3, 0))).toBe(new Date(2026, 7, 27, 4, 0).toISOString());
   });
 
   it("honours an inclusive interval end", () => {
@@ -36,11 +38,11 @@ describe("timer rules", () => {
       kind: "interval" as const,
       every: 1,
       unit: "hours" as const,
-      anchorAt: "2026-08-27T00:00:00.000Z",
-      endAt: "2026-08-27T02:00:00.000Z",
+      anchorAt: "2026-08-27T00:00",
+      endAt: "2026-08-27T02:00",
     };
-    expect(nextTimerRunAt(schedule, new Date("2026-08-27T01:00:00.000Z"))).toBe("2026-08-27T02:00:00.000Z");
-    expect(nextTimerRunAt(schedule, new Date("2026-08-27T02:00:00.000Z"))).toBeNull();
+    expect(nextTimerRunAt(schedule, new Date(2026, 7, 27, 1, 0))).toBe(new Date(2026, 7, 27, 2, 0).toISOString());
+    expect(nextTimerRunAt(schedule, new Date(2026, 7, 27, 2, 0))).toBeNull();
   });
 
   it("rejects a past one-time schedule when saving", () => {
@@ -83,6 +85,25 @@ describe("timer rules", () => {
       endDate: "2026-09-01",
     })).toThrow(TimerRuleError);
   });
+
+  it("keeps a daily interval on the same host-local clock time across DST", () => {
+    const priorTimeZone = process.env.TZ;
+    process.env.TZ = "America/New_York";
+    try {
+      const next = nextTimerRunAt({
+        kind: "interval",
+        every: 1,
+        unit: "days",
+        anchorAt: "2026-03-07T09:00",
+        endAt: null,
+      }, new Date("2026-03-07T15:00:00.000Z"));
+      expect(next).toBe("2026-03-08T13:00:00.000Z");
+      expect(new Date(next!).getHours()).toBe(9);
+    } finally {
+      if (priorTimeZone === undefined) delete process.env.TZ;
+      else process.env.TZ = priorTimeZone;
+    }
+  });
 });
 
 function localMinute(offset: number, base = new Date()): string {
@@ -92,6 +113,10 @@ function localMinute(offset: number, base = new Date()): string {
 
 function localDate(value: Date): string {
   return `${value.getFullYear()}-${two(value.getMonth() + 1)}-${two(value.getDate())}`;
+}
+
+function localDateTime(value: Date): string {
+  return `${localDate(value)}T${two(value.getHours())}:${two(value.getMinutes())}`;
 }
 
 function two(value: number): string { return String(value).padStart(2, "0"); }
