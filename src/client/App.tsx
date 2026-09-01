@@ -57,7 +57,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { api, jsonBody, promptorToken as token } from "./api-client.js";
-import { SafeMarkdown } from "./safe-markdown.js";
+import { MarkdownView, preloadMarkdownView } from "./markdown-view.js";
 import { DocumentView, useDocumentViewer, type DocumentOpenIntent } from "./document-viewer.js";
 import { insertCommonPrompt, type DraftSelection } from "./prompt-insertion.js";
 import { placeGroupAfter, placeTab } from "./navigation-placement.js";
@@ -222,6 +222,9 @@ export function App() {
   }, [adoptIndex, markRecentCompletion]);
 
   useEffect(() => { void refresh(); }, [refresh]);
+  // Off the critical path, but not left until the reader scrolls to an
+  // answer: asked for once the page is painted and usable.
+  useEffect(() => { preloadMarkdownView(); }, []);
   useEffect(() => { if (index) document.documentElement.dataset.theme = index.ui.theme; }, [index?.ui.theme]);
   useEffect(() => { document.documentElement.lang = locale; }, [locale]);
   useEffect(() => {
@@ -1094,7 +1097,7 @@ function AnswerHistory({ answers, total, hasEarlier, onLoadEarlier, onDocumentLi
       {answer.finalAnswer ? <>
         {isRunning && <div className="answer-lifecycle running"><span className="status-dot running" />{t("answers.waitingFinal")}</div>}
         {isPartial && <div className={`answer-lifecycle partial ${answer.status}`}><strong>{answer.status === "completed" ? t("answers.partial") : statusLabel}</strong><span>{t("answers.partialDetail")}</span></div>}
-        <div className="markdown"><SafeMarkdown source={answer.finalAnswer} onDocumentLink={(href) => onDocumentLink(href, answer.id)} /></div>
+        <div className="markdown"><MarkdownView source={answer.finalAnswer} onDocumentLink={(href) => onDocumentLink(href, answer.id)} /></div>
       </> : answer.status === "running" ? <div className="answer-lifecycle running"><span className="status-dot running" />{t("answers.waitingFinal")}</div> : <div className={`answer-lifecycle ${answer.status}`}><strong>{statusLabel}</strong><span>{answer.error ? i18n.errorText(answer.error) : t(answer.status === "interrupted" ? "answers.interruptedDetail" : "answers.failedDetail")}</span></div>}
       {answer.status !== "running" && <div className="answer-ended"><time>{t("answers.endedAt")} {i18n.formatTime(answer.completedAt)}</time></div>}
     </article>;

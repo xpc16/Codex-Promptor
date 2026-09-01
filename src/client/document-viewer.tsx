@@ -3,7 +3,8 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { extractDocumentTarget } from "../shared/document-link.js";
 import type { DocumentOpenRequest } from "../shared/document-protocol.js";
 import { DocumentLoader, type DocumentViewerState } from "./document-loader.js";
-import { planMarkdownHeadingIds, SafeMarkdown } from "./safe-markdown.js";
+import { planMarkdownHeadingIds } from "./markdown-headings.js";
+import { MarkdownView } from "./markdown-view.js";
 import { useI18n } from "./i18n.js";
 
 export type DocumentOpenIntent = {
@@ -84,7 +85,7 @@ export function DocumentView({ state, loader, onClose }: { state: DocumentViewer
     <div className="document-scroll" ref={scroll} onScroll={onScroll}>
       {state.kind === "text" && <pre className="document-text">{state.textSegments}</pre>}
       {state.kind === "markdown" && <div className="document-markdown markdown">
-        {state.markdownBlocks.map((block, index) => <div className="document-markdown-block" style={{ contentVisibility: "auto", containIntrinsicSize: "1px 160px" }} key={`${state.documentEpoch}:${index}`}><SafeMarkdown source={block} headingIds={headingIds[index]} onDocumentLink={openNestedDocument} /></div>)}
+        {state.markdownBlocks.map((block, index) => <div className="document-markdown-block" style={{ contentVisibility: "auto", containIntrinsicSize: "1px 160px" }} key={`${state.documentEpoch}:${index}`}><MarkdownView source={block} headingIds={headingIds[index]} onDocumentLink={openNestedDocument} /></div>)}
         {state.pendingMarkdown && <pre className="document-markdown-pending">{state.pendingMarkdown}</pre>}
       </div>}
       {state.status === "loading" && <div className="document-loading"><span className="spinner" />{t("document.loading")}</div>}

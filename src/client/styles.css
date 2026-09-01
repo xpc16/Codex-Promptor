@@ -247,6 +247,8 @@ input, textarea, select { color: var(--text); }
 .answer-lifecycle.interrupted strong, .answer-lifecycle.failed strong { color: var(--danger); }
 .answer-lifecycle.partial { margin-bottom: 9px; padding: 6px 9px; font-size: 12px; }
 .answer-ended { display: flex; justify-content: flex-end; margin-top: 10px; font-size: 12px; }
+/* The answer while its renderer is still downloading: readable, unformatted. */
+.markdown-pending { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); }
 .markdown { min-width: 0; max-width: 100%; color: var(--text); font-size: 14px; line-height: 1.65; overflow-wrap: anywhere; word-break: break-word; }
 .markdown p { margin: 7px 0; }
 .markdown h1, .markdown h2, .markdown h3, .markdown h4 { margin: 15px 0 7px; line-height: 1.35; }

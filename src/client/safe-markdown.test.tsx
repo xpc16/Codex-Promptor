@@ -1,7 +1,8 @@
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { planMarkdownHeadingIds, SafeMarkdown, slugHeading } from "./safe-markdown.js";
+import { SafeMarkdown } from "./safe-markdown.js";
+import { planMarkdownHeadingIds, slugHeading } from "./markdown-headings.js";
 
 describe("SafeMarkdown", () => {
   it("keeps document anchors while stripping scripts and images", () => {
