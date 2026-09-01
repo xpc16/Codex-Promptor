@@ -86,4 +86,48 @@ describe("Claude Code provider", () => {
     expect((await manager.rpc.waitForTurn("prompt-4")).turn.status).toBe("interrupted");
     await expect(manager.rpc.startTurn("session-2", "too late", "client-5", directory)).rejects.toThrow("SESSION_NOT_READY");
   });
+
+  it("returns a transcript-reconciled completion instead of losing the finished turn", async () => {
+    const submitted: string[] = [];
+    const fakePty = {
+      submitPrompt: (_tabId: string, text: string) => { submitted.push(text); return true; },
+      write: () => undefined,
+    } as any;
+    const manager = new ClaudeCodeManager("tab-reconcile", fakePty);
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-claude-reconcile-"));
+    temporaryDirectories.push(directory);
+    const transcriptPath = path.join(directory, "session-reconcile.jsonl");
+    await fs.writeFile(transcriptPath, "", "utf8");
+    await manager.beginLaunch({
+      cwd: directory,
+      launch: { mode: "new" },
+      hookScriptPath: path.join(process.cwd(), "scripts", "claude-hook.mjs"),
+      settingsPath: path.join(directory, "settings.json"),
+      theme: "light",
+      exitMarker: "__CLAUDE_PROMPTOR_EXIT__:test:",
+    });
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "session-reconcile", cwd: directory, transcript_path: transcriptPath });
+
+    const starting = manager.rpc.startTurn("session-reconcile", "reconcile this", "client-reconcile", directory);
+    await vi.waitFor(() => expect(submitted).toEqual(["reconcile this"]));
+    await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-reconcile", prompt_id: "prompt-reconcile", prompt: "reconcile this" });
+    expect((await starting).turnId).toBe("prompt-reconcile");
+    await fs.appendFile(transcriptPath, [
+      JSON.stringify({ type: "user", uuid: "prompt-reconcile", timestamp: "2026-09-01T09:00:00.000Z", message: { role: "user", content: "reconcile this" } }),
+      JSON.stringify({ type: "assistant", timestamp: "2026-09-01T09:00:05.000Z", message: { role: "assistant", content: [{ type: "text", text: "recovered answer" }], stop_reason: "end_turn" } }),
+      "",
+    ].join("\n"), "utf8");
+
+    vi.useFakeTimers();
+    try {
+      const waiting = manager.rpc.waitForTurn("prompt-reconcile");
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(waiting).resolves.toMatchObject({
+        turn: { id: "prompt-reconcile", status: "completed" },
+        items: [{ type: "userMessage", text: "reconcile this" }, { type: "agentMessage", phase: "final_answer", text: "recovered answer" }],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

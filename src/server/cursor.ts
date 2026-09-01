@@ -230,9 +230,9 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
   }
 
   private async waitForTurn(turnId: string): Promise<{ turn: any; items: any[] }> {
-    const completed = this.completed.get(turnId);
-    if (completed) return completed;
     while (true) {
+      const completed = this.completed.get(turnId);
+      if (completed) return completed;
       const active = this.turns.get(turnId);
       if (!active) throw new Error(`CURSOR_TURN_NOT_FOUND:${turnId}`);
       const result = await Promise.race([
