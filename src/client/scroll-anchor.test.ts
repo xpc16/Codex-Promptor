@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bufferedWheelHandoff, BOTTOM_SLACK, isAtBottom, isNearTop, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
+import { bufferedWheelHandoff, BOTTOM_SLACK, isAtBottom, isNearTop, settleAtTail, shouldHandoffWheel, wheelDeltaPixels } from "./scroll-anchor.js";
 
 const at = (scrollTop: number) => ({ scrollTop, scrollHeight: 1_000, clientHeight: 400 });
 
@@ -23,6 +23,22 @@ describe("following new content", () => {
 
   it("follows rather than freezing when the measurements are unusable", () => {
     expect(isAtBottom({ scrollTop: Number.NaN, scrollHeight: 1_000, clientHeight: 400 })).toBe(true);
+  });
+
+  it("keeps a newly added row visible while its text and action row settle", () => {
+    const list = { scrollTop: 0, scrollHeight: 100 };
+    const frames: Array<() => void> = [];
+    settleAtTail(() => list, (callback) => frames.push(callback));
+    expect(list.scrollTop).toBe(100);
+
+    list.scrollHeight = 150;
+    frames.shift()?.();
+    expect(list.scrollTop).toBe(150);
+
+    list.scrollHeight = 184;
+    frames.shift()?.();
+    expect(list.scrollTop).toBe(184);
+    expect(frames).toHaveLength(0);
   });
 });
 

@@ -34,7 +34,7 @@ import { applyTabMessage } from "./tab-bundle-delta.js";
 import { forgetCachedTab, readCachedTab, rememberTab, retainCachedTabs, windowLimits } from "./tab-cache.js";
 import { clampPaneSize, CONSOLE_WIDTH, conversationSplit, queueTerminalSplit, readPaneSize, readStoredPaneSize, workspaceSplit, writePaneSize } from "./pane-size.js";
 import { onPaneDragEnd, PaneDrag, paneDragActive } from "./pane-drag.js";
-import { bufferedWheelHandoff, isAtBottom, isNearTop, wheelDeltaPixels, type WheelHandoffBufferState } from "./scroll-anchor.js";
+import { bufferedWheelHandoff, isAtBottom, isNearTop, settleAtTail, wheelDeltaPixels, type WheelHandoffBufferState } from "./scroll-anchor.js";
 import { clearPromptDraft, readPromptDraft, readSessionFormDraft, writePromptDraft, writeSessionFormDraft } from "./prompt-draft.js";
 import { clampPromptComposerHeight, draggedPromptComposerHeight } from "./prompt-composer-resize.js";
 import { autoSizedHeight, autoSizedLines, readTextareaMetrics } from "./textarea-autosize.js";
@@ -715,6 +715,11 @@ function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: num
     if (isNearTop(element)) void revealEarlier();
   }, [revealEarlier]);
 
+  const followTail = useCallback(() => {
+    following.current = true;
+    settleAtTail(() => scrollRef.current);
+  }, []);
+
   useLayoutEffect(() => {
     const element = scrollRef.current;
     if (!element) return;
@@ -731,7 +736,7 @@ function useTailWindow<T>(items: readonly T[], contentKey: string, pageSize: num
     setVisibleCount((current) => Math.max(Math.min(current, items.length), Math.min(pageSize, items.length)));
   }, [items.length, pageSize]);
 
-  return { onScroll, scrollRef, startIndex, visibleItems, revealEarlier, revealing, canRevealEarlier: hasEarlier || visibleCount < items.length };
+  return { onScroll, scrollRef, startIndex, visibleItems, revealEarlier, revealing, followTail, canRevealEarlier: hasEarlier || visibleCount < items.length };
 }
 
 function LoadEarlier({ shown, busy, label, busyLabel, onReveal }: { shown: boolean; busy: boolean; label: string; busyLabel: string; onReveal: () => void }) {
@@ -1150,7 +1155,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     return () => window.clearInterval(timer);
   }, [stalledSince]);
   const stalledFor = stalledSince ? stalledMinutes(stalledSince, Date.now()) : null;
-  const { onScroll: onPromptScroll, scrollRef: promptWindow, startIndex: promptStartIndex, visibleItems: visiblePrompts, revealEarlier: revealEarlierPrompts, revealing: revealingPrompts, canRevealEarlier: canRevealEarlierPrompts } = useTailWindow(prompts, promptContentKey, 24, hasEarlier, onLoadEarlier);
+  const { onScroll: onPromptScroll, scrollRef: promptWindow, startIndex: promptStartIndex, visibleItems: visiblePrompts, revealEarlier: revealEarlierPrompts, revealing: revealingPrompts, followTail: followPromptTail, canRevealEarlier: canRevealEarlierPrompts } = useTailWindow(prompts, promptContentKey, 24, hasEarlier, onLoadEarlier);
   const runtime = bundle.runtime;
   // Two different facts, and they come apart: the agent can be idle between
   // prompts while the queue is still set to keep feeding it, and the agent can
@@ -1183,7 +1188,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     setAdding(true);
     // Only drop the draft once the prompt is safely on the list; a failed add
     // must leave the text exactly where the user can retry it.
-    try { const echo = await api(`/api/tabs/${bundle.tab.id}/prompts`, jsonBody({ text })); setNewText(""); clearPromptDraft(tabId); onChanged(echo); }
+    try { const echo = await api(`/api/tabs/${bundle.tab.id}/prompts`, jsonBody({ text })); setNewText(""); clearPromptDraft(tabId); followPromptTail(); onChanged(echo); }
     catch (reason) { onError(reason); }
     finally { setAdding(false); }
   };

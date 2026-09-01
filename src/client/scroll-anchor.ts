@@ -8,6 +8,8 @@
  * to look away to.
  */
 export type ScrollPosition = { scrollTop: number; scrollHeight: number; clientHeight: number };
+export type TailScrollable = Pick<ScrollPosition, "scrollTop" | "scrollHeight">;
+export type FrameScheduler = (callback: () => void) => unknown;
 
 /** Close enough to the bottom that the reader means to be following along. */
 export const BOTTOM_SLACK = 24;
@@ -42,6 +44,28 @@ export function isAtBottom({ scrollTop, scrollHeight, clientHeight }: ScrollPosi
 
 export function isNearTop({ scrollTop }: Pick<ScrollPosition, "scrollTop">, trigger = TOP_TRIGGER): boolean {
   return Number.isFinite(scrollTop) && scrollTop <= Math.max(0, trigger);
+}
+
+/**
+ * Pins a list to its tail now and across the next two layout frames.
+ *
+ * A newly mounted prompt first measures its wrapped textarea, then may move its
+ * action buttons onto a second row. Those two layout steps can increase the
+ * list after the first scroll, so one immediate `scrollTop` assignment leaves
+ * the bottom controls clipped.
+ */
+export function settleAtTail(
+  element: () => TailScrollable | null,
+  schedule: FrameScheduler = (callback) => requestAnimationFrame(callback),
+  deferredPasses = 2,
+): void {
+  const scroll = (remaining: number) => {
+    const current = element();
+    if (!current) return;
+    current.scrollTop = current.scrollHeight;
+    if (remaining > 0) schedule(() => scroll(remaining - 1));
+  };
+  scroll(Math.max(0, Math.trunc(deferredPasses)));
 }
 
 /**
