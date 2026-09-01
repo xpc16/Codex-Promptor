@@ -6,8 +6,9 @@ import {
 const LOCAL_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 const LOCAL_TIME = /^(\d{2}):(\d{2})$/;
 const LOCAL_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/;
-const HOUR_MS = 60 * 60 * 1_000;
-const DAY_MS = 24 * HOUR_MS;
+const MINUTE_MS = 60 * 1_000;
+const HOUR_MINUTES = 60;
+const DAY_MINUTES = 24 * HOUR_MINUTES;
 
 export class TimerRuleError extends Error {
   readonly code = "INVALID_TIMER_SCHEDULE";
@@ -71,16 +72,18 @@ export function normalizeTimerRule(
 
   const anchor = intervalDateTime(schedule.anchorAt, "The interval anchor must be a local date and time.");
   const end = schedule.endAt === null ? null : intervalDateTime(schedule.endAt, "The interval end must be a local date and time.");
-  const step = schedule.every * (schedule.unit === "hours" ? HOUR_MS : DAY_MS);
-  if (!Number.isSafeInteger(step) || step <= 0) throw new TimerRuleError("The interval is too large.");
+  const every = roundHundredths(schedule.every);
+  if (every <= 0) throw new TimerRuleError("The interval must be at least 0.01 hours or days.");
   if (end && end.getTime() < anchor.getTime()) {
     throw new TimerRuleError("The interval end must not precede its anchor.");
   }
   const normalized: TimerSchedule = {
     ...schedule,
+    every,
     anchorAt: formatLocalDateTime(anchor),
     endAt: end ? formatLocalDateTime(end) : null,
   };
+  intervalStepMinutes(normalized);
   return { schedule: normalized, nextRunAt: nextIntervalRun(normalized, now) };
 }
 
@@ -113,18 +116,19 @@ function nextWeeklyRun(schedule: Extract<TimerSchedule, { kind: "weekly" }>, now
 function nextIntervalRun(schedule: Extract<TimerSchedule, { kind: "interval" }>, now: Date): string | null {
   const anchor = intervalDateTime(schedule.anchorAt, "Invalid interval anchor.");
   const end = schedule.endAt === null ? null : intervalDateTime(schedule.endAt, "Invalid interval end.");
-  const step = schedule.every * (schedule.unit === "hours" ? HOUR_MS : DAY_MS);
+  const stepMinutes = intervalStepMinutes(schedule);
+  const step = stepMinutes * MINUTE_MS;
   const elapsed = now.getTime() - anchor.getTime();
   let index = elapsed < 0 ? 0 : Math.floor(elapsed / step) + 1;
-  let occurrence = localIntervalOccurrence(anchor, schedule.every, schedule.unit, index);
+  let occurrence = localIntervalOccurrence(anchor, stepMinutes, index);
 
   // The nominal millisecond estimate is exact outside offset changes. These
   // short corrections handle DST gaps/folds without walking old occurrences.
   while (Number.isFinite(occurrence.getTime()) && occurrence.getTime() <= now.getTime()) {
-    occurrence = localIntervalOccurrence(anchor, schedule.every, schedule.unit, ++index);
+    occurrence = localIntervalOccurrence(anchor, stepMinutes, ++index);
   }
   while (index > 0) {
-    const previous = localIntervalOccurrence(anchor, schedule.every, schedule.unit, index - 1);
+    const previous = localIntervalOccurrence(anchor, stepMinutes, index - 1);
     if (!Number.isFinite(previous.getTime()) || previous.getTime() <= now.getTime()) break;
     occurrence = previous;
     index -= 1;
@@ -134,12 +138,22 @@ function nextIntervalRun(schedule: Extract<TimerSchedule, { kind: "interval" }>,
   return occurrence.toISOString();
 }
 
-function localIntervalOccurrence(anchor: Date, every: number, unit: "hours" | "days", index: number): Date {
-  const amount = every * index;
+function localIntervalOccurrence(anchor: Date, stepMinutes: number, index: number): Date {
+  const amount = stepMinutes * index;
   if (!Number.isSafeInteger(amount)) return new Date(Number.NaN);
-  return unit === "hours"
-    ? new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate(), anchor.getHours() + amount, anchor.getMinutes(), 0, 0)
-    : new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + amount, anchor.getHours(), anchor.getMinutes(), 0, 0);
+  // Date's local-field normalization keeps calendar-day intervals anchored to
+  // the host wall clock across daylight-saving transitions.
+  return new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate(), anchor.getHours(), anchor.getMinutes() + amount, 0, 0);
+}
+
+function intervalStepMinutes(schedule: Extract<TimerSchedule, { kind: "interval" }>): number {
+  const minutes = Math.round(schedule.every * (schedule.unit === "hours" ? HOUR_MINUTES : DAY_MINUTES));
+  if (!Number.isSafeInteger(minutes) || minutes <= 0) throw new TimerRuleError("The interval is too large or rounds to less than one minute.");
+  return minutes;
+}
+
+function roundHundredths(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
 function localDateTime(value: string): Date {

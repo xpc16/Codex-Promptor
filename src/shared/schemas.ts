@@ -248,7 +248,9 @@ export const WeeklyScheduleSchema = z.object({
 
 export const IntervalScheduleSchema = z.object({
   kind: z.literal("interval"),
-  every: z.number().int().positive(),
+  // Drafts may contain more precision; the server stores this value rounded
+  // to two decimals and converts the recurrence to a whole-minute step.
+  every: z.number().positive(),
   unit: z.enum(["hours", "days"]),
   anchorAt: z.string(),
   endAt: z.string().nullable(),

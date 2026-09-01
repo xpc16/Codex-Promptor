@@ -19,6 +19,7 @@ import { StorageService } from "./storage.js";
 import { hostTimeZone, nextTimerRunAt, normalizeTimerRule } from "./timer-rules.js";
 
 const MAX_WAKE_DELAY_MS = 30_000;
+const INTERVAL_JITTER_MAX_SECONDS = 3 * 60;
 const ACTIVE_STATUSES = new Set(["pending", "dispatching", "running"]);
 
 const TimerDraftSchema = z.object({
@@ -287,7 +288,7 @@ export class TimerService {
       .flatMap((file) => file.timers)
       .filter((timer) => timer.enabled && timer.nextRunAt)
       .reduce<number | null>((best, timer) => {
-        const value = Date.parse(timer.nextRunAt!);
+        const value = timerEffectiveRunAt(timer);
         return Number.isFinite(value) && (best === null || value < best) ? value : best;
       }, null);
     if (nearest === null) return;
@@ -305,7 +306,7 @@ export class TimerService {
     try {
       const now = this.now();
       const due = [...this.files.entries()].flatMap(([tabId, file]) => file.timers
-        .filter((timer) => timer.enabled && timer.nextRunAt && Date.parse(timer.nextRunAt) <= now.getTime())
+        .filter((timer) => timer.enabled && timer.nextRunAt && timerEffectiveRunAt(timer) <= now.getTime())
         .map((timer) => ({ tabId, timerId: timer.id, scheduledFor: timer.nextRunAt! })));
       for (const item of due) await this.triggerScheduled(item.tabId, item.timerId, item.scheduledFor);
     } finally {
@@ -493,7 +494,7 @@ function parseDraft(input: unknown): z.output<typeof TimerDraftSchema> {
   try { return TimerDraftSchema.parse(input); }
   catch (error) {
     if (error instanceof z.ZodError && error.issues.some((issue) => issue.path.join(".") === "schedule.every")) {
-      throw new TimerServiceError(422, "INVALID_TIMER", "The interval must be a positive whole number.");
+      throw new TimerServiceError(422, "INVALID_TIMER", "The interval must be a positive number.");
     }
     if (error instanceof z.ZodError) {
       throw new TimerServiceError(422, "INVALID_TIMER", error.issues[0]?.message ?? "Invalid timer.");
@@ -542,6 +543,19 @@ function advanceTimer(timer: Timer, now: Date): Timer {
   if (timer.schedule.kind === "once") return { ...timer, enabled: false, nextRunAt: null };
   const nextRunAt = nextTimerRunAt(timer.schedule, now);
   return { ...timer, enabled: nextRunAt !== null, nextRunAt };
+}
+
+/**
+ * Interval rules keep their nominal time in `nextRunAt`; only dispatch is
+ * delayed. A stable pseudo-random offset gives every occurrence independent
+ * 0-3 minute jitter without adding state or changing after a backend restart.
+ */
+export function timerEffectiveRunAt(timer: Pick<Timer, "id" | "schedule" | "nextRunAt">): number {
+  const nominal = timer.nextRunAt === null ? Number.NaN : Date.parse(timer.nextRunAt);
+  if (!Number.isFinite(nominal) || timer.schedule.kind !== "interval") return nominal;
+  const hash = createHash("sha256").update(`${timer.id}\0${timer.nextRunAt}`).digest();
+  const jitterSeconds = hash.readUInt32BE(0) % (INTERVAL_JITTER_MAX_SECONDS + 1);
+  return nominal + jitterSeconds * 1_000;
 }
 
 function firstPendingIndex(prompts: readonly PromptRecord[], threadId: string): number {

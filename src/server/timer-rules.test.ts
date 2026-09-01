@@ -33,6 +33,30 @@ describe("timer rules", () => {
     }, new Date(2026, 7, 27, 3, 0))).toBe(new Date(2026, 7, 27, 4, 0).toISOString());
   });
 
+  it("stores two decimal places and rounds fractional hours to whole minutes", () => {
+    const anchor = new Date(2026, 7, 27, 0, 0);
+    const result = normalizeTimerRule({
+      kind: "interval",
+      every: 0.106,
+      unit: "hours",
+      anchorAt: localDateTime(anchor),
+      endAt: null,
+    }, anchor);
+
+    expect(result.schedule).toMatchObject({ kind: "interval", every: 0.11 });
+    expect(result.nextRunAt).toBe(new Date(2026, 7, 27, 0, 7).toISOString());
+  });
+
+  it("rejects an interval that becomes zero after keeping two decimals", () => {
+    expect(() => normalizeTimerRule({
+      kind: "interval",
+      every: 0.004,
+      unit: "days",
+      anchorAt: "2026-08-27T00:00",
+      endAt: null,
+    })).toThrow(TimerRuleError);
+  });
+
   it("honours an inclusive interval end", () => {
     const schedule = {
       kind: "interval" as const,

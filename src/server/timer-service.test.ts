@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isoNow, newPrompt } from "../shared/schemas.js";
 import { StorageService } from "./storage.js";
-import { TimerService, timerFileEtag, timerOccurrenceId, timerPromptId } from "./timer-service.js";
+import { TimerService, timerEffectiveRunAt, timerFileEtag, timerOccurrenceId, timerPromptId } from "./timer-service.js";
 
 const roots: string[] = [];
 
@@ -118,6 +118,44 @@ describe("timer scheduler", () => {
     expect(file.timers[0].lastTrigger).toMatchObject({ source: "scheduled", status: "queued" });
     expect((await storage.readPromptsOnly(tabId)).prompts).toHaveLength(1);
     expect(holds).toContain(true);
+    await service.stop();
+  });
+
+  it("waits for a stable 0-3 minute interval offset before submitting", async () => {
+    const { storage, tabId } = await fixture();
+    let now = new Date(2026, 8, 1, 9, 0);
+    const batches: string[][] = [];
+    const service = new TimerService(
+      storage,
+      () => ({ runOneShotBatch: async (ids) => { batches.push([...ids]); } }),
+      () => undefined,
+      () => new Date(now),
+    );
+    const empty = await service.getTimers(tabId);
+    const created = await service.createTimer(tabId, {
+      title: "Fractional interval",
+      enabled: true,
+      externalQueuePolicy: "after_running_queue",
+      schedule: { kind: "interval", every: 0.251, unit: "hours", anchorAt: localMinute(0, now), endAt: null },
+      prompts: [{ id: "template-interval", text: "scheduled prompt" }],
+    }, empty.etag);
+    const nominal = new Date(2026, 8, 1, 9, 15).getTime();
+    const effective = timerEffectiveRunAt(created.timer);
+
+    expect(created.timer.schedule).toMatchObject({ kind: "interval", every: 0.25 });
+    expect(Date.parse(created.timer.nextRunAt!)).toBe(nominal);
+    expect(effective).toBeGreaterThanOrEqual(nominal);
+    expect(effective).toBeLessThanOrEqual(nominal + 3 * 60_000);
+    expect(timerEffectiveRunAt(created.timer)).toBe(effective);
+
+    await service.start();
+    now = new Date(effective - 1);
+    await (service as unknown as { checkDueTimers(): Promise<void> }).checkDueTimers();
+    expect(batches).toHaveLength(0);
+    now = new Date(effective);
+    await (service as unknown as { checkDueTimers(): Promise<void> }).checkDueTimers();
+    expect(batches).toHaveLength(1);
+    expect((await storage.readTimers(tabId)).timers[0].lastTrigger?.scheduledFor).toBe(new Date(nominal).toISOString());
     await service.stop();
   });
 });

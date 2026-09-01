@@ -94,26 +94,26 @@ describe("timer and common-prompt HTTP API", () => {
     expect(runOneShotBatch).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps interval anchors local and reports an invalid interval plainly", async () => {
+  it("keeps interval anchors local and normalizes fractional intervals", async () => {
     const empty = await request("GET", `/api/tabs/${tabId}/timers`);
     const etag = String(empty.headers.etag);
     const interval = {
       ...timerDraft(),
       enabled: false,
-      schedule: { kind: "interval", every: 1.5, unit: "days", anchorAt: "2026-09-01T09:30", endAt: null },
+      schedule: { kind: "interval", every: 0.004, unit: "days", anchorAt: "2026-09-01T09:30", endAt: null },
     };
     const invalid = await request("POST", `/api/tabs/${tabId}/timers`, interval, { "if-match": etag });
     expect(invalid.statusCode).toBe(422);
-    expect(invalid.json().error.message).toBe("The interval must be a positive whole number.");
+    expect(invalid.json().error.message).toBe("The interval must be at least 0.01 hours or days.");
 
     const created = await request("POST", `/api/tabs/${tabId}/timers`, {
       ...interval,
-      schedule: { ...interval.schedule, every: 1 },
+      schedule: { ...interval.schedule, every: 1.236 },
     }, { "if-match": etag });
     expect(created.statusCode).toBe(200);
     expect(created.json().data.timer.schedule).toEqual({
       kind: "interval",
-      every: 1,
+      every: 1.24,
       unit: "days",
       anchorAt: "2026-09-01T09:30",
       endAt: null,
