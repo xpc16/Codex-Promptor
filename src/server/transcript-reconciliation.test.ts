@@ -32,6 +32,23 @@ describe("provider transcript reconciliation", () => {
     });
   });
 
+  it("confirms a Codex submission when the native terminal drops smart double quotes", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-rollout-smart-quotes-"));
+    temporaryDirectories.push(directory);
+    const file = path.join(directory, "rollout-session.jsonl");
+    const records = [
+      { timestamp: "2026-09-01T13:04:58.700Z", payload: { type: "task_started", turn_id: "turn-smart-quotes" } },
+      { timestamp: "2026-09-01T13:04:58.742Z", payload: { type: "item_completed", turn_id: "turn-smart-quotes", item: { type: "UserMessage", content: [{ type: "text", text: "repair no progress state" }] } } },
+    ];
+    await fs.writeFile(file, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+
+    await expect(inspectCodexSubmission(
+      { path: file, offset: 0 },
+      "repair \u201cno progress\u201d state",
+      "session",
+    )).resolves.toMatchObject({ state: "accepted", turnId: "turn-smart-quotes" });
+  });
+
   it("retries Enter only when the recognized rollout has not grown", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-rollout-empty-"));
     temporaryDirectories.push(directory);

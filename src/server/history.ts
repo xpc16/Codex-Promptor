@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isoNow, type AnswerRecord, type Origin, type PromptRecord, newPrompt, type TabBundle } from "../shared/schemas.js";
+import { sameSubmittedPrompt } from "./prompt-submit.js";
 import { StorageService } from "./storage.js";
 
 const normalizeType = (value: unknown) => String(value ?? "").replace(/[_-]/g, "").toLowerCase();
@@ -92,6 +93,50 @@ export function protocolTime(value: unknown): string | null {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+const RECOVERABLE_SUBMISSION_WINDOW_MS = 2 * 60_000;
+const INTERRUPTED_SUBMISSION_PREFIX = "submission-interrupted:";
+
+type RecoverableSubmission = {
+  prompt: PromptRecord;
+  attempt: PromptRecord["attempts"][number];
+  previousTurnId: string | null;
+};
+
+/**
+ * Finds one queue submission that reached the provider but lost its hook/turn
+ * linkage. Text equivalence alone is not enough: the local attempt must still
+ * have no provider turn (or only the synthetic interrupted-submission id), and
+ * its start must be close to the provider turn. Ambiguity fails closed.
+ */
+function recoverableSubmissionForTurn(
+  prompts: PromptRecord[],
+  threadId: string,
+  turn: any,
+  inputText: string,
+): RecoverableSubmission | null {
+  const turnStartedAt = protocolTime(turn?.startedAt);
+  const turnStartedMs = turnStartedAt ? Date.parse(turnStartedAt) : Number.NaN;
+  if (!Number.isFinite(turnStartedMs)) return null;
+  const matches: RecoverableSubmission[] = [];
+  for (const prompt of prompts) {
+    if ((prompt.origin !== "queue" && prompt.origin !== "timer")
+      || (prompt.threadId && prompt.threadId !== threadId)
+      || !["dispatching", "running", "interrupted"].includes(prompt.status)
+      || !sameSubmittedPrompt(prompt.text, inputText)) continue;
+    const previousTurnId = prompt.codexTurnId;
+    if (previousTurnId && !previousTurnId.startsWith(INTERRUPTED_SUBMISSION_PREFIX)) continue;
+    const attempt = [...prompt.attempts].reverse().find((item) => item.delivery === "turn"
+      && ["dispatching", "running", "interrupted"].includes(item.status)
+      && (!item.codexTurnId || item.codexTurnId.startsWith(INTERRUPTED_SUBMISSION_PREFIX)));
+    if (!attempt) continue;
+    const attemptStartedAt = protocolTime(attempt.startedAt ?? prompt.startedAt);
+    const attemptStartedMs = attemptStartedAt ? Date.parse(attemptStartedAt) : Number.NaN;
+    if (!Number.isFinite(attemptStartedMs) || Math.abs(turnStartedMs - attemptStartedMs) > RECOVERABLE_SUBMISSION_WINDOW_MS) continue;
+    matches.push({ prompt, attempt, previousTurnId });
+  }
+  return matches.length === 1 ? matches[0] : null;
+}
+
 export type RecordTurnOptions = {
   threadId: string;
   turn: any;
@@ -115,7 +160,7 @@ function combinedTurnPromptText(inputText: string | null | undefined, prompts: P
   if (protocolText) parts.push(protocolText);
   for (const prompt of prompts) {
     const text = prompt.text.trim();
-    if (!text || parts.some((part) => part.includes(text))) continue;
+    if (!text || parts.some((part) => part.includes(text) || sameSubmittedPrompt(part, text))) continue;
     parts.push(text);
   }
   return parts.join(separator);
@@ -543,16 +588,33 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       const final = extractFinalAnswer(items);
       if (!input || !final) { report.ignored += 1; continue; }
       recordedAnswerTurnIds.add(turnId);
+      const recovery = recoverableSubmissionForTurn(bundle.prompts.prompts, threadId, turn, input.text);
+      const supersededPromptIds = new Set(recovery ? linkedTurnPrompts
+        .filter((candidate) => (candidate.origin === "manual" || candidate.origin === "imported")
+          && candidate.attempts.length === 0
+          && sameSubmittedPrompt(candidate.text, input.text))
+        .map((candidate) => candidate.id) : []);
+      if (supersededPromptIds.size) {
+        bundle.prompts.prompts = bundle.prompts.prompts.filter((candidate) => !supersededPromptIds.has(candidate.id));
+        promptChanges += supersededPromptIds.size;
+      }
+      if (recovery?.previousTurnId && recovery.previousTurnId !== turnId) {
+        const before = bundle.answers.answers.length;
+        bundle.answers.answers = bundle.answers.answers.filter((answer) => !(answer.promptId === recovery.prompt.id
+          && answer.codexTurnId === recovery.previousTurnId));
+        answerChanges += before - bundle.answers.answers.length;
+      }
+      const effectiveLinkedTurnPrompts = linkedTurnPrompts.filter((candidate) => !supersededPromptIds.has(candidate.id));
       const existingAnswer = bundle.answers.answers.find((answer) => answer.threadId === threadId && answer.codexTurnId === turnId);
-      const existingPrompt = linkedTurnPrompts.find((prompt) => !promptWasSteeredIntoTurn(prompt, turnId));
+      const existingPrompt = effectiveLinkedTurnPrompts.find((prompt) => !promptWasSteeredIntoTurn(prompt, turnId));
       // Historic turns commonly have no client id. Never compare a missing id:
       // doing so reused the first null-id prompt for every turn and then pushed
       // that same object into the list repeatedly.
       const promptByClientId = clientId
         ? bundle.prompts.prompts.find((item) => item.clientUserMessageId === clientId && (!item.threadId || item.threadId === threadId))
         : undefined;
-      const prompt = existingPrompt ?? promptByClientId ?? newPrompt(input.text, "imported");
-      const createdPrompt = !existingPrompt && !promptByClientId;
+      const prompt = recovery?.prompt ?? existingPrompt ?? promptByClientId ?? newPrompt(input.text, "imported");
+      const createdPrompt = !recovery && !existingPrompt && !promptByClientId;
       let promptChanged = createdPrompt;
       const setPrompt = <K extends keyof PromptRecord>(key: K, value: PromptRecord[K]) => {
         if (JSON.stringify(prompt[key]) === JSON.stringify(value)) return;
@@ -573,7 +635,8 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       for (const attempt of prompt.attempts) {
         const matchesTurn = attempt.codexTurnId === turnId;
         const matchesClient = Boolean(clientId) && attempt.clientUserMessageId === clientId;
-        if (!matchesTurn && !matchesClient) continue;
+        const matchesRecovery = recovery?.attempt.attemptId === attempt.attemptId;
+        if (!matchesTurn && !matchesClient && !matchesRecovery) continue;
         const completedAt = turnCompletedAt ?? attempt.completedAt ?? isoNow();
         if (attempt.status !== "completed" || attempt.completedAt !== completedAt || attempt.codexTurnId !== turnId || attempt.error !== null) {
           attempt.status = "completed";
@@ -589,7 +652,7 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       }
       if (createdPrompt) bundle.prompts.prompts.push(prompt);
       historyPrompts.push(prompt);
-      for (const linked of linkedTurnPrompts.filter((item) => item.id !== prompt.id)) {
+      for (const linked of effectiveLinkedTurnPrompts.filter((item) => item.id !== prompt.id)) {
         let linkedChanged = false;
         const setLinked = <K extends keyof PromptRecord>(key: K, value: PromptRecord[K]) => {
           if (JSON.stringify(linked[key]) === JSON.stringify(value)) return;
@@ -613,11 +676,11 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       }
 
       let repairedAnswer = false;
-      const answerPrompts = [prompt, ...linkedTurnPrompts.filter((item) => item.id !== prompt.id)];
+      const answerPrompts = [prompt, ...effectiveLinkedTurnPrompts.filter((item) => item.id !== prompt.id)];
       const answerPrompt = combinedTurnPromptText(input.text, answerPrompts);
       const answerMetadata = {
         promptIds: answerPrompts.map((item) => item.id),
-        steeredPromptIds: linkedTurnPrompts.filter((item) => promptWasSteeredIntoTurn(item, turnId)).map((item) => item.id),
+        steeredPromptIds: effectiveLinkedTurnPrompts.filter((item) => promptWasSteeredIntoTurn(item, turnId)).map((item) => item.id),
       };
       if (!existingAnswer) {
         bundle.answers.answers.push({
@@ -633,7 +696,7 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
           startedAt: protocolTime(turn.startedAt),
           completedAt: protocolTime(turn.completedAt),
           recordedAt: isoNow(),
-          clientUserMessageId: clientId,
+          clientUserMessageId: clientId ?? prompt.clientUserMessageId,
           error: null,
           metadata: answerMetadata,
         });
@@ -649,7 +712,7 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
           captureMode: final.captureMode,
           startedAt: protocolTime(turn.startedAt),
           completedAt: protocolTime(turn.completedAt),
-          clientUserMessageId: clientId,
+          clientUserMessageId: clientId ?? prompt.clientUserMessageId,
           error: null,
           metadata: answerMetadata,
         };

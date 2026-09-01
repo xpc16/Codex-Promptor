@@ -112,7 +112,18 @@ export function clearSubmitTimers(timers: SubmitTimers): void {
   timers.reconcile = null;
 }
 
-/** Limited normalization only: never substring- or fuzzy-match user text. */
+/**
+ * Limited normalization only: never substring- or fuzzy-match user text.
+ *
+ * One native Codex/PowerShell submission was persisted without the two smart
+ * double quotes present in the bracketed paste. Treat those presentation
+ * marks as transport decoration so the hook and rollout can still acknowledge
+ * the exact queued submission; ordinary ASCII quotes remain significant.
+ */
 export function sameSubmittedPrompt(left: string, right: string): boolean {
-  return left.replace(/\r\n/g, "\n").trim() === right.replace(/\r\n/g, "\n").trim();
+  const comparable = (value: string) => value
+    .replace(/\r\n/g, "\n")
+    .replace(/[\u201c\u201d]/g, "")
+    .trim();
+  return comparable(left) === comparable(right);
 }

@@ -495,4 +495,124 @@ describe("history sync", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("merges a completed provider turn back into the one unconfirmed queue submission", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-history-submit-recovery-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      const tab = await storage.createTab("submission recovery");
+      const bundle = await storage.readTab(tab.id);
+      const threadId = "thread-submit-recovery";
+      const realTurnId = "turn-submit-recovery";
+      const syntheticTurnId = "submission-interrupted:client-submit-recovery";
+      const queuePrompt = newPrompt("repair \u201cno progress\u201d state", "queue");
+      const attempt = newAttempt("queue");
+      Object.assign(attempt, {
+        status: "interrupted",
+        startedAt: "2026-09-01T13:04:54.777Z",
+        completedAt: "2026-09-01T13:25:26.349Z",
+        codexTurnId: syntheticTurnId,
+        clientUserMessageId: "client-submit-recovery",
+        error: { code: "TURN_INTERRUPTED", message: "Submission was interrupted." },
+      });
+      Object.assign(queuePrompt, {
+        status: "interrupted",
+        threadId,
+        startedAt: attempt.startedAt,
+        completedAt: attempt.completedAt,
+        codexTurnId: syntheticTurnId,
+        clientUserMessageId: attempt.clientUserMessageId,
+        attempts: [attempt],
+        error: attempt.error,
+      });
+      const duplicateManualPrompt = newPrompt("repair no progress state", "manual");
+      Object.assign(duplicateManualPrompt, {
+        status: "completed",
+        threadId,
+        startedAt: "2026-09-01T13:04:58.700Z",
+        completedAt: "2026-09-01T13:12:18.652Z",
+        codexTurnId: realTurnId,
+      });
+      bundle.prompts.prompts = [duplicateManualPrompt, queuePrompt];
+      bundle.answers.answers = [
+        {
+          id: "answer-real",
+          promptId: duplicateManualPrompt.id,
+          threadId,
+          codexTurnId: realTurnId,
+          origin: "manual",
+          prompt: duplicateManualPrompt.text,
+          status: "completed",
+          finalAnswer: "fixed",
+          captureMode: "phase_final_answer",
+          startedAt: duplicateManualPrompt.startedAt,
+          completedAt: duplicateManualPrompt.completedAt,
+          recordedAt: duplicateManualPrompt.completedAt!,
+          clientUserMessageId: null,
+          error: null,
+          metadata: {},
+        },
+        {
+          id: "answer-synthetic",
+          promptId: queuePrompt.id,
+          threadId,
+          codexTurnId: syntheticTurnId,
+          origin: "queue",
+          prompt: queuePrompt.text,
+          status: "interrupted",
+          finalAnswer: "",
+          captureMode: null,
+          startedAt: queuePrompt.startedAt,
+          completedAt: queuePrompt.completedAt,
+          recordedAt: queuePrompt.completedAt!,
+          clientUserMessageId: queuePrompt.clientUserMessageId,
+          error: queuePrompt.error,
+          metadata: { promptIds: [queuePrompt.id] },
+        },
+      ];
+      await storage.writePrompts(tab.id, bundle.prompts);
+      await storage.writeAnswers(tab.id, bundle.answers);
+
+      await syncHistory(storage, tab.id, {
+        id: threadId,
+        turns: [{
+          id: realTurnId,
+          status: "completed",
+          startedAt: "2026-09-01T13:04:58.700Z",
+          completedAt: "2026-09-01T13:12:18.652Z",
+          items: [
+            { type: "userMessage", text: "repair no progress state" },
+            { type: "agentMessage", phase: "final_answer", text: "fixed" },
+          ],
+        }],
+      }, { mode: "merge" });
+
+      const synced = await storage.readTab(tab.id);
+      expect(synced.prompts.prompts).toHaveLength(1);
+      expect(synced.prompts.prompts[0]).toMatchObject({
+        id: queuePrompt.id,
+        origin: "queue",
+        status: "completed",
+        codexTurnId: realTurnId,
+        clientUserMessageId: "client-submit-recovery",
+        error: null,
+      });
+      expect(synced.prompts.prompts[0].attempts).toEqual([expect.objectContaining({
+        status: "completed",
+        codexTurnId: realTurnId,
+        error: null,
+      })]);
+      expect(synced.answers.answers).toEqual([expect.objectContaining({
+        id: "answer-real",
+        promptId: queuePrompt.id,
+        origin: "queue",
+        prompt: "repair no progress state",
+        clientUserMessageId: "client-submit-recovery",
+        finalAnswer: "fixed",
+      })]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

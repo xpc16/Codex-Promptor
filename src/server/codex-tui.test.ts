@@ -63,6 +63,24 @@ describe("Codex native PTY/hooks provider", () => {
     expect((await manager.rpc.waitForTurn("turn-2")).turn.status).toBe("interrupted");
   });
 
+  it("keeps a queue turn linked when the hook omits smart double quotes", async () => {
+    const submitted: string[] = [];
+    const manager = new CodexTuiManager("tab-smart-quotes", {
+      submitPrompt: (_tabId: string, text: string) => { submitted.push(text); return true; },
+      write: () => undefined,
+    } as any);
+    await manager.beginLaunch({ cwd: "D:\\work", launch: { mode: "new" }, hookScriptPath: "scripts/codex-hook.mjs" });
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "session-smart-quotes", cwd: "D:\\work", transcript_path: null });
+
+    const starting = manager.rpc.startTurn("session-smart-quotes", "repair \u201cno progress\u201d state", "client-smart-quotes", "D:\\work");
+    await vi.waitFor(() => expect(submitted).toEqual(["repair \u201cno progress\u201d state"]));
+    await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-smart-quotes", turn_id: "turn-smart-quotes", prompt: "repair no progress state" });
+
+    await expect(starting).resolves.toEqual({ turnId: "turn-smart-quotes" });
+    expect(manager.rpc.activeTurnIds("session-smart-quotes")).toEqual(["turn-smart-quotes"]);
+    await manager.stop();
+  });
+
   it("fails closed when Codex reports that hooks are untrusted", () => {
     expect(codexHookStartupError("Warning: hook configuration is not trusted")).toBe("CODEX_HOOK_TRUST_REQUIRED");
     expect(codexHookStartupError("Codex ready")).toBeNull();

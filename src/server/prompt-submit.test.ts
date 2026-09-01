@@ -82,6 +82,8 @@ describe("evidence-gated prompt submission recovery", () => {
 
   it("uses limited exact normalization rather than fuzzy matching", () => {
     expect(sameSubmittedPrompt("one\r\ntwo\n", " one\ntwo ")).toBe(true);
+    expect(sameSubmittedPrompt("repair \u201cno progress\u201d state", "repair no progress state")).toBe(true);
+    expect(sameSubmittedPrompt('say "yes"', "say yes")).toBe(false);
     expect(sameSubmittedPrompt("one two", "one  two")).toBe(false);
     expect(sameSubmittedPrompt("prefix", "prefix suffix")).toBe(false);
   });
