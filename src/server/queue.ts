@@ -20,6 +20,7 @@ export type QueueRpc = {
 };
 export type QueueBinding = { rpc: QueueRpc };
 type QueueResolver = QueueBinding | (() => QueueBinding);
+export const QUEUE_INTER_PROMPT_DELAY_MS = 5_000;
 
 export class QueueRunner extends EventEmitter {
   private loopPromise: Promise<void> | null = null;
@@ -41,6 +42,7 @@ export class QueueRunner extends EventEmitter {
     private readonly storage: StorageService,
     private readonly queueBinding: QueueResolver,
     private readonly freezeTimeoutMs = 5_000,
+    private readonly interPromptDelayMs = QUEUE_INTER_PROMPT_DELAY_MS,
   ) {
     super();
     // EventEmitter treats an unobserved `error` event as an exception. QueueRunner
@@ -308,12 +310,55 @@ export class QueueRunner extends EventEmitter {
             await this.pauseAfterFailure();
             return;
           }
+        } else {
+          await this.waitAfterCompletedPrompt(dispatched.prompt.id, threadId, generation);
         }
       }
     } catch (error) {
       if (this.stopping || generation !== this.loopGeneration) return;
       await this.failRunner("RUNNER_ERROR", error instanceof Error ? error.message : String(error));
     }
+  }
+
+  /**
+   * Give the provider five seconds to settle after a successful turn before
+   * reserving the next queued prompt. The deadline is anchored to the stored
+   * completion time, so history persistence does not add extra delay. Prompt
+   * order is deliberately read again after the wait.
+   */
+  private async waitAfterCompletedPrompt(promptId: string, threadId: string, generation: number): Promise<void> {
+    if (this.interPromptDelayMs <= 0 || generation !== this.loopGeneration || this.stopping) return;
+    const delay = await this.storage.withTabLock(this.tabId, async () => {
+      if (generation !== this.loopGeneration || this.stopping) return 0;
+      const bundle = await this.storage.readTab(this.tabId);
+      // A paused timer one-shot is not a rolling queue. It keeps its existing
+      // batch semantics unless the user explicitly presses Start mid-turn.
+      if (bundle.runtime.runner.desiredState !== "running") return 0;
+      const completed = bundle.prompts.prompts.find((prompt) => prompt.id === promptId);
+      if (completed?.status !== "completed" || !completed.completedAt) return 0;
+      const eligible = (prompt: PromptRecord) => prompt.status === "pending"
+        && (!prompt.threadId || prompt.threadId === threadId);
+      if (!bundle.prompts.prompts.some(eligible)) return 0;
+      const completedAt = Date.parse(completed.completedAt);
+      const elapsed = Number.isFinite(completedAt) ? Math.max(0, Date.now() - completedAt) : 0;
+      const remaining = Math.max(0, this.interPromptDelayMs - elapsed);
+      if (remaining === 0) return 0;
+      const runtime: RuntimeFile = {
+        ...bundle.runtime,
+        revision: bundle.runtime.revision + 1,
+        runner: {
+          ...bundle.runtime.runner,
+          state: "waiting_for_prompt",
+          activePromptId: null,
+          activeTurnId: null,
+          lastTransitionAt: isoNow(),
+        },
+      };
+      await this.storage.writeRuntime(this.tabId, runtime);
+      this.emit("runtime", runtime);
+      return remaining;
+    });
+    if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay));
   }
 
   private async prepareDispatch(promptId: string, generation: number): Promise<{ prompt: PromptRecord; clientUserMessageId: string } | null> {

@@ -4,7 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { isoNow, newPrompt } from "../shared/schemas.js";
 import type { AppServerManager } from "./codex.js";
-import { QueueRunner } from "./queue.js";
+import { QUEUE_INTER_PROMPT_DELAY_MS, QueueRunner } from "./queue.js";
 import { StorageService } from "./storage.js";
 
 class HookedStorage extends StorageService {
@@ -163,13 +163,13 @@ describe("queue pause boundary", () => {
       const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
       let reportFirstStarted!: () => void;
       const firstStarted = new Promise<void>((resolve) => { reportFirstStarted = resolve; });
-      const calls: Array<{ turnId: string; text: string; cwd: string }> = [];
+      const calls: Array<{ turnId: string; text: string; cwd: string; startedAt: number }> = [];
       const codex = {
         rpc: {
           waitForThreadIdle: async () => undefined,
           startTurn: async (_threadId: string, text: string, _clientId: string, cwd: string) => {
             const turnId = `turn-${calls.length + 1}`;
-            calls.push({ turnId, text, cwd });
+            calls.push({ turnId, text, cwd, startedAt: Date.now() });
             if (turnId === "turn-1") reportFirstStarted();
             return { turnId };
           },
@@ -186,7 +186,8 @@ describe("queue pause boundary", () => {
           },
         },
       } as unknown as AppServerManager;
-      const runner = new QueueRunner(tab.id, storage, codex);
+      const testDelayMs = 40;
+      const runner = new QueueRunner(tab.id, storage, codex, 5_000, testDelayMs);
 
       await runner.start();
       await firstStarted;
@@ -217,6 +218,8 @@ describe("queue pause boundary", () => {
       expect(completedAnswers).toHaveLength(2);
       expect(completedAnswers[0]).toMatchObject({ id: activeAnswer.id, status: "completed", finalAnswer: "第一条完成" });
       expect(completedAnswers[0].completedAt).not.toBeNull();
+      expect(QUEUE_INTER_PROMPT_DELAY_MS).toBe(5_000);
+      expect(calls[1].startedAt - Date.parse(completedAnswers[0].completedAt!)).toBeGreaterThanOrEqual(testDelayMs);
       await runner.stop();
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -610,7 +613,7 @@ describe("starting the queue during a one-shot", () => {
           },
         },
       } as unknown as AppServerManager;
-      const runner = new QueueRunner(tab.id, storage, codex);
+      const runner = new QueueRunner(tab.id, storage, codex, 5_000, 5);
 
       await runner.insertNow(selected.id);
       await waitUntil(async () => calls.length === 1 && gates.length === 1);
