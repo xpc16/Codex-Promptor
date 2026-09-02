@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { isoNow, newAttempt, type AnswerRecord, type PromptRecord, type RuntimeFile } from "../shared/schemas.js";
 import { recordTurn, recordTurnStarted, turnStatus } from "./history.js";
+import { isSlashCommandPrompt, SLASH_COMMAND_NO_TURN } from "./prompt-submit.js";
 import { StorageService } from "./storage.js";
 
 export type RunnerEvent = { tabId: string; type: "runtime" | "answer" | "error"; data?: unknown };
@@ -154,7 +155,11 @@ export class QueueRunner extends EventEmitter {
     const activeTurnId = initial.runtime.runner.activeTurnId && activeTurnIds.includes(initial.runtime.runner.activeTurnId)
       ? initial.runtime.runner.activeTurnId
       : activeTurnIds.at(-1) ?? null;
-    if (activeTurnId) {
+    const effectiveText = replacementText ?? prompt.text;
+    // CLI commands belong in the terminal composer, never inside an existing
+    // model turn. Steering /compact or /status makes the provider wait for a
+    // turn/final-answer lifecycle those commands intentionally do not have.
+    if (activeTurnId && !isSlashCommandPrompt(effectiveText)) {
       try {
         await this.steerPendingPrompt(promptId, threadId, activeTurnId, replacementText);
         return { mode: "steered", turnId: activeTurnId };
@@ -520,7 +525,7 @@ export class QueueRunner extends EventEmitter {
       startedAt: reserved.startedAt,
       clientUserMessageId,
     });
-    this.emit("answer", answer);
+    if (answer) this.emit("answer", answer);
   }
 
   private async dispatch(threadId: string, cwd: string, dispatched: { prompt: PromptRecord; clientUserMessageId: string }, generation: number): Promise<boolean> {
@@ -544,7 +549,7 @@ export class QueueRunner extends EventEmitter {
         startedAt: dispatched.prompt.startedAt,
         clientUserMessageId: dispatched.clientUserMessageId,
       });
-      this.emit("answer", startedAnswer);
+      if (startedAnswer) this.emit("answer", startedAnswer);
       if (generation !== this.loopGeneration) {
         try { await this.agent().rpc.interruptTurn(threadId, turnId); } catch { /* the detached turn may already be settling */ }
         await this.finalizeInterruptedTurn(threadId, turnId);
@@ -563,7 +568,8 @@ export class QueueRunner extends EventEmitter {
       });
       let completionError: { code: string; message: string } | null = null;
       const status = turnStatus(completed.turn);
-      if (!resultRecord.answer || resultRecord.answer.status !== "completed") {
+      if ((!resultRecord.answer || resultRecord.answer.status !== "completed")
+        && !isSlashCommandPrompt(dispatched.prompt.text)) {
         if (["interrupted", "canceled", "cancelled"].includes(status)) {
           // recordTurn already persisted the prompt and its active attempt as
           // interrupted. An intentional pause/close is not a runner error.
@@ -587,6 +593,12 @@ export class QueueRunner extends EventEmitter {
         }
       }
       const message = error instanceof Error ? error.message : String(error);
+      if (isSlashCommandPrompt(dispatched.prompt.text)
+        && (message === SLASH_COMMAND_NO_TURN || message === "PROMPT_SUBMISSION_INTERRUPTED" || Boolean(turnId))) {
+        await this.completeSlashCommandWithoutAnswer(dispatched.prompt.id, dispatched.clientUserMessageId, turnId || null);
+        await this.clearActive(null, dispatched.prompt.id, turnId || null);
+        return false;
+      }
       if (!turnId && message === "PROMPT_SUBMISSION_INTERRUPTED") {
         await this.finalizeInterruptedSubmission(threadId, dispatched.prompt.id, dispatched.clientUserMessageId);
         return false;
@@ -639,6 +651,44 @@ export class QueueRunner extends EventEmitter {
       bundle.prompts.revision += 1;
       bundle.prompts.updatedAt = isoNow();
       await this.storage.writePrompts(this.tabId, bundle.prompts);
+    });
+  }
+
+  /**
+   * Settle a CLI slash command that produced no reliable model-turn result.
+   * No synthetic turn or final-answer card is invented; a real completed
+   * answer, if one raced in first, is left intact.
+   */
+  private async completeSlashCommandWithoutAnswer(promptId: string, clientId: string, turnId: string | null): Promise<void> {
+    await this.storage.withTabLock(this.tabId, async () => {
+      const bundle = await this.storage.readTab(this.tabId);
+      const prompt = bundle.prompts.prompts.find((item) => item.id === promptId);
+      if (!prompt || !isSlashCommandPrompt(prompt.text)) return;
+      const completedAt = isoNow();
+      prompt.status = "completed";
+      prompt.completedAt = completedAt;
+      prompt.error = null;
+      prompt.updatedAt = completedAt;
+      if (turnId) prompt.codexTurnId = turnId;
+      for (const attempt of prompt.attempts.filter((item) => item.clientUserMessageId === clientId
+        || (turnId && item.codexTurnId === turnId))) {
+        attempt.status = "completed";
+        attempt.completedAt = completedAt;
+        attempt.error = null;
+        if (turnId) attempt.codexTurnId = turnId;
+      }
+      bundle.prompts.revision += 1;
+      bundle.prompts.updatedAt = completedAt;
+      await this.storage.writePrompts(this.tabId, bundle.prompts);
+
+      const before = bundle.answers.answers.length;
+      bundle.answers.answers = bundle.answers.answers.filter((answer) => !(answer.promptId === promptId
+        && answer.status !== "completed"));
+      if (bundle.answers.answers.length !== before) {
+        bundle.answers.revision += 1;
+        bundle.answers.updatedAt = completedAt;
+        await this.storage.writeAnswers(this.tabId, bundle.answers);
+      }
     });
   }
 
@@ -709,64 +759,77 @@ export class QueueRunner extends EventEmitter {
       if (!linked.length) return;
       const completedAt = isoNow();
       const error = { code: "TURN_INTERRUPTED", message: "Agent turn was interrupted before a final answer was produced." };
+      const slashCommandOnly = linked.every((prompt) => isSlashCommandPrompt(prompt.text));
       for (const prompt of linked) {
-        prompt.status = "interrupted";
+        prompt.status = slashCommandOnly ? "completed" : "interrupted";
         prompt.completedAt = completedAt;
         prompt.updatedAt = completedAt;
-        prompt.error = error;
+        prompt.error = slashCommandOnly ? null : error;
         for (const attempt of prompt.attempts.filter((item) => item.codexTurnId === turnId
           && (item.status === "dispatching" || item.status === "running"))) {
-          attempt.status = "interrupted";
+          attempt.status = slashCommandOnly ? "completed" : "interrupted";
           attempt.completedAt = completedAt;
-          attempt.error = error;
+          attempt.error = slashCommandOnly ? null : error;
         }
       }
       bundle.prompts.revision += 1;
       bundle.prompts.updatedAt = completedAt;
       await this.storage.writePrompts(this.tabId, bundle.prompts);
 
-      const primary = linked.find((prompt) => prompt.attempts.some((attempt) => attempt.codexTurnId === turnId && attempt.delivery === "turn")) ?? linked[0];
-      const promptText = linked.map((prompt) => prompt.text.trim()).filter(Boolean).join("\n\n--- 追加输入 ---\n\n") || primary.text;
-      const metadata = {
-        promptIds: linked.map((prompt) => prompt.id),
-        steeredPromptIds: linked.filter((prompt) => prompt.attempts.some((attempt) => attempt.codexTurnId === turnId && attempt.delivery === "steer")).map((prompt) => prompt.id),
-      };
-      interruptedAnswer = bundle.answers.answers.find((answer) => answer.threadId === threadId && answer.codexTurnId === turnId) ?? null;
-      if (!interruptedAnswer) {
-        interruptedAnswer = {
-          id: randomUUID(),
-          promptId: primary.id,
-          threadId,
-          codexTurnId: turnId,
-          origin: primary.origin,
-          prompt: promptText,
-          status: "interrupted",
-          finalAnswer: "",
-          captureMode: null,
-          startedAt: primary.startedAt,
-          completedAt,
-          recordedAt: completedAt,
-          clientUserMessageId: primary.clientUserMessageId,
-          error,
-          metadata,
-        };
-        bundle.answers.answers.push(interruptedAnswer);
+      if (slashCommandOnly) {
+        const before = bundle.answers.answers.length;
+        bundle.answers.answers = bundle.answers.answers.filter((answer) => !(answer.threadId === threadId
+          && answer.codexTurnId === turnId
+          && answer.status !== "completed"));
+        if (bundle.answers.answers.length !== before) {
+          bundle.answers.revision += 1;
+          bundle.answers.updatedAt = completedAt;
+          await this.storage.writeAnswers(this.tabId, bundle.answers);
+        }
       } else {
-        interruptedAnswer.promptId = primary.id;
-        interruptedAnswer.origin = primary.origin;
-        interruptedAnswer.prompt = promptText;
-        interruptedAnswer.status = "interrupted";
-        interruptedAnswer.finalAnswer = "";
-        interruptedAnswer.captureMode = null;
-        interruptedAnswer.startedAt = interruptedAnswer.startedAt ?? primary.startedAt;
-        interruptedAnswer.completedAt = completedAt;
-        interruptedAnswer.clientUserMessageId = interruptedAnswer.clientUserMessageId ?? primary.clientUserMessageId;
-        interruptedAnswer.error = error;
-        interruptedAnswer.metadata = metadata;
+        const primary = linked.find((prompt) => prompt.attempts.some((attempt) => attempt.codexTurnId === turnId && attempt.delivery === "turn")) ?? linked[0];
+        const promptText = linked.map((prompt) => prompt.text.trim()).filter(Boolean).join("\n\n--- 追加输入 ---\n\n") || primary.text;
+        const metadata = {
+          promptIds: linked.map((prompt) => prompt.id),
+          steeredPromptIds: linked.filter((prompt) => prompt.attempts.some((attempt) => attempt.codexTurnId === turnId && attempt.delivery === "steer")).map((prompt) => prompt.id),
+        };
+        interruptedAnswer = bundle.answers.answers.find((answer) => answer.threadId === threadId && answer.codexTurnId === turnId) ?? null;
+        if (!interruptedAnswer) {
+          interruptedAnswer = {
+            id: randomUUID(),
+            promptId: primary.id,
+            threadId,
+            codexTurnId: turnId,
+            origin: primary.origin,
+            prompt: promptText,
+            status: "interrupted",
+            finalAnswer: "",
+            captureMode: null,
+            startedAt: primary.startedAt,
+            completedAt,
+            recordedAt: completedAt,
+            clientUserMessageId: primary.clientUserMessageId,
+            error,
+            metadata,
+          };
+          bundle.answers.answers.push(interruptedAnswer);
+        } else {
+          interruptedAnswer.promptId = primary.id;
+          interruptedAnswer.origin = primary.origin;
+          interruptedAnswer.prompt = promptText;
+          interruptedAnswer.status = "interrupted";
+          interruptedAnswer.finalAnswer = "";
+          interruptedAnswer.captureMode = null;
+          interruptedAnswer.startedAt = interruptedAnswer.startedAt ?? primary.startedAt;
+          interruptedAnswer.completedAt = completedAt;
+          interruptedAnswer.clientUserMessageId = interruptedAnswer.clientUserMessageId ?? primary.clientUserMessageId;
+          interruptedAnswer.error = error;
+          interruptedAnswer.metadata = metadata;
+        }
+        bundle.answers.revision += 1;
+        bundle.answers.updatedAt = completedAt;
+        await this.storage.writeAnswers(this.tabId, bundle.answers);
       }
-      bundle.answers.revision += 1;
-      bundle.answers.updatedAt = completedAt;
-      await this.storage.writeAnswers(this.tabId, bundle.answers);
 
       const ownsActivePrompt = linked.some((prompt) => prompt.id === bundle.runtime.runner.activePromptId);
       if (bundle.runtime.runner.activeTurnId === turnId || ownsActivePrompt) {

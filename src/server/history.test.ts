@@ -4,7 +4,7 @@ import { StorageService } from "./storage.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { newAttempt, newPrompt } from "../shared/schemas.js";
+import { isoNow, newAttempt, newPrompt } from "../shared/schemas.js";
 
 describe("history extraction", () => {
   it("joins user messages and preserves input items", () => {
@@ -20,6 +20,64 @@ describe("history extraction", () => {
   it("prefers final-answer phase and falls back to the last agent message", () => {
     expect(extractFinalAnswer([{ type: "agentMessage", phase: "commentary", text: "过程" }, { type: "agentMessage", phase: "final_answer", text: "结论" }])).toEqual({ text: "结论", captureMode: "phase_final_answer" });
     expect(extractFinalAnswer([{ type: "agentMessage", text: "没有 phase" }])).toEqual({ text: "没有 phase", captureMode: "fallback_last_agent_message" });
+  });
+});
+
+describe("slash command history reconciliation", () => {
+  it("settles an interrupted CLI command without retaining an abnormal final-answer card", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-history-slash-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      const tab = await storage.createTab("slash history");
+      const bundle = await storage.readTab(tab.id);
+      const prompt = newPrompt("/compact", "queue");
+      const attempt = newAttempt("queue");
+      Object.assign(attempt, { status: "running", codexTurnId: "turn-compact", clientUserMessageId: "client-compact" });
+      Object.assign(prompt, {
+        status: "running",
+        threadId: "thread-compact",
+        codexTurnId: "turn-compact",
+        clientUserMessageId: "client-compact",
+        attempts: [attempt],
+      });
+      bundle.prompts.prompts = [prompt];
+      bundle.answers.answers = [{
+        id: "answer-compact",
+        promptId: prompt.id,
+        threadId: "thread-compact",
+        codexTurnId: "turn-compact",
+        origin: "queue",
+        prompt: "/compact",
+        status: "running",
+        finalAnswer: "",
+        captureMode: null,
+        startedAt: null,
+        completedAt: null,
+        recordedAt: isoNow(),
+        clientUserMessageId: "client-compact",
+        error: null,
+        metadata: { promptIds: [prompt.id] },
+      }];
+      await storage.writePrompts(tab.id, bundle.prompts);
+      await storage.writeAnswers(tab.id, bundle.answers);
+
+      await syncHistory(storage, tab.id, {
+        id: "thread-compact",
+        turns: [{
+          id: "turn-compact",
+          status: "interrupted",
+          items: [{ type: "userMessage", clientId: "client-compact", text: "/compact" }],
+        }],
+      });
+
+      const synced = await storage.readTab(tab.id);
+      expect(synced.prompts.prompts[0]).toMatchObject({ status: "completed", error: null });
+      expect(synced.prompts.prompts[0].attempts[0]).toMatchObject({ status: "completed", error: null });
+      expect(synced.answers.answers).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

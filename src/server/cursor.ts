@@ -7,7 +7,15 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { CURSOR_EXIT_MARKER, type PtyManager, type TerminalTheme } from "./pty.js";
 import type { QueueBinding, QueueRpc } from "./queue.js";
-import { clearSubmitTimers, sameSubmittedPrompt, scheduleSubmitRecovery, type SubmitEvidence, type SubmitTimers } from "./prompt-submit.js";
+import {
+  clearSubmitTimers,
+  isSlashCommandPrompt,
+  sameSubmittedPrompt,
+  scheduleSubmitRecovery,
+  SLASH_COMMAND_NO_TURN,
+  type SubmitEvidence,
+  type SubmitTimers,
+} from "./prompt-submit.js";
 import { inspectCursorSubmission, reconcileCursorTurn, transcriptCursor, type TranscriptCursor } from "./transcript-reconciliation.js";
 import { writeFileAtomicWithRetry } from "./storage.js";
 
@@ -329,8 +337,14 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
         inspect: () => inspectCursorSubmission(this.submissionCursor(submission), prompt),
         resend: () => { this.pty.submitEnter(this.tabId); },
         accept: (evidence) => this.acceptRecoveredSubmission(submission, evidence),
-        unconfirmed: (evidence) => this.emit("submissionUnconfirmed", { threadId: this.attached?.sessionId, prompt, reason: evidence.reason ?? null }),
-      });
+        unconfirmed: (evidence) => {
+          if (isSlashCommandPrompt(prompt)) {
+            this.rejectSubmission(submission, new Error(SLASH_COMMAND_NO_TURN));
+            return;
+          }
+          this.emit("submissionUnconfirmed", { threadId: this.attached?.sessionId, prompt, reason: evidence.reason ?? null });
+        },
+      }, isSlashCommandPrompt(prompt) ? [] : undefined);
       this.submission = submission;
       return submission;
     } finally {

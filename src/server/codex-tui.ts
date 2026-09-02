@@ -6,7 +6,15 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type { AgentProcessLaunch, PtyManager } from "./pty.js";
 import type { QueueBinding, QueueRpc } from "./queue.js";
-import { clearSubmitTimers, sameSubmittedPrompt, scheduleSubmitRecovery, type SubmitEvidence, type SubmitTimers } from "./prompt-submit.js";
+import {
+  clearSubmitTimers,
+  isSlashCommandPrompt,
+  sameSubmittedPrompt,
+  scheduleSubmitRecovery,
+  SLASH_COMMAND_NO_TURN,
+  type SubmitEvidence,
+  type SubmitTimers,
+} from "./prompt-submit.js";
 import { inspectCodexSubmission, reconcileCodexTurn, transcriptCursor, type TranscriptCursor } from "./transcript-reconciliation.js";
 
 const COMPLETED_CACHE_LIMIT = 100;
@@ -249,6 +257,16 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
       return;
     }
     if (eventName === "PostCompact") {
+      // /compact is a CLI command: PostCompact is its acknowledgement, but it
+      // deliberately has no UserPromptSubmit/Stop turn lifecycle.
+      if (this.submission && /^\/compact(?:\s|$)/i.test(this.submission.prompt.trimStart())) {
+        this.rejectSubmission(this.submission, new Error(SLASH_COMMAND_NO_TURN));
+      }
+      for (const turn of [...this.turns.values()]) {
+        if (/^\/compact(?:\s|$)/i.test(turn.prompt.trimStart())) {
+          this.completeTurn(turn, "completed", "", "");
+        }
+      }
       this.emit("compacted", { sessionId, transcriptPath: this.attached?.transcriptPath ?? null });
       return;
     }
@@ -448,8 +466,14 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
         inspect: () => inspectCodexSubmission(this.submissionCursor(submission), prompt, this.attached?.sessionId ?? ""),
         resend: () => { this.pty.submitEnter(this.tabId); },
         accept: (evidence) => this.acceptRecoveredSubmission(submission, evidence),
-        unconfirmed: (evidence) => this.emit("submissionUnconfirmed", { threadId: this.attached?.sessionId, prompt, reason: evidence.reason ?? null }),
-      });
+        unconfirmed: (evidence) => {
+          if (isSlashCommandPrompt(prompt)) {
+            this.rejectSubmission(submission, new Error(SLASH_COMMAND_NO_TURN));
+            return;
+          }
+          this.emit("submissionUnconfirmed", { threadId: this.attached?.sessionId, prompt, reason: evidence.reason ?? null });
+        },
+      }, isSlashCommandPrompt(prompt) ? [] : undefined);
       this.submission = submission;
       return submission;
     } finally {

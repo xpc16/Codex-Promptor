@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearSubmitTimers,
+  isSlashCommandPrompt,
   sameSubmittedPrompt,
   scheduleSubmitRecovery,
   SUBMIT_RETRY_DELAYS_MS,
@@ -80,12 +81,34 @@ describe("evidence-gated prompt submission recovery", () => {
     expect(resend).toHaveBeenCalledTimes(1);
   });
 
+  it("supports no-retry command submissions while retaining the confirmation deadline", async () => {
+    const resend = vi.fn();
+    const unconfirmed = vi.fn();
+    scheduleSubmitRecovery({
+      inspect: async () => ({ state: "not-submitted" }),
+      resend,
+      accept: vi.fn(),
+      unconfirmed,
+    }, [], 1_000);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(resend).not.toHaveBeenCalled();
+    expect(unconfirmed).toHaveBeenCalledOnce();
+  });
+
   it("uses limited exact normalization rather than fuzzy matching", () => {
     expect(sameSubmittedPrompt("one\r\ntwo\n", " one\ntwo ")).toBe(true);
     expect(sameSubmittedPrompt("repair \u201cno progress\u201d state", "repair no progress state")).toBe(true);
     expect(sameSubmittedPrompt('say "yes"', "say yes")).toBe(false);
     expect(sameSubmittedPrompt("one two", "one  two")).toBe(false);
     expect(sameSubmittedPrompt("prefix", "prefix suffix")).toBe(false);
+  });
+
+  it("recognizes CLI slash commands after leading whitespace only", () => {
+    expect(isSlashCommandPrompt("/compact")).toBe(true);
+    expect(isSlashCommandPrompt("  /status")).toBe(true);
+    expect(isSlashCommandPrompt("explain /compact")).toBe(false);
+    expect(isSlashCommandPrompt("")).toBe(false);
   });
 
   it("keeps retries outside the normal hook response window", () => {

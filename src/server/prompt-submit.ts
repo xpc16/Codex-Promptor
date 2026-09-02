@@ -9,6 +9,16 @@
 export const SUBMIT_TIMEOUT_MS = 20_000;
 export const SUBMIT_RETRY_DELAYS_MS: readonly number[] = [4_000, 9_000];
 export const SUBMIT_RECONCILE_INTERVAL_MS = 5_000;
+/**
+ * Slash commands are handled by the CLI itself and do not necessarily create
+ * a provider turn or final answer. This internal result lets the queue settle
+ * that expected no-turn case without mistaking it for a failed model prompt.
+ */
+export const SLASH_COMMAND_NO_TURN = "SLASH_COMMAND_NO_TURN";
+
+export function isSlashCommandPrompt(text: string): boolean {
+  return text.trimStart().startsWith("/");
+}
 
 export type SubmitEvidence =
   | { state: "accepted"; turnId: string; turn?: any; items?: any[] }
@@ -36,8 +46,9 @@ export type SubmitRecoveryOptions = {
 /**
  * Schedule two evidence-gated Enter retries and then low-frequency accounting.
  *
- * At 20 seconds an unknown result remains pending and is reconciled in the
- * background. It is deliberately not turned into a failed queue prompt. An
+ * At 20 seconds an unknown result normally remains pending and is reconciled
+ * in the background. Providers may instead settle an expected no-turn CLI
+ * command from `unconfirmed`; ordinary prompts are deliberately not failed. An
  * unchanged record is enough to gate an Enter retry, but not enough to prove
  * the CLI rejected the submission. Explicit process exit is handled directly
  * by each provider manager.

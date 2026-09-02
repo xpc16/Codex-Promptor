@@ -257,6 +257,56 @@ describe("runtime recovery", () => {
   }, 20_000);
 });
 
+describe("slash command restart recovery", () => {
+  it("settles stale command lifecycle records without creating an interrupted answer", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-command-recovery-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      const tab = await storage.createTab("command recovery");
+      const bundle = await storage.readTab(tab.id);
+      const prompt = newPrompt("/status", "queue");
+      const attempt = newAttempt("queue");
+      Object.assign(attempt, { status: "running", codexTurnId: "turn-status", clientUserMessageId: "client-status" });
+      Object.assign(prompt, {
+        status: "running",
+        threadId: "thread-status",
+        codexTurnId: "turn-status",
+        clientUserMessageId: "client-status",
+        attempts: [attempt],
+      });
+      bundle.prompts.prompts = [prompt];
+      bundle.answers.answers = [{
+        id: "answer-status",
+        promptId: prompt.id,
+        threadId: "thread-status",
+        codexTurnId: "turn-status",
+        origin: "queue",
+        prompt: "/status",
+        status: "running",
+        finalAnswer: "",
+        captureMode: null,
+        startedAt: null,
+        completedAt: null,
+        recordedAt: isoNow(),
+        clientUserMessageId: "client-status",
+        error: null,
+        metadata: { promptIds: [prompt.id] },
+      }];
+      await storage.writePrompts(tab.id, bundle.prompts);
+      await storage.writeAnswers(tab.id, bundle.answers);
+
+      expect(await recoverTerminalRuntime(storage)).toBe(1);
+      const recovered = await storage.readTab(tab.id);
+      expect(recovered.prompts.prompts[0]).toMatchObject({ status: "completed", error: null });
+      expect(recovered.prompts.prompts[0].attempts[0]).toMatchObject({ status: "completed", error: null });
+      expect(recovered.answers.answers).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("answer WebSocket events", () => {
   it("reserves the audible event for completed answers", () => {
     expect(answerEventType({ status: "running" })).toBe("answer.changed");

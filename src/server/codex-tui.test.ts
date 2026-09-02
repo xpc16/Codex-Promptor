@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { buildCodexHookOverride, buildCodexTuiLaunch, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, codexTuiReady, CodexTuiManager, resolveHookCommandPaths, spaceFreePath } from "./codex-tui.js";
+import { SLASH_COMMAND_NO_TURN } from "./prompt-submit.js";
 
 describe("Codex native PTY/hooks provider", () => {
   it("builds per-run hooks and keeps every Codex argument in an argv slot", () => {
@@ -78,6 +79,31 @@ describe("Codex native PTY/hooks provider", () => {
 
     await expect(starting).resolves.toEqual({ turnId: "turn-smart-quotes" });
     expect(manager.rpc.activeTurnIds("session-smart-quotes")).toEqual(["turn-smart-quotes"]);
+    await manager.stop();
+  });
+
+  it("uses PostCompact to settle /compact without inventing a model turn", async () => {
+    const submitted: string[] = [];
+    const manager = new CodexTuiManager("tab-compact", {
+      submitPrompt: (_tabId: string, text: string) => { submitted.push(text); return true; },
+      write: () => undefined,
+    } as any);
+    await manager.beginLaunch({ cwd: "D:\\work", launch: { mode: "new" }, hookScriptPath: "scripts/codex-hook.mjs" });
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "session-compact", cwd: "D:\\work", transcript_path: null });
+
+    const starting = manager.rpc.startTurn("session-compact", "/compact", "client-compact", "D:\\work");
+    await vi.waitFor(() => expect(submitted).toEqual(["/compact"]));
+    await manager.handleHook({ hook_event_name: "PostCompact", session_id: "session-compact" });
+
+    await expect(starting).rejects.toThrow(SLASH_COMMAND_NO_TURN);
+    expect(manager.rpc.activeTurnIds("session-compact")).toEqual([]);
+
+    const accepted = manager.rpc.startTurn("session-compact", "/compact", "client-compact-accepted", "D:\\work");
+    await vi.waitFor(() => expect(submitted).toEqual(["/compact", "/compact"]));
+    await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-compact", turn_id: "turn-compact", prompt: "/compact" });
+    expect((await accepted).turnId).toBe("turn-compact");
+    await manager.handleHook({ hook_event_name: "PostCompact", session_id: "session-compact" });
+    expect((await manager.rpc.waitForTurn("turn-compact")).turn.status).toBe("completed");
     await manager.stop();
   });
 

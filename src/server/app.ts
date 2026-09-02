@@ -35,6 +35,7 @@ import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
 import { entityTag, ifMatchSatisfied, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
 import { CLAUDE_EXIT_MARKER, CODEX_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
+import { isSlashCommandPrompt } from "./prompt-submit.js";
 import { RunnerManager } from "./queue.js";
 import { StorageService } from "./storage.js";
 import { TimerService, TimerServiceError } from "./timer-service.js";
@@ -3020,14 +3021,15 @@ export async function recoverTerminalRuntime(storage: StorageService): Promise<n
           updatedAt: recoveredAt,
           prompts: bundle.prompts.prompts.map((prompt) => {
             if (prompt.status !== "dispatching" && prompt.status !== "running") return prompt;
+            const slashCommand = isSlashCommandPrompt(prompt.text);
             return {
               ...prompt,
-              status: "interrupted",
+              status: slashCommand ? "completed" : "interrupted",
               completedAt: recoveredAt,
               updatedAt: recoveredAt,
-              error,
+              error: slashCommand ? null : error,
               attempts: prompt.attempts.map((attempt) => attempt.status === "dispatching" || attempt.status === "running"
-                ? { ...attempt, status: "interrupted", completedAt: recoveredAt, error }
+                ? { ...attempt, status: slashCommand ? "completed" : "interrupted", completedAt: recoveredAt, error: slashCommand ? null : error }
                 : attempt),
             };
           }),
@@ -3042,6 +3044,14 @@ export async function recoverTerminalRuntime(storage: StorageService): Promise<n
           if (recoveredTurns.has(turnKey)) continue;
           recoveredTurns.add(turnKey);
           const linked = prompts.prompts.filter((prompt) => prompt.threadId === threadId && prompt.codexTurnId === turnId);
+          if (linked.length && linked.every((prompt) => isSlashCommandPrompt(prompt.text))) {
+            const before = bundle.answers.answers.length;
+            bundle.answers.answers = bundle.answers.answers.filter((answer) => !(answer.threadId === threadId
+              && answer.codexTurnId === turnId
+              && answer.status !== "completed"));
+            if (bundle.answers.answers.length !== before) answersChanged = true;
+            continue;
+          }
           const primary = linked.find((prompt) => prompt.attempts.some((attempt) => attempt.codexTurnId === turnId && attempt.delivery === "turn"))
             ?? linked[0]
             ?? stalePrompt;
@@ -3085,6 +3095,11 @@ export async function recoverTerminalRuntime(storage: StorageService): Promise<n
           }
           answersChanged = true;
         }
+        const promptById = new Map(prompts.prompts.map((prompt) => [prompt.id, prompt]));
+        const beforeSlashCleanup = bundle.answers.answers.length;
+        bundle.answers.answers = bundle.answers.answers.filter((answer) => answer.status === "completed"
+          || !isSlashCommandPrompt(promptById.get(answer.promptId)?.text ?? answer.prompt));
+        if (bundle.answers.answers.length !== beforeSlashCleanup) answersChanged = true;
         if (answersChanged) {
           bundle.answers.revision += 1;
           bundle.answers.updatedAt = recoveredAt;

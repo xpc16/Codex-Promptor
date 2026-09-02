@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { isoNow, newPrompt } from "../shared/schemas.js";
 import type { AppServerManager } from "./codex.js";
+import { SLASH_COMMAND_NO_TURN } from "./prompt-submit.js";
 import { QUEUE_INTER_PROMPT_DELAY_MS, QueueRunner } from "./queue.js";
 import { StorageService } from "./storage.js";
 
@@ -634,6 +635,99 @@ describe("starting the queue during a one-shot", () => {
       // Rolling to the end of the queue arms it, as a finished run always does.
       await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.desiredState === "armed");
       expect((await storage.readTab(tab.id)).prompts.prompts.map((prompt) => prompt.status)).toEqual(["completed", "completed"]);
+      await runner.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("CLI slash command queue lifecycle", () => {
+  it("settles an unacknowledged command without an interrupted or running answer", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-slash-no-turn-"));
+    const storage = new StorageService(root);
+    try {
+      await storage.ensure();
+      const tab = await storage.createTab("slash command");
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        updatedAt: isoNow(),
+        session: { ...current.session, state: "ready", workingDirectory: root, threadId: "thread-slash", sessionId: "thread-slash", connectedAt: isoNow() },
+      }));
+      const bundle = await storage.readTab(tab.id);
+      bundle.prompts.prompts.push(newPrompt("  /compact", "queue"));
+      await storage.writePrompts(tab.id, bundle.prompts);
+
+      const binding = {
+        rpc: {
+          activeTurnIds: () => [],
+          waitForThreadIdle: async () => undefined,
+          startTurn: async () => { throw new Error(SLASH_COMMAND_NO_TURN); },
+        },
+      } as any;
+      const runner = new QueueRunner(tab.id, storage, binding, 50, 0);
+      await runner.start();
+      await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.desiredState === "armed");
+
+      const finished = await storage.readTab(tab.id);
+      expect(finished.prompts.prompts[0]).toMatchObject({ status: "completed", error: null });
+      expect(finished.prompts.prompts[0].attempts[0]).toMatchObject({ status: "completed", error: null });
+      expect(finished.answers.answers).toEqual([]);
+      expect(finished.runtime.runner.lastError).toBeNull();
+      await runner.stop();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a real final answer but exempts a command completed without one", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-slash-final-"));
+    const storage = new StorageService(root);
+    try {
+      await storage.ensure();
+      const tab = await storage.createTab("slash answers");
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        updatedAt: isoNow(),
+        session: { ...current.session, state: "ready", workingDirectory: root, threadId: "thread-slash-final", sessionId: "thread-slash-final", connectedAt: isoNow() },
+      }));
+      const bundle = await storage.readTab(tab.id);
+      bundle.prompts.prompts.push(newPrompt("/status", "queue"), newPrompt("/plan implement it", "queue"));
+      await storage.writePrompts(tab.id, bundle.prompts);
+
+      let turnNumber = 0;
+      const prompts = new Map<string, string>();
+      const binding = {
+        rpc: {
+          activeTurnIds: () => [],
+          waitForThreadIdle: async () => undefined,
+          startTurn: async (_threadId: string, text: string) => {
+            const turnId = `slash-turn-${++turnNumber}`;
+            prompts.set(turnId, text);
+            return { turnId };
+          },
+          waitForTurn: async (turnId: string) => ({
+            turn: { id: turnId, status: "completed" },
+            items: prompts.get(turnId) === "/status"
+              ? [{ type: "userMessage", text: "/status" }]
+              : [
+                { type: "userMessage", text: "/plan implement it" },
+                { type: "agentMessage", phase: "final_answer", text: "plan ready" },
+              ],
+          }),
+        },
+      } as any;
+      const runner = new QueueRunner(tab.id, storage, binding, 50, 0);
+      await runner.start();
+      await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.desiredState === "armed");
+
+      const finished = await storage.readTab(tab.id);
+      expect(finished.prompts.prompts.map((prompt) => prompt.status)).toEqual(["completed", "completed"]);
+      expect(finished.answers.answers).toEqual([expect.objectContaining({
+        prompt: "/plan implement it",
+        status: "completed",
+        finalAnswer: "plan ready",
+      })]);
       await runner.stop();
     } finally {
       await rm(root, { recursive: true, force: true });

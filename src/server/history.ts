@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isoNow, type AnswerRecord, type Origin, type PromptRecord, newPrompt, type TabBundle } from "../shared/schemas.js";
-import { sameSubmittedPrompt } from "./prompt-submit.js";
+import { isSlashCommandPrompt, sameSubmittedPrompt } from "./prompt-submit.js";
 import { StorageService } from "./storage.js";
 
 const normalizeType = (value: unknown) => String(value ?? "").replace(/[_-]/g, "").toLowerCase();
@@ -192,8 +192,8 @@ export type RecordTurnStartedOptions = {
   clientUserMessageId: string | null;
 };
 
-/** Persist the answer card as soon as Codex accepts a queued turn. */
-export async function recordTurnStarted(storage: StorageService, tabId: string, options: RecordTurnStartedOptions): Promise<AnswerRecord> {
+/** Persist the answer card as soon as an ordinary queued turn is accepted. */
+export async function recordTurnStarted(storage: StorageService, tabId: string, options: RecordTurnStartedOptions): Promise<AnswerRecord | null> {
   return storage.withTabLock(tabId, async () => {
     const bundle = await storage.readTab(tabId);
     const requested = bundle.prompts.prompts.find((prompt) => prompt.id === options.promptId);
@@ -201,6 +201,19 @@ export async function recordTurnStarted(storage: StorageService, tabId: string, 
     const linked = bundle.prompts.prompts.filter((prompt) => prompt.codexTurnId === options.turnId && (!prompt.threadId || prompt.threadId === options.threadId));
     const primary = linked.find((prompt) => !promptWasSteeredIntoTurn(prompt, options.turnId)) ?? requested;
     const prompts = [primary, ...linked.filter((prompt) => prompt.id !== primary.id)];
+    const slashCommandTurn = isSlashCommandPrompt(options.promptText)
+      && prompts.every((prompt) => isSlashCommandPrompt(prompt.text));
+    if (slashCommandTurn) {
+      const existing = bundle.answers.answers.find((item) => item.threadId === options.threadId && item.codexTurnId === options.turnId);
+      if (existing?.status === "completed") return null;
+      if (existing) {
+        bundle.answers.answers = bundle.answers.answers.filter((item) => item.id !== existing.id);
+        bundle.answers.revision += 1;
+        bundle.answers.updatedAt = isoNow();
+        await storage.writeAnswers(tabId, bundle.answers);
+      }
+      return null;
+    }
     const promptText = combinedTurnPromptText(options.promptText, prompts);
     const metadata = buildAnswerMetadata(prompts, options.turnId);
     let answer = bundle.answers.answers.find((item) => item.threadId === options.threadId && item.codexTurnId === options.turnId);
@@ -287,6 +300,7 @@ export async function recordTurn(storage: StorageService, tabId: string, options
     const metadata = buildAnswerMetadata(affectedPrompts, turnId);
     const startedAt = protocolTime(options.turn?.startedAt) ?? prompt.startedAt;
     let answer: AnswerRecord | null = null;
+    let answersChanged = false;
     const ensureAnswer = (): AnswerRecord => {
       const existing = bundle.answers.answers.find((item) => item.threadId === options.threadId && item.codexTurnId === turnId);
       if (existing) return existing;
@@ -312,6 +326,7 @@ export async function recordTurn(storage: StorageService, tabId: string, options
     };
     if (final) {
       answer = ensureAnswer();
+      answersChanged = true;
       // Codex completion snapshots can omit inputs delivered by turn/steer.
       // Local turn linkage is therefore also authoritative for the card summary.
       applyAnswerPatch(answer, {
@@ -340,12 +355,36 @@ export async function recordTurn(storage: StorageService, tabId: string, options
           attempt.error = null;
         }
       }
+    } else if (affectedPrompts.every((linked) => isSlashCommandPrompt(linked.text))) {
+      // CLI slash commands often acknowledge no model turn/final answer. Once
+      // their lifecycle reaches a terminal boundary, that absence is expected:
+      // settle the queue record and remove only synthetic non-final cards.
+      for (const linked of affectedPrompts) {
+        linked.threadId = options.threadId;
+        linked.codexTurnId = turnId;
+        linked.status = "completed";
+        linked.completedAt = completedAt;
+        linked.error = null;
+        linked.updatedAt = isoNow();
+        for (const attempt of linked.attempts.filter((item) => item.codexTurnId === turnId
+          || (options.clientUserMessageId && item.clientUserMessageId === options.clientUserMessageId))) {
+          attempt.status = "completed";
+          attempt.completedAt = completedAt;
+          attempt.error = null;
+        }
+      }
+      const before = bundle.answers.answers.length;
+      bundle.answers.answers = bundle.answers.answers.filter((item) => !(item.threadId === options.threadId
+        && item.codexTurnId === turnId
+        && item.status !== "completed"));
+      answersChanged = bundle.answers.answers.length !== before;
     } else if (terminalStatus) {
       const status = terminalStatus;
       const error = status === "interrupted"
         ? { code: "TURN_INTERRUPTED", message: "Agent turn was interrupted before a final answer was produced." }
         : { code: "TURN_FAILED", message: "Agent turn failed before a final answer was produced." };
       answer = ensureAnswer();
+      answersChanged = true;
       applyAnswerPatch(answer, {
         promptId: prompt.id,
         origin: prompt.origin,
@@ -376,6 +415,7 @@ export async function recordTurn(storage: StorageService, tabId: string, options
     } else if (options.origin === "queue" || options.origin === "timer") {
       const error = { code: "NO_FINAL_ANSWER", message: "Turn completed without a final answer." };
       answer = ensureAnswer();
+      answersChanged = true;
       applyAnswerPatch(answer, {
         promptId: prompt.id,
         origin: prompt.origin,
@@ -403,9 +443,11 @@ export async function recordTurn(storage: StorageService, tabId: string, options
     }
     bundle.prompts.revision += 1;
     bundle.prompts.updatedAt = isoNow();
-    bundle.answers.revision += answer ? 1 : 0;
-    bundle.answers.updatedAt = isoNow();
-    await storage.writeAnswers(tabId, bundle.answers);
+    if (answersChanged) {
+      bundle.answers.revision += 1;
+      bundle.answers.updatedAt = isoNow();
+      await storage.writeAnswers(tabId, bundle.answers);
+    }
     await storage.writePrompts(tabId, bundle.prompts);
     return { prompt, answer };
   });
@@ -426,6 +468,7 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
   const threadId = String(thread?.id ?? thread?.threadId ?? "");
   if (!threadId) throw new Error("THREAD_ID_MISSING");
   const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const historyTurnIds = new Set(turns.map((turn: any) => String(turn?.id ?? turn?.turnId ?? "")).filter(Boolean));
   const report: HistoryReport = { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
   await storage.withTabLock(tabId, async () => {
     const bundle = await storage.readTab(tabId);
@@ -440,6 +483,76 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
     const historyPrompts: PromptRecord[] = [];
     const recordedAnswerTurnIds = new Set<string>();
     bundle.prompts.prompts = deduplicatedPrompts;
+
+    const settleSlashCommandTurn = (
+      turn: any,
+      turnId: string,
+      clientId: string | null,
+      linkedTurnPrompts: PromptRecord[],
+      input: ReturnType<typeof extractUserInput>,
+    ): boolean => {
+      const primary = linkedTurnPrompts.find((item) => !promptWasSteeredIntoTurn(item, turnId))
+        ?? linkedTurnPrompts[0]
+        ?? (clientId ? bundle.prompts.prompts.find((item) => item.clientUserMessageId === clientId && (!item.threadId || item.threadId === threadId)) : undefined);
+      if (!primary) return false;
+      const affected = [primary, ...linkedTurnPrompts.filter((item) => item.id !== primary.id)];
+      const commandText = input?.text ?? primary.text;
+      if (!isSlashCommandPrompt(commandText)
+        || !affected.every((item) => isSlashCommandPrompt(item.text || commandText))) return false;
+
+      const completedAt = protocolTime(turn?.completedAt) ?? primary.completedAt ?? isoNow();
+      let changedPrompts = 0;
+      for (const current of affected) {
+        let changed = false;
+        const setPrompt = <K extends keyof PromptRecord>(key: K, value: PromptRecord[K]) => {
+          if (JSON.stringify(current[key]) === JSON.stringify(value)) return;
+          current[key] = value;
+          changed = true;
+        };
+        setPrompt("threadId", threadId);
+        setPrompt("codexTurnId", turnId);
+        setPrompt("completedAt", completedAt);
+        setPrompt("status", "completed");
+        setPrompt("error", null);
+        if (current.id === primary.id) {
+          if (clientId) setPrompt("clientUserMessageId", clientId);
+          if (input?.snapshot) setPrompt("inputSnapshot", input.snapshot);
+          if (!current.text && input?.text) setPrompt("text", input.text);
+          setPrompt("startedAt", protocolTime(turn?.startedAt) ?? current.startedAt);
+        }
+        for (const attempt of current.attempts) {
+          const matchesTurn = attempt.codexTurnId === turnId;
+          const matchesClient = Boolean(clientId) && attempt.clientUserMessageId === clientId;
+          if (!matchesTurn && !matchesClient) continue;
+          if (attempt.status === "completed" && attempt.completedAt === completedAt && attempt.error === null) continue;
+          attempt.status = "completed";
+          attempt.completedAt = completedAt;
+          attempt.codexTurnId = turnId;
+          attempt.error = null;
+          changed = true;
+        }
+        if (changed) {
+          current.updatedAt = isoNow();
+          changedPrompts += 1;
+        }
+        historyPrompts.push(current);
+      }
+      promptChanges += changedPrompts;
+
+      const completedAnswer = bundle.answers.answers.find((answer) => answer.threadId === threadId
+        && answer.codexTurnId === turnId
+        && answer.status === "completed");
+      if (completedAnswer) recordedAnswerTurnIds.add(turnId);
+      const before = bundle.answers.answers.length;
+      bundle.answers.answers = bundle.answers.answers.filter((answer) => !(answer.threadId === threadId
+        && answer.codexTurnId === turnId
+        && answer.status !== "completed"));
+      const removedAnswers = before - bundle.answers.answers.length;
+      answerChanges += removedAnswers;
+      if (changedPrompts || removedAnswers) report.repaired += changedPrompts + removedAnswers;
+      else report.skipped += 1;
+      return true;
+    };
 
     // Prompt files created before thread ownership was recorded can be repaired
     // from their answer linkage. This lets a later sync remove records belonging
@@ -473,13 +586,14 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
           report.ignored += 1;
           continue;
         }
+        const input = extractUserInput(items);
+        if (settleSlashCommandTurn(turn, turnId, clientId, linkedTurnPrompts, input)) continue;
         const prompt = linkedTurnPrompts.find((item) => !promptWasSteeredIntoTurn(item, turnId))
           ?? linkedTurnPrompts[0]
           ?? (clientId ? bundle.prompts.prompts.find((item) => item.clientUserMessageId === clientId && (!item.threadId || item.threadId === threadId)) : undefined);
         // Do not import arbitrary incomplete manual history. A local queue record
         // must already identify the interrupted/failed turn.
         if (!prompt) { report.ignored += 1; continue; }
-        const input = extractUserInput(items);
         // An interrupted/failed turn can still carry a partial agent message
         // (e.g. Claude's last text before a missing end_turn). Keep it so the
         // UI can show what was generated instead of an empty answer card.
@@ -586,6 +700,7 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       }
       const input = extractUserInput(items);
       const final = extractFinalAnswer(items);
+      if (!final && settleSlashCommandTurn(turn, turnId, clientId, linkedTurnPrompts, input)) continue;
       if (!input || !final) { report.ignored += 1; continue; }
       recordedAnswerTurnIds.add(turnId);
       const recovery = recoverableSubmissionForTurn(bundle.prompts.prompts, threadId, turn, input.text);
@@ -726,6 +841,46 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
         else report.skipped += 1;
       }
     }
+    // Slash commands omitted by provider history have no later final-answer
+    // event that could repair their local lifecycle. Settle only stale/terminal
+    // records; a command attached to a currently reported turn remains active.
+    for (const prompt of bundle.prompts.prompts) {
+      if (!isSlashCommandPrompt(prompt.text)) continue;
+      const terminalAnomaly = prompt.status === "failed" || prompt.status === "interrupted";
+      const missingActiveTurn = (prompt.status === "dispatching" || prompt.status === "running")
+        && (!prompt.codexTurnId || !historyTurnIds.has(prompt.codexTurnId));
+      if (!terminalAnomaly && !missingActiveTurn) continue;
+      const completedAt = prompt.completedAt ?? isoNow();
+      prompt.status = "completed";
+      prompt.completedAt = completedAt;
+      prompt.error = null;
+      prompt.updatedAt = isoNow();
+      for (const attempt of prompt.attempts) {
+        if (!["dispatching", "running", "failed", "interrupted"].includes(attempt.status)) continue;
+        attempt.status = "completed";
+        attempt.completedAt = attempt.completedAt ?? completedAt;
+        attempt.error = null;
+      }
+      promptChanges += 1;
+      report.repaired += 1;
+    }
+
+    // Never retain synthetic running/interrupted/failed answer cards for CLI
+    // commands. A genuine completed answer (for example a command that starts
+    // a real agent turn) remains authoritative and is preserved.
+    const promptById = new Map(bundle.prompts.prompts.map((prompt) => [prompt.id, prompt]));
+    const beforeSlashCleanup = bundle.answers.answers.length;
+    bundle.answers.answers = bundle.answers.answers.filter((answer) => {
+      if (answer.status === "completed") return true;
+      const linkedPrompt = promptById.get(answer.promptId);
+      return !isSlashCommandPrompt(linkedPrompt?.text ?? answer.prompt);
+    });
+    const removedSlashAnswers = beforeSlashCleanup - bundle.answers.answers.length;
+    if (removedSlashAnswers) {
+      answerChanges += removedSlashAnswers;
+      report.repaired += removedSlashAnswers;
+    }
+
     // final_answers.json mirrors the active conversation. Old-thread answers are
     // reproducible from Codex and must not leak into the currently selected tab.
     if (options.mode !== "merge") {
