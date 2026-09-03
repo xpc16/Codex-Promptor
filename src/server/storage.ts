@@ -495,7 +495,7 @@ export class StorageService {
   }
 }
 
-function recordsForCurrentThread(bundle: TabBundle): { prompts: PromptRecord[]; answers: AnswerRecord[] } {
+export function recordsForCurrentThread(bundle: TabBundle): { prompts: PromptRecord[]; answers: AnswerRecord[] } {
   const answers = currentAnswerRecords(bundle.tab, bundle.answers.answers);
   const prompts = currentPromptRecords(bundle.tab, bundle.prompts.prompts, answers);
   return { prompts, answers };

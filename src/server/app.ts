@@ -24,6 +24,7 @@ import { syncClaudeHistory } from "./claude-history.js";
 import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorHookBridge, probeCursorVersion } from "./cursor.js";
 import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
+import { buildConversationMarkdown, conversationExportFilename } from "./conversation-export.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
 import { locateCodexRollout, readCodexRolloutThread, readCodexThreadForHistory } from "./codex-history.js";
 import { decideStall, noteRolloutSize, TURN_STALL_POLL_MS, type RolloutProgress } from "./turn-stall.js";
@@ -37,7 +38,7 @@ import { entityTag, ifMatchSatisfied, ifNoneMatchSatisfied, REVALIDATE_CACHE_CON
 import { CLAUDE_EXIT_MARKER, CODEX_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
 import { isSlashCommandPrompt } from "./prompt-submit.js";
 import { RunnerManager } from "./queue.js";
-import { StorageService } from "./storage.js";
+import { recordsForCurrentThread, StorageService } from "./storage.js";
 import { TimerService, TimerServiceError } from "./timer-service.js";
 import {
   BoundedWebSocketSender,
@@ -1934,6 +1935,39 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       return missing
         ? apiError(reply, 404, "TAB_NOT_FOUND", message)
         : apiError(reply, 503, "TAB_READ_FAILED", message, true);
+    }
+  });
+
+  app.get("/api/tabs/:tabId/export.md", async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    if (!isLocalBrowserRequest(request.headers)) {
+      return apiError(reply, 403, "CONVERSATION_EXPORT_LOCAL_ONLY", "Conversation export is available only from a loopback browser.");
+    }
+    const tabId = String((request.params as any).tabId);
+    const locale = (request.query as any)?.locale === "en" ? "en" : "zh-CN";
+    try {
+      // Read the full persisted files before selecting the current thread, so
+      // the export is complete even when the page itself uses a small window.
+      const bundle = await storage.readTab(tabId);
+      const records = recordsForCurrentThread(bundle);
+      const visibleBundle: TabBundle = {
+        ...bundle,
+        prompts: { ...bundle.prompts, prompts: records.prompts },
+        answers: { ...bundle.answers, answers: records.answers },
+      };
+      const exportedAt = new Date();
+      const filename = conversationExportFilename(bundle.tab.name, exportedAt);
+      return reply
+        .header("Content-Type", "text/markdown; charset=utf-8")
+        .header("Content-Disposition", `attachment; filename="codex-promptor-conversation.md"; filename*=UTF-8''${encodeURIComponent(filename)}`)
+        .header("X-Codex-Promptor-Filename", encodeURIComponent(filename))
+        .send(buildConversationMarkdown(visibleBundle, locale, exportedAt));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const missing = (error as NodeJS.ErrnoException)?.code === "ENOENT";
+      return missing
+        ? apiError(reply, 404, "TAB_NOT_FOUND", message)
+        : apiError(reply, 503, "CONVERSATION_EXPORT_FAILED", message, true);
     }
   });
 

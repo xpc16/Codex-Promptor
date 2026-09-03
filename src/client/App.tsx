@@ -57,6 +57,7 @@ import {
   type Locale,
 } from "./i18n.js";
 import { api, jsonBody, promptorToken as token } from "./api-client.js";
+import { downloadConversationMarkdown } from "./conversation-export.js";
 import { MarkdownView, preloadMarkdownView } from "./markdown-view.js";
 import { DocumentView, useDocumentViewer, type DocumentOpenIntent } from "./document-viewer.js";
 import { insertCommonPrompt, type DraftSelection } from "./prompt-insertion.js";
@@ -1031,6 +1032,7 @@ function SessionPanel({ bundle, height, reopening, onReopen, onBundle, onError }
   const [provider, setProvider] = useState<AgentProvider>(initialDraft.provider);
   const [resumeId, setResumeId] = useState(initialDraft.resumeId);
   const [busy, setBusy] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [browsing, setBrowsing] = useState(false);
   const restoring = session.state === "connecting" && Boolean(session.threadId && session.workingDirectory);
   const connected = session.state === "ready" || session.state === "closed" || restoring;
@@ -1057,6 +1059,12 @@ function SessionPanel({ bundle, height, reopening, onReopen, onBundle, onError }
     finally { setBrowsing(false); }
   };
   const closeConversation = async () => { try { setBusy(true); onBundle(await api<TabBundle>(`/api/tabs/${bundle.tab.id}/session/close`, { method: "POST" })); } catch (reason) { onError(reason); } finally { setBusy(false); } };
+  const exportConversation = async () => {
+    if (exporting) return;
+    try { setExporting(true); await downloadConversationMarkdown(bundle.tab.id, i18n.locale); }
+    catch (reason) { onError(reason); }
+    finally { setExporting(false); }
+  };
   const activeProvider = connected ? session.provider : provider;
   const providerName = t(activeProvider === "claude" ? "provider.claude" : activeProvider === "cursor" ? "provider.cursor" : activeProvider === "shell" ? "provider.shell" : "provider.codex");
   // A terminal has no agent, so everything downstream of one is switched off.
@@ -1075,7 +1083,7 @@ function SessionPanel({ bundle, height, reopening, onReopen, onBundle, onError }
       : t("session.setupHelp");
   return <div className="session-card" style={height === null ? undefined : { height: `${height}%`, maxHeight: "none" }}>
     <div className="section-title"><span className="section-icon">◌</span><div><strong>{sessionTitle}</strong><small>{sessionHelp}</small></div></div>
-    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t("session.workingDirectory")}</span><code>{session.workingDirectory}</code></div>{session.provider !== "shell" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <button className="danger-action" disabled={busy} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>}</div></div> : <>
+    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t("session.workingDirectory")}</span><code>{session.workingDirectory}</code></div>{session.provider !== "shell" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <button className="danger-action" disabled={busy} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>}{localFolderPicker && <button className="ghost" disabled={exporting} onClick={() => void exportConversation()}>{t(exporting ? "session.exporting" : "session.export")}</button>}</div></div> : <>
       <label className="field-label">{t(localFolderPicker ? "session.localPath" : "session.remotePath")}</label><div className={`path-row ${localFolderPicker ? "" : "remote"}`}><input value={cwd} title={cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t("session.pathExample")} />{localFolderPicker && <button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button>}</div>{!localFolderPicker && <small className="field-hint">{t("session.remotePathHint")}</small>}{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}
       {!isShell && <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => setMode("new")}>{t("session.createNew")}</button><button className={mode === "resume" ? "active" : ""} onClick={() => setMode("resume")}>{t("session.resumeOld")}</button></div>}
       {!isShell && mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} placeholder={t("session.resumePlaceholder")} />}
