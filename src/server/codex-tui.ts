@@ -106,7 +106,7 @@ function deferred<T>(): Deferred<T> {
   return value;
 }
 
-/** Native Codex TUI adapter used by the experimental PTY/hooks transport. */
+/** Native Codex TUI adapter behind the default PTY/hooks transport. */
 export class CodexTuiManager extends EventEmitter implements QueueBinding {
   readonly rpc: QueueRpc;
   private launchReady: Deferred<CodexTuiSessionInfo> | null = null;

@@ -20,9 +20,12 @@ describe("provider resume id validation", () => {
 
 describe("Codex connection mode", () => {
   it("keeps App Server as the safe default and enables PTY/hooks explicitly", () => {
-    expect(codexConnectionModeFromEnv(undefined)).toBe("app-server");
-    expect(codexConnectionModeFromEnv("unknown")).toBe("app-server");
+    // Hooks are the default; the App Server is the way back, and only an
+    // exact request for it counts -- a typo must not silently change transport.
+    expect(codexConnectionModeFromEnv(undefined)).toBe("pty-hooks");
+    expect(codexConnectionModeFromEnv("unknown")).toBe("pty-hooks");
     expect(codexConnectionModeFromEnv("PTY-HOOKS")).toBe("pty-hooks");
+    expect(codexConnectionModeFromEnv(" App-Server ")).toBe("app-server");
   });
 });
 

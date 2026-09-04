@@ -66,8 +66,15 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 
 export type CodexConnectionMode = "app-server" | "pty-hooks";
 
+/**
+ * Codex runs over the native TUI with hooks by default. The App Server remains
+ * reachable with `CODEX_PROMPTOR_CODEX_CONNECTION_MODE=app-server` as a way
+ * back, because the two transports differ in how a conversation is created:
+ * hooks bind a tab when SessionStart fires, which is after the first prompt,
+ * so a thread only becomes a tab's own once Codex has written it to disk.
+ */
 export function codexConnectionModeFromEnv(value: unknown): CodexConnectionMode {
-  return String(value ?? "").trim().toLowerCase() === "pty-hooks" ? "pty-hooks" : "app-server";
+  return String(value ?? "").trim().toLowerCase() === "app-server" ? "app-server" : "pty-hooks";
 }
 
 export function isValidResumeId(provider: AgentProvider, resumeId: string): boolean {
