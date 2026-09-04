@@ -224,7 +224,7 @@ export class DocumentService {
     if (target.kind !== "local-file") throw new DocumentError(400, "DOCUMENT_LINK_INVALID", "The link is not a local document path.");
     const parsed = parseLocalHref(request.href);
     const bundle = await this.storage.readTab(request.tabId).catch(() => null);
-    if (!bundle) throw new DocumentError(404, "DOCUMENT_ACCESS_DENIED", "The target tab does not exist.");
+    if (!bundle) throw new DocumentError(404, "DOCUMENT_TAB_UNKNOWN", "The target tab does not exist.");
 
     const roots = new Set<string>(this.configuredRoots);
     const docsRoot = await canonicalDirectory(path.join(this.rootDir, "docs"));
@@ -236,15 +236,24 @@ export class DocumentService {
 
     let base: string | null = null;
     if (request.parentDocId) {
+      // Memos live in memory, so every parent id is unknown after a restart.
+      // That is a stale viewer, not a permission problem, and saying "outside
+      // the allowed directories" sends the reader looking for the wrong thing.
       const parent = this.memo.get(request.parentDocId);
-      if (!parent || !parent.authorizedTabIds.has(request.tabId)) {
+      if (!parent) throw new DocumentError(409, "DOCUMENT_PARENT_UNKNOWN", "The containing document must be opened again.");
+      if (!parent.authorizedTabIds.has(request.tabId)) {
         throw new DocumentError(403, "DOCUMENT_ACCESS_DENIED", "The parent document is not authorized for this tab.");
       }
       base = path.dirname(parent.canonicalPath);
       for (const root of parent.authorizedRoots) roots.add(root);
     } else if (request.answerId) {
+      // A page that has not caught up sends the answer id it last saw, and
+      // history reconciliation can replace those records underneath it.
+      // Naming an answer only ever widens what is reachable, so an id this tab
+      // no longer has falls back to the working directory -- the same position
+      // as sending no id at all. Sending a stale one must not be worse than
+      // sending none, which is what refusing here made it.
       const answer = bundle.answers.answers.find((record) => record.id === request.answerId);
-      if (!answer) throw new DocumentError(403, "DOCUMENT_ACCESS_DENIED", "The answer is not part of this tab.");
       const storedBase = answer?.metadata.documentBasePath;
       if (typeof storedBase === "string") {
         base = await canonicalDirectory(storedBase);

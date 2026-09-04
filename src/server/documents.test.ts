@@ -106,6 +106,26 @@ describe("DocumentService", () => {
       .rejects.toMatchObject({ code: "DOCUMENT_CHANGED" });
   });
 
+  it("does not report a stale viewer as a directory problem", async () => {
+    // Memos are in-process, so a restart invalidates every parent id at once.
+    // Reporting that as "outside the allowed directories" sent a reader looking
+    // for a permission problem that was not there.
+    const { workspace, tab, documents } = await fixture();
+    await fs.writeFile(path.join(workspace, "child.md"), "child", "utf8");
+    await expect(documents.open({ tabId: tab.id, href: "./child.md", parentDocId: "AAAAAAAAAAAAAAAAAAAAAA" }))
+      .rejects.toMatchObject({ code: "DOCUMENT_PARENT_UNKNOWN" });
+  });
+
+  it("treats an answer it no longer has as no answer at all", async () => {
+    // A page that has not caught up sends the id it last saw. Naming an answer
+    // only widens what is reachable, so an unknown one has to land where
+    // sending nothing lands -- refusing made the stale id worse than no id.
+    const { workspace, tab, documents } = await fixture();
+    await fs.writeFile(path.join(workspace, "answer-linked.md"), "body", "utf8");
+    const opened = await documents.open({ tabId: tab.id, href: "./answer-linked.md", answerId: "an-answer-this-tab-no-longer-has" });
+    expect(opened.name).toBe("answer-linked.md");
+  });
+
   it("requires a path-and-revision-bound confirmation before opening active files", async () => {
     const { workspace, tab, documents, opener } = await fixture();
     await fs.writeFile(path.join(workspace, "run.ps1"), "Write-Host test", "utf8");
