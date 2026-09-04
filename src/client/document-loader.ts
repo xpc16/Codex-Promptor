@@ -36,6 +36,42 @@ export type DocumentTransport = {
   chunk: (metadata: DocumentOpenMetadata, index: number, signal: AbortSignal) => Promise<Uint8Array>;
 };
 
+/**
+ * How many containing documents may be reopened to follow one link.
+ *
+ * A restart invalidates every id at once, so a reader three documents deep has
+ * a whole stale chain behind them. Walking it is bounded rather than open:
+ * beyond a few steps the reopening is more surprising than the error.
+ */
+const MAX_PARENT_REFRESH_DEPTH = 3;
+
+/**
+ * Whether a failed link click should be retried by reopening the document it
+ * was clicked in.
+ *
+ * The server keeps its document registry in memory, so a page left open across
+ * a restart holds ids that no longer exist and sends one as the link's parent.
+ * Nothing is wrong with the link or the file -- only the handle is stale, and
+ * minting a fresh one resolves the link exactly as it would have resolved
+ * before. Dropping the parent instead would be wrong: it moves a relative
+ * href's base from the containing document's directory to the tab's working
+ * directory, which can quietly open a different file.
+ */
+export function shouldRefreshStaleParent(input: {
+  code: string | null;
+  /** The parent id the failed request carried. */
+  parentDocId: string | undefined;
+  /** The document that was open when the link was clicked. */
+  openDocId: string | null;
+  depth: number;
+}): boolean {
+  if (input.code !== "DOCUMENT_PARENT_UNKNOWN" || !input.parentDocId) return false;
+  // Only the document being navigated from can be reissued; an id from
+  // anywhere else is not this viewer's to refresh.
+  if (input.openDocId !== input.parentDocId) return false;
+  return input.depth < MAX_PARENT_REFRESH_DEPTH;
+}
+
 const initialState = (epoch = 0): DocumentViewerState => ({
   status: "closed",
   viewerReserved: false,
@@ -76,8 +112,12 @@ export class DocumentLoader {
     return () => { this.listeners.delete(listener); };
   }
 
-  async open(source: DocumentOpenRequest, reopenedUnknownId = false): Promise<void> {
+  async open(source: DocumentOpenRequest, reopenedUnknownId = false, refreshDepth = 0): Promise<void> {
     const reserveViewer = this.stateValue.viewerReserved;
+    // Captured before the state is replaced below: recovering from a stale
+    // parent id needs the document the reader was standing in.
+    const from = this.stateValue.source;
+    const fromDocId = this.stateValue.docId;
     this.abort();
     const epoch = this.stateValue.documentEpoch + 1;
     this.decoder = new TextDecoder("utf-8", { fatal: true });
@@ -107,7 +147,20 @@ export class DocumentLoader {
     } catch (error) {
       if (!this.current(epoch, attempt, controller.signal) || isAbort(error)) return;
       this.controller = null;
-      this.set({ ...this.stateValue, status: "error", error: asError(error) });
+      const failure = asError(error);
+      const code = failure instanceof PromptorApiError ? failure.code : null;
+      if (from && shouldRefreshStaleParent({ code, parentDocId: source.parentDocId, openDocId: fromDocId, depth: refreshDepth })) {
+        // Reopen the containing document first, then follow the link from the
+        // id that comes back. Each level of a stale chain unwinds the same way,
+        // and a failure on the way leaves its own error on screen.
+        await this.open(from, false, refreshDepth + 1);
+        const parentDocId = this.stateValue.docId;
+        if (this.stateValue.status === "open" && parentDocId) {
+          await this.open({ ...source, parentDocId }, false, refreshDepth + 1);
+        }
+        return;
+      }
+      this.set({ ...this.stateValue, status: "error", error: failure });
     }
   }
 
