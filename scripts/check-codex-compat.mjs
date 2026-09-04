@@ -22,7 +22,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
-import { buildCodexHookOverride } from "../src/server/codex-tui.ts";
+import { buildCodexHookOverride, resolveHookCommandPaths } from "../src/server/codex-tui.ts";
 
 const execFileAsync = promisify(execFile);
 const isWindows = process.platform === "win32";
@@ -63,8 +63,20 @@ for (const flag of ["--remote", "--no-alt-screen", "-C", "--dangerously-bypass-h
 note(/\bresume\b/.test(help), "subcommand resume", /\bresume\b/.test(help) ? "present" : "missing", "reopening a conversation");
 note(/\bapp-server\b/.test(help), "subcommand app-server", /\bapp-server\b/.test(help) ? "present" : "missing", "the whole RPC path");
 
-const hookOverride = buildCodexHookOverride(path.join(process.cwd(), "scripts", "codex-hook.mjs"));
+// The app resolves both halves to 8.3 short names before building the TOML,
+// because Codex splits a hook command on whitespace and ignores quotes. Doing
+// that here too is what lets this check run when Node sits under Program
+// Files -- the default install -- instead of dying before it reaches the real
+// test, which is what it did for every such machine.
+let hookOverride = null;
 try {
+  const { node, script } = await resolveHookCommandPaths(path.join(process.cwd(), "scripts", "codex-hook.mjs"));
+  hookOverride = buildCodexHookOverride(script, node);
+  note(true, "hook command path", `${node} ${script}`, "native PTY/hooks transport");
+} catch (error) {
+  note(false, "hook command path", String(error?.message ?? error), "native PTY/hooks transport");
+}
+if (hookOverride) try {
   const result = await execFileAsync(command, ["-c", hookOverride, "--version"], { windowsHide: true, shell: commandNeedsShell });
   note(result.stdout.includes("codex-cli"), "per-run hook TOML", String(result.stdout).trim(), "native PTY/hooks transport");
 } catch (error) {
