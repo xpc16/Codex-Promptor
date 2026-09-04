@@ -8,7 +8,7 @@
  * anything longer stops at the cap and scrolls inside its own box so the
  * queue stays scannable.
  */
-export const PROMPT_ROW_MAX_LINES = 3;
+export const PROMPT_ROW_MAX_LINES = 4;
 
 export type TextareaMetrics = {
   /** Natural laid-out height at the current width, including padding. */
@@ -24,8 +24,8 @@ export type TextareaMetrics = {
 /**
  * How many lines the box will show, capped.
  *
- * The row's controls arrange themselves around this: one line leaves no room
- * beside the text for two buttons side by side, two or three lines do.
+ * Action placement is decided separately from natural text width, so changing
+ * this height cannot make the controls bounce between inline and wrapped.
  */
 export function autoSizedLines({ scrollHeight, lineHeight, padding, maxLines = PROMPT_ROW_MAX_LINES }: TextareaMetrics): number {
   const cap = Math.max(1, Math.trunc(maxLines));

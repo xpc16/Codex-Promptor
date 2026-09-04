@@ -69,7 +69,7 @@ input, textarea, select { color: var(--text); }
    track sizing straight onto the element on mount and on every drag frame
    (pane-drag.ts), so React never re-applies a stale size mid-gesture. */
 .app-shell { display: grid; grid-template-columns: 300px 7px minmax(0, 1fr); width: 100%; height: 100vh; overflow: hidden; background: var(--page); }
-.sidebar { min-width: 0; height: 100vh; overflow: hidden; display: flex; flex-direction: column; padding: 20px 14px 14px; background: var(--sidebar); border-right: 1px solid var(--border); }
+.sidebar { min-width: 0; height: 100vh; overflow: hidden; display: flex; flex-direction: column; padding: 20px 14px 8px; background: var(--sidebar); border-right: 1px solid var(--border); }
 .console-splitter, .splitter { cursor: col-resize; position: relative; z-index: 2; }
 .console-splitter { height: 100vh; background: color-mix(in srgb, var(--border) 80%, transparent); border-left: 2px solid transparent; border-right: 2px solid transparent; }
 .console-splitter:hover, .console-splitter:active, .splitter:hover, .splitter:active { background: color-mix(in srgb, var(--primary) 30%, transparent); border-color: var(--primary); }
@@ -89,19 +89,19 @@ input, textarea, select { color: var(--text); }
 .ghost:hover:not(:disabled), .icon-button:hover, .footer-compact-button:hover { background: var(--panel-strong); color: var(--text); }
 
 .tab-tree { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 2px 3px 10px; overscroll-behavior: contain; }
-.group { margin: 4px 0 14px; }
-.group-heading { min-height: 34px; display: flex; align-items: center; gap: 7px; padding: 4px 5px; color: var(--muted); border-radius: 7px; user-select: none; }
+.group { margin: 3px 0 10px; }
+.group-heading { min-height: 28px; display: flex; align-items: center; gap: 5px; padding: 2px 4px; color: var(--muted); border-radius: 7px; user-select: none; }
 .group-heading[draggable="true"] { cursor: grab; }
 .group-heading[draggable="true"]:active { cursor: grabbing; }
 .collapse-button { flex: none; display: grid; place-items: center; background: transparent; color: var(--faint); border-radius: 5px; }
-.collapse-button { width: 24px; height: 28px; font-size: 20px; line-height: 1; }
+.collapse-button { width: 22px; height: 24px; font-size: 20px; line-height: 1; }
 .collapse-button:hover { color: var(--primary); background: var(--primary-soft); }
 .console-drag { color: var(--faint); cursor: grab; user-select: none; }
 .group-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 700; letter-spacing: .02em; }
 .group-heading em { margin-left: auto; color: var(--faint); font-size: 12px; font-style: normal; }
 .ungrouped-group .group-heading { margin-top: 2px; }
 
-.tab-row { width: 100%; min-height: 38px; display: grid; grid-template-columns: 18px minmax(0, 1fr) 30px; align-items: center; gap: 2px; padding: 2px 4px 2px 27px; border-radius: 8px; color: var(--muted); user-select: none; }
+.tab-row { width: 100%; min-height: 28px; display: grid; grid-template-columns: 16px minmax(0, 1fr) 26px; align-items: center; gap: 2px; padding: 1px 3px 1px 24px; border-radius: 8px; color: var(--muted); user-select: none; }
 .tab-row:hover { background: var(--panel-strong); color: var(--text); }
 .tab-row.selected { background: var(--primary-soft); color: var(--text); box-shadow: inset 3px 0 var(--primary); }
 .console-drag { text-align: center; font-size: 13px; }
@@ -110,10 +110,10 @@ input, textarea, select { color: var(--text); }
 .tab-row[data-provider="cursor"] .console-drag { color: var(--provider-cursor); }
 .tab-row[data-provider="shell"] .console-drag { color: var(--provider-shell); }
 .tab-row.navigation-drop-target, .group-heading.navigation-drop-target { background: var(--primary-soft); box-shadow: inset 0 -3px var(--primary); }
-.tab-button { min-width: 0; width: 100%; display: flex; align-items: center; gap: 8px; padding: 7px 3px; text-align: left; background: transparent; font-size: 14px; }
+.tab-button { min-width: 0; width: 100%; display: flex; align-items: center; gap: 7px; padding: 4px 3px; text-align: left; background: transparent; font-size: 14px; }
 .tab-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row-actions-anchor { flex: none; width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; }
-.row-actions-button { width: 28px; height: 28px; display: grid; place-items: center; padding: 0 0 4px; border-radius: 6px; background: transparent; color: var(--faint); font-size: 21px; font-weight: 700; line-height: 1; }
+.row-actions-anchor { flex: none; width: 24px; height: 24px; display: inline-flex; align-items: center; justify-content: center; }
+.row-actions-button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0 0 3px; border-radius: 6px; background: transparent; color: var(--faint); font-size: 19px; font-weight: 700; line-height: 1; }
 .row-actions-button:hover, .row-actions-button[aria-expanded="true"] { background: var(--panel-strong); color: var(--text); }
 .row-actions-menu { position: fixed; z-index: 1000; width: 116px; display: grid; gap: 3px; padding: 5px; border: 1px solid var(--border-strong); border-radius: 9px; background: var(--panel); box-shadow: 0 10px 28px rgba(31, 42, 63, .2); }
 .row-actions-menu button { width: 100%; padding: 8px 10px; border-radius: 6px; background: transparent; color: var(--text); font-size: 13px; text-align: left; }
@@ -151,16 +151,15 @@ input, textarea, select { color: var(--text); }
 .empty-sidebar { padding: 34px 12px; color: var(--muted); text-align: center; font-size: 14px; line-height: 1.7; }
 .empty-sidebar span { color: var(--faint); font-size: 12px; }
 
-.sidebar-footer { flex: none; display: grid; gap: 9px; padding: 12px 4px 0; border-top: 1px solid var(--border); }
-.footer-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
-.footer-bottom-row { min-width: 0; display: grid; grid-template-columns: 32px minmax(0, 1fr) 54px; align-items: center; gap: 4px; }
-.footer-compact-button { height: 32px; display: flex; align-items: center; justify-content: center; padding: 0; }
-.theme-icon-toggle { width: 32px; }
-.theme-icon-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.locale-toggle { gap: 3px; padding: 0 6px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.sidebar-footer { flex: none; display: grid; padding: 6px 2px 0; border-top: 1px solid var(--border); }
+.footer-bottom-row { min-width: 0; display: grid; grid-template-columns: 26px 26px minmax(0, 1fr) 50px; align-items: center; gap: 3px; }
+.footer-compact-button { height: 26px; display: flex; align-items: center; justify-content: center; padding: 0; }
+.theme-icon-toggle, .refresh-icon-button { width: 26px; }
+.theme-icon-toggle svg, .refresh-icon-button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.locale-toggle { gap: 2px; padding: 0 4px; font-size: 10px; font-weight: 600; white-space: nowrap; }
 .locale-toggle span { color: var(--faint); }
 .locale-toggle span.active { color: var(--primary); font-weight: 800; }
-.service-status { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 4px; color: var(--muted); font-size: 10px; }
+.service-status { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 3px; color: var(--muted); font-size: 9px; }
 .service-status time { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .muted { margin-left: auto; color: var(--faint); }
 
@@ -288,7 +287,10 @@ input, textarea, select { color: var(--text); }
 .queue-card > .runner-error { flex: none; margin: 8px 0 0; overflow-wrap: anywhere; }
 .status-dot.running { background: var(--primary); box-shadow: 0 0 8px color-mix(in srgb, var(--primary) 55%, transparent); }
 .prompt-list { flex: 1; min-height: 0; overflow-y: auto; display: grid; align-content: start; gap: 8px; margin-top: 10px; padding-right: 3px; overscroll-behavior: contain; scrollbar-gutter: stable; }
-.prompt-row { display: grid; grid-template-columns: 24px 18px minmax(0, 1fr) auto; gap: 7px; align-items: start; padding: 10px 9px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel-soft); transition: .14s; }
+.prompt-row { position: relative; display: grid; grid-template-columns: 24px 18px minmax(0, 1fr) auto; column-gap: 7px; row-gap: 0; align-items: start; padding: 10px 9px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel-soft); transition: .14s; }
+.prompt-row > textarea { grid-column: 3; grid-row: 1; }
+.prompt-row.actions-below { grid-template-columns: 24px 18px minmax(0, 1fr); row-gap: 6px; }
+.prompt-row.actions-below .prompt-side { grid-column: 3; grid-row: 2; justify-self: end; }
 .prompt-row:hover { border-color: var(--border-strong); }
 .prompt-row.completed { opacity: .65; background: var(--panel-strong); }
 .prompt-row.failed { border-color: color-mix(in srgb, var(--danger) 50%, var(--border)); }
@@ -298,7 +300,7 @@ input, textarea, select { color: var(--text); }
 .drag-handle.enabled { user-select: none; touch-action: none; }
 .drag-handle.enabled.dragging { color: var(--primary); cursor: grabbing; }
 /* Height is set inline from the measured text (see textarea-autosize): one
-   line for a one-line prompt, up to three, then the box scrolls inside itself.
+   line for a one-line prompt, up to four, then the box scrolls inside itself.
    No max-height here -- the cap depends on the padding, which differs between
    the resting and editing states, and the measurement already accounts for it. */
 .prompt-row textarea { width: 100%; resize: none; overflow-y: auto; overscroll-behavior-y: auto; padding: 1px 0; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 13px; line-height: 1.5; }
@@ -307,8 +309,8 @@ input, textarea, select { color: var(--text); }
 .prompt-row textarea:disabled { color: var(--muted); }
 .prompt-row.locked { background: color-mix(in srgb, var(--panel-soft) 82%, var(--page)); }
 .prompt-row.locked .drag-handle { opacity: .3; cursor: not-allowed; }
-.prompt-side { min-width: 70px; max-width: 190px; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; }
-.prompt-status { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.prompt-side { grid-column: 4; grid-row: 1; min-width: max-content; display: flex; flex-wrap: nowrap; align-items: center; justify-content: flex-end; gap: 6px; white-space: nowrap; }
+.prompt-status { display: inline-flex; flex-wrap: nowrap; justify-content: flex-end; gap: 5px; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .prompt-status time { color: var(--faint); font-variant-numeric: tabular-nums; }
 .completed .prompt-status { color: var(--success); }
 .failed .prompt-status { color: var(--danger); }
@@ -320,23 +322,15 @@ input, textarea, select { color: var(--text); }
 .prompt-edit-button, .prompt-send-button { width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 1px solid var(--border); border-radius: 5px; background: var(--panel); color: var(--primary); font-size: 15px; line-height: 1; }
 .prompt-edit-button:hover:not(:disabled), .prompt-send-button:hover:not(:disabled) { border-color: var(--primary); background: var(--primary-soft); }
 .send-icon { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
-/*
- * One line leaves no vertical room, so the two controls sit side by side. From
- * two lines up the row is already tall enough to stack them, which keeps the
- * text column wide instead of spending the extra width on buttons.
- */
-/* Keep the outer footprint identical when multiline switches the buttons from
-   a row (24 + 6 + 24) to a column. Otherwise that switch widens the textarea,
-   which can make it one line again and start a ResizeObserver feedback loop. */
 .prompt-icon-group { width: 54px; flex: 0 0 54px; display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
-.prompt-row.multiline .prompt-icon-group { flex-direction: column; align-items: flex-end; }
-.add-prompt { flex: none; display: flex; gap: 8px; align-items: stretch; margin-top: 10px; }
+.add-prompt { flex: none; display: flex; gap: 8px; align-items: flex-end; margin-top: 10px; }
 .prompt-composer { position: relative; flex: 1 1 auto; min-width: 0; height: 50px; min-height: 50px; max-height: min(45vh, 420px); }
 .prompt-composer textarea { display: block; width: 100%; height: 100%; min-height: 0; max-height: none; resize: none; overflow-y: auto; }
 .prompt-composer-resizer { position: absolute; z-index: 2; top: -5px; right: 0; left: 0; height: 10px; cursor: ns-resize; touch-action: none; outline: 0; }
 .prompt-composer-resizer::after { content: ""; position: absolute; top: 4px; right: 8px; left: 8px; height: 2px; border-radius: 2px; background: transparent; }
 .prompt-composer-resizer:hover::after, .prompt-composer-resizer:focus-visible::after { background: color-mix(in srgb, var(--primary) 58%, transparent); }
-.compose-tools { display: grid; grid-template-rows: 1fr 1fr; gap: 5px; }
+.compose-tools { flex: none; height: 50px; display: grid; grid-template-rows: 1fr 1fr; gap: 5px; }
+.add-prompt > .primary { flex: none; height: 50px; display: grid; place-items: center; padding-block: 0; }
 .compose-tool { width: 34px; min-height: 0; display: grid; place-items: center; padding: 4px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--panel-soft); color: var(--muted); }
 .compose-tool:hover { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); }
 .compose-tool svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
@@ -402,11 +396,16 @@ input, textarea, select { color: var(--text); }
 
 .terminal-card { display: flex; flex-direction: column; overflow: hidden; }
 .terminal-heading { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 13px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 13px; }
-.terminal-heading > span:first-child { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 700; }
-.terminal-meta { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 6px; color: var(--muted); font-size: 11px; }
-.terminal-meta b { margin-left: 5px; color: var(--text); font-size: 12px; }
-.terminal-key-control select { max-width: 112px; padding: 3px 22px 3px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft); color: var(--text); font-size: 11px; cursor: pointer; }
+.terminal-heading > span:first-child { min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 700; }
+.terminal-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-meta { flex: none; min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 6px; color: var(--muted); font-size: 11px; }
+.terminal-key-control { flex: none; position: relative; width: 36px; height: 28px; display: grid; place-items: center; color: var(--muted); }
+.terminal-key-control select { position: absolute; inset: 0; width: 100%; height: 100%; max-width: none; padding: 0; appearance: none; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft); color: transparent; font-size: 11px; cursor: pointer; }
+.terminal-key-control select option { background: var(--panel); color: var(--text); }
 .terminal-key-control select:disabled { cursor: default; }
+.terminal-key-icon { position: relative; z-index: 1; width: 20px; height: 20px; pointer-events: none; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.terminal-key-control:hover .terminal-key-icon, .terminal-key-control:focus-within .terminal-key-icon { color: var(--text); }
+.terminal-key-control select:disabled + .terminal-key-icon { opacity: .42; }
 .terminal-channel-status { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 999px; background: var(--panel-soft); white-space: nowrap; }
 .terminal-channel-status strong { padding-left: 6px; border-left: 1px solid var(--border); color: var(--muted); font-size: 10px; letter-spacing: .03em; }
 .terminal-channel-status.projection { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); background: color-mix(in srgb, var(--success) 9%, var(--panel)); }
@@ -478,7 +477,7 @@ input, textarea, select { color: var(--text); }
   .conversation-pane { padding-right: 7px; }
   .queue-pane { padding-left: 7px; }
   .session-ids { grid-template-columns: 1fr; }
-  .prompt-side { min-width: 60px; flex-wrap: wrap; }
+  .prompt-side { min-width: max-content; }
 }
 
 /* The desktop layout puts four panes on screen at once — console, conversation,
@@ -520,7 +519,7 @@ input, textarea, select { color: var(--text); }
   }
   .console-splitter { display: none; }
   .sidebar, .workspace { grid-area: 1 / 1; min-width: 0; min-height: 0; height: 100%; }
-  .sidebar { padding: 16px 12px 10px; border-right: none; }
+  .sidebar { padding: 16px 12px 6px; border-right: none; }
   .app-shell:not([data-mobile-pane="console"]) .sidebar,
   .app-shell[data-mobile-pane="console"] .workspace { visibility: hidden; pointer-events: none; }
 
@@ -539,10 +538,13 @@ input, textarea, select { color: var(--text); }
   .mobile-pane-bar { grid-area: 2 / 1; display: grid; }
   .answer-scroll, .prompt-list, .tab-tree { -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
 
-  /* A queue row on a phone has no width to spare: the status and its buttons
-     move under the prompt so the text keeps the full column, which is what
-     makes an opened editor readable rather than a two-character slot. */
-  .prompt-row { grid-template-columns: 24px 18px minmax(0, 1fr); gap: 6px; }
-  .prompt-side { grid-column: 3; max-width: none; justify-content: flex-start; }
+  /* The same measured wrap rule applies on a phone; most prompts naturally
+     move the compact action row below, while genuinely short ones stay inline. */
+  .prompt-row { column-gap: 6px; }
   .prompt-row textarea.editing { padding: 6px 8px; }
+  .terminal-heading { gap: 6px; padding: 8px 10px; }
+  .terminal-heading > span:first-child { gap: 6px; }
+  .terminal-meta { gap: 4px; }
+  .terminal-channel-status { gap: 3px; padding: 3px 5px; }
+  .terminal-channel-status strong { padding-left: 4px; font-size: 9px; }
 }

@@ -11,6 +11,7 @@ describe("queue row height", () => {
   it("grows with the prompt up to the cap", () => {
     expect(autoSizedHeight({ ...base, scrollHeight: 42 })).toBe(42);
     expect(autoSizedHeight({ ...base, scrollHeight: 62 })).toBe(62);
+    expect(autoSizedHeight({ ...base, scrollHeight: 82 })).toBe(82);
   });
 
   it("stops at the cap and leaves the rest to scroll inside the box", () => {
@@ -19,7 +20,7 @@ describe("queue row height", () => {
 
   it("counts wrapped lines, not newlines -- the height is what was measured", () => {
     // One unbroken prompt that wrapped to five visual lines still fills the cap.
-    expect(autoSizedHeight({ ...base, scrollHeight: 102 })).toBe(62);
+    expect(autoSizedHeight({ ...base, scrollHeight: 102 })).toBe(82);
   });
 
   it("includes padding and border because the box is border-box sized", () => {
@@ -50,6 +51,7 @@ describe("how many lines the row will show", () => {
     expect(autoSizedLines(metrics(22))).toBe(1);
     expect(autoSizedLines(metrics(42))).toBe(2);
     expect(autoSizedLines(metrics(62))).toBe(3);
+    expect(autoSizedLines(metrics(82))).toBe(4);
   });
 
   it("stops at the cap however long the prompt is", () => {
