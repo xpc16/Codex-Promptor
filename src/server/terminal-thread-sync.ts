@@ -1,5 +1,6 @@
 import { isoNow } from "../shared/schemas.js";
 import { readCodexThreadForHistory } from "./codex-history.js";
+import { durableThreadOrigin } from "./codex-thread-fallback.js";
 import { syncHistory, type HistoryReport } from "./history.js";
 import type { StorageService } from "./storage.js";
 import type { TuiThreadSelection } from "./tui-protocol.js";
@@ -33,6 +34,14 @@ export async function syncTerminalThreadSelection(options: {
   runner: TerminalThreadRunner;
   selection: TuiThreadSelection;
   isCurrent?: () => boolean;
+  /**
+   * Whether a thread has a rollout on disk. A thread that `thread/start` just
+   * created has none until the first prompt lands, and recording such an id as
+   * the origin of the switch loses the way back to the conversation (see
+   * `durableThreadOrigin`). Absent, every thread is assumed durable, which is
+   * the behaviour this had before.
+   */
+  isDurableThread?: (threadId: string) => Promise<boolean>;
 }): Promise<TerminalThreadSwitchResult | null> {
   const { storage, tabId, rpc, runner, selection } = options;
   const isCurrent = options.isCurrent ?? (() => true);
@@ -56,6 +65,14 @@ export async function syncTerminalThreadSelection(options: {
     if (!announcedCwd) throw new Error("TUI_THREAD_CWD_MISSING");
     const announcedSessionId = nonEmptyString(selection.thread?.sessionId) ?? targetThreadId;
     const switchedAt = isoNow();
+    const previousIsDurable = options.isDurableThread
+      ? await options.isDurableThread(previousThreadId).catch(() => true)
+      : true;
+    const fromThreadId = durableThreadOrigin({
+      previousThreadId,
+      previousIsDurable,
+      carriedFromThreadId: before.tab.session.lastThreadSwitch?.fromThreadId ?? null,
+    });
 
     // Bind first so any new turn emitted immediately after the TUI response is
     // attributed to the selected thread, then subscribe this controller client.
@@ -70,7 +87,7 @@ export async function syncTerminalThreadSelection(options: {
         connectedAt: switchedAt,
         lastError: null,
         lastThreadSwitch: {
-          fromThreadId: previousThreadId,
+          fromThreadId,
           toThreadId: targetThreadId,
           method: selection.method,
           switchedAt,

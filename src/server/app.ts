@@ -55,6 +55,7 @@ import { createTrafficLedger, rollupBuckets, type TrafficLedger } from "./traffi
 import { classifyNetworkScope, type NetworkScope } from "./traffic-scope.js";
 import { buildIndexDelta, indexDeltaIsEmpty } from "../shared/index-delta.js";
 import { createTrafficLog } from "./traffic-log.js";
+import { chooseResumeThread } from "./codex-thread-fallback.js";
 import { syncTerminalThreadSelection } from "./terminal-thread-sync.js";
 import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionHandler } from "./tui-protocol.js";
 import { TuiProxyPool } from "./tui-proxy.js";
@@ -441,6 +442,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         runner: runners.get(tabId),
         selection,
         isCurrent: () => codex.existing(tabId) === manager,
+        isDurableThread: async (threadId) => Boolean(await rolloutFile(threadId)),
       });
       if (!result) return;
       emit(tabId, { type: "thread.switched", switch: result });
@@ -973,6 +975,31 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return { ok: true, bundle: await readClientTab(tab.id) };
   };
 
+  /**
+   * The thread a reopen should resume, and the tab rebound onto it when the
+   * stored one turns out to have no rollout. Codex writes nothing for a thread
+   * until its first prompt, so a `thread/start` that never received one leaves
+   * an id that cannot survive a restart; the conversation is still on disk
+   * under the thread that switch left behind.
+   */
+  const resolveCodexResumeThread = async (tab: TabMeta): Promise<string> => {
+    const threadId = tab.session.threadId!;
+    const fallbackThreadId = tab.session.lastThreadSwitch?.fromThreadId ?? null;
+    const choice = chooseResumeThread({
+      threadId,
+      fallbackThreadId,
+      threadHasRollout: Boolean(await rolloutFile(threadId)),
+      fallbackHasRollout: fallbackThreadId ? Boolean(await rolloutFile(fallbackThreadId)) : false,
+    });
+    if (!choice.fellBack) return threadId;
+    await storage.updateTab(tab.id, (current) => ({
+      ...current,
+      session: { ...current.session, threadId: choice.threadId, sessionId: choice.threadId },
+      updatedAt: isoNow(),
+    }));
+    return choice.threadId;
+  };
+
   const performCodexNativeTerminalReopen = async (tab: TabMeta, recorder: PhaseRecorder = createPhaseRecorder()): Promise<TerminalReopenResult> => {
     const tabId = tab.id;
     try {
@@ -991,10 +1018,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       }));
       await emitSnapshot(tabId);
       await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null, appServer: null });
+      const resumeThreadId = await resolveCodexResumeThread(tab);
       const { manager, session } = await recorder.step("start", () => startCodexNativeTui(
         tabId,
         tab.session.workingDirectory!,
-        { mode: "resume", sessionId: tab.session.threadId! },
+        { mode: "resume", sessionId: resumeThreadId },
       ));
       // Only a new conversation comes back without one, and this is a resume.
       if (!session) throw new Error("CODEX_RESUME_SESSION_MISSING");
@@ -1122,7 +1150,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null });
       const tuiUrl = await startTuiProxy(tabId, manager);
       await restoreTerminalSize(storage, pty, tabId);
-      await recorder.step("pty", () => pty.start(tabId, tab.session.workingDirectory!, tuiUrl, { mode: "resume", threadId: tab.session.threadId! }, theme));
+      const resumeThreadId = await resolveCodexResumeThread(tab);
+      await recorder.step("pty", () => pty.start(tabId, tab.session.workingDirectory!, tuiUrl, { mode: "resume", threadId: resumeThreadId }, theme));
       await recorder.step("threadLoaded", () => waitForThreadLoaded(rpc, tab.session.threadId!, 30_000, 200, () => pty.startupError(tabId)));
       // thread/resume ships the whole conversation back and took eleven seconds
       // on the two largest here, but nothing on screen needs it: the terminal is
