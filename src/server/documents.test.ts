@@ -116,6 +116,21 @@ describe("DocumentService", () => {
       .rejects.toMatchObject({ code: "DOCUMENT_PARENT_UNKNOWN" });
   });
 
+  it("opens a link that cites a line, and still refuses a stream", async () => {
+    // Agents cite sources as `notes.md:140`. Windows reads that colon as an
+    // NTFS alternate data stream, so the reader was told the file was outside
+    // the allowed directories when the path had simply never named the file.
+    const { workspace, tab, documents } = await fixture();
+    await fs.writeFile(path.join(workspace, "notes.md"), "line", "utf8");
+    await expect(documents.open({ tabId: tab.id, href: "./notes.md:140" }))
+      .resolves.toMatchObject({ name: "notes.md" });
+    await expect(documents.open({ tabId: tab.id, href: "./notes.md:140:12" }))
+      .resolves.toMatchObject({ name: "notes.md" });
+    // Only a numeric suffix is a citation; a named stream is still refused.
+    await expect(documents.open({ tabId: tab.id, href: "./notes.md:hidden" }))
+      .rejects.toMatchObject({ code: "DOCUMENT_ACCESS_DENIED" });
+  });
+
   it("treats an answer it no longer has as no answer at all", async () => {
     // A page that has not caught up sends the id it last saw. Naming an answer
     // only widens what is reachable, so an unknown one has to land where

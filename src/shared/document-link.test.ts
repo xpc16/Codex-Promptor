@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractDocumentTarget, isLoopbackHostname, normalizeDocumentHrefForMarkdown } from "./document-link.js";
+import { extractDocumentTarget, isLoopbackHostname, normalizeDocumentHrefForMarkdown, splitLineAnchor } from "./document-link.js";
 
 describe("document link classification", () => {
   it.each(["localhost", "127.0.0.1", "::1", "[::1]"])("recognizes loopback hostname %s", (hostname) => {
@@ -31,5 +31,36 @@ describe("document link classification", () => {
     expect(normalizeDocumentHrefForMarkdown("D:\\work\\a b.md")).toBe("file:///D:/work/a%20b.md");
     expect(normalizeDocumentHrefForMarkdown("./a.md")).toBe("./a.md");
     expect(normalizeDocumentHrefForMarkdown("javascript:alert(1)")).toBe("javascript:alert(1)");
+  });
+});
+
+describe("a link that cites a line", () => {
+  it("reads the trailing line, and the column when one is given", () => {
+    // How agents cite sources; Markdown offers no other way to say it.
+    expect(splitLineAnchor("D:/docs/notes.md:140")).toEqual({ path: "D:/docs/notes.md", line: 140 });
+    expect(splitLineAnchor("D:/docs/notes.md:140:12")).toEqual({ path: "D:/docs/notes.md", line: 140 });
+  });
+
+  it("leaves a path that cites nothing alone", () => {
+    expect(splitLineAnchor("D:/docs/notes.md")).toEqual({ path: "D:/docs/notes.md", line: null });
+    expect(splitLineAnchor("D:/docs/notes.md")).toEqual({ path: "D:/docs/notes.md", line: null });
+  });
+
+  it("keeps the drive letter it would otherwise eat", () => {
+    expect(splitLineAnchor("C:/x")).toEqual({ path: "C:/x", line: null });
+  });
+
+  it("still refuses a stream name that is not a line number", () => {
+    // Only a numeric suffix is a citation. Anything else stays in the path and
+    // is refused downstream as an alternate data stream.
+    expect(splitLineAnchor("D:/docs/notes.md:secret")).toEqual({ path: "D:/docs/notes.md:secret", line: null });
+    expect(splitLineAnchor("D:/docs/notes.md:14a")).toEqual({ path: "D:/docs/notes.md:14a", line: null });
+  });
+
+  it("takes the anchor off the target a click resolves", () => {
+    expect(extractDocumentTarget("D:/docs/notes.md:140").path).toBe("D:/docs/notes.md");
+    expect(extractDocumentTarget("/D:/docs/notes.md:140").path).toBe("D:/docs/notes.md");
+    expect(extractDocumentTarget("./notes.md:140").path).toBe("./notes.md");
+    expect(extractDocumentTarget("file:///D:/docs/notes.md:140").path).toBe("D:/docs/notes.md");
   });
 });

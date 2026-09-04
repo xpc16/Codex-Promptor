@@ -14,6 +14,29 @@ const DANGEROUS_PROTOCOL_RE = /^(?:javascript|data|vbscript):/i;
 const EXTERNAL_PROTOCOL_RE = /^(?:https?|mailto|tel):/i;
 const UNKNOWN_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:/i;
 
+const LINE_ANCHOR_RE = /:(\d+)(?::\d+)?$/;
+
+/**
+ * Splits a trailing `:line` (or `:line:column`) off a local path.
+ *
+ * Agents cite sources the way compilers and editors do -- `notes.md:140` --
+ * and Markdown has no other way to say it, so those links arrive here intact.
+ * Windows reads the same colon as an NTFS alternate data stream, which the
+ * document service refuses outright; the reader was told their file sat
+ * outside the allowed directories when in truth the path never named the file
+ * at all.
+ *
+ * Dropping the suffix cannot widen access: it yields the base file, which the
+ * link could have named directly, while a stream name that is not purely
+ * numeric is left alone and still refused.
+ */
+export function splitLineAnchor(value: string): { path: string; line: number | null } {
+  const match = LINE_ANCHOR_RE.exec(value);
+  if (!match) return { path: value, line: null };
+  const line = Number(match[1]);
+  return { path: value.slice(0, match.index), line: Number.isSafeInteger(line) ? line : null };
+}
+
 export function isLoopbackHostname(hostname: string): boolean {
   const normalized = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
@@ -33,17 +56,17 @@ export function extractDocumentTarget(value: unknown): DocumentTarget {
       const pathname = safeDecode(url.pathname);
       if (pathname === null) return target("blocked", rawHref);
       const path = /^\/[a-z]:\//i.test(pathname) ? pathname.slice(1) : pathname;
-      return target("local-file", rawHref, path, decodeFragment(url.hash));
+      return target("local-file", rawHref, splitLineAnchor(path).path, decodeFragment(url.hash));
     } catch {
       return target("blocked", rawHref);
     }
   }
 
   const { pathPart, fragment } = splitFragment(rawHref);
-  if (WINDOWS_ABSOLUTE_RE.test(pathPart)) return target("local-file", rawHref, pathPart, fragment);
-  if (INTERNAL_WINDOWS_ABSOLUTE_RE.test(pathPart)) return target("local-file", rawHref, pathPart.slice(1), fragment);
+  if (WINDOWS_ABSOLUTE_RE.test(pathPart)) return target("local-file", rawHref, splitLineAnchor(pathPart).path, fragment);
+  if (INTERNAL_WINDOWS_ABSOLUTE_RE.test(pathPart)) return target("local-file", rawHref, splitLineAnchor(pathPart.slice(1)).path, fragment);
   if (pathPart.startsWith("./") || pathPart.startsWith("../") || pathPart.startsWith(".\\") || pathPart.startsWith("..\\")) {
-    return target("local-file", rawHref, pathPart, fragment);
+    return target("local-file", rawHref, splitLineAnchor(pathPart).path, fragment);
   }
   if (UNKNOWN_PROTOCOL_RE.test(rawHref)) return target("unknown", rawHref);
   return target("unknown", rawHref);

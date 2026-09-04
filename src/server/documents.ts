@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-link.js";
+import { extractDocumentTarget, isLoopbackHostname, splitLineAnchor } from "../shared/document-link.js";
 import {
   DOCUMENT_HREF_MAX_BYTES,
   DOCUMENT_ID_RE,
@@ -410,7 +410,11 @@ function parseLocalHref(rawHref: string): { path: string } {
   }
   if (/%[0-9a-f]{2}/i.test(decoded)) throw new DocumentError(400, "DOCUMENT_LINK_INVALID", "Double-encoded document paths are not allowed.");
   if (decoded.includes("?") || /[\0-\x1f\x7f]/.test(decoded)) throw new DocumentError(400, "DOCUMENT_LINK_INVALID", "The document path contains forbidden characters.");
-  return { path: decoded.replace(/^\/([a-z]:[\\/])/i, "$1") };
+  // Done here independently of whatever the page sent: this is the security
+  // boundary, and `notes.md:140` has to reach assertSafeCandidate as a path
+  // rather than as something indistinguishable from an NTFS stream.
+  const withoutLine = splitLineAnchor(decoded).path;
+  return { path: withoutLine.replace(/^\/([a-z]:[\\/])/i, "$1") };
 }
 
 function assertSafeCandidate(candidate: string, configuredRoots: string[]): void {
