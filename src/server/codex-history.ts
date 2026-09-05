@@ -341,6 +341,18 @@ export async function readCodexRolloutSlice(
  */
 export type RolloutHistoryBase = { threadId: string; endByteOffset: number };
 
+/**
+ * Whether a thread's rollout says it carries on from the given thread.
+ *
+ * Codex rolls a long conversation into a fresh thread on its own, keeping the
+ * old rollout as the new one's history base. Nothing about the conversation
+ * changed and nobody asked for it, so a tab that follows such a thread is not
+ * following a conversation switch and must not say that it was.
+ */
+export function continuesThread(base: RolloutHistoryBase | null, threadId: string | null): boolean {
+  return Boolean(base && threadId && base.threadId === threadId);
+}
+
 /** How far in the opening record is looked for. Session metadata carries the whole system prompt. */
 const SESSION_META_SCAN_BYTES = 8 * 1024 * 1024;
 

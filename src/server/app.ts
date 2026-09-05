@@ -26,7 +26,7 @@ import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
 import { buildConversationMarkdown, conversationExportFilename } from "./conversation-export.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
-import { locateCodexRollout, readCodexRolloutThread, readCodexThreadForHistory } from "./codex-history.js";
+import { continuesThread, locateCodexRollout, readCodexRolloutThread, readCodexThreadForHistory, readRolloutHistoryBase } from "./codex-history.js";
 import { decideStall, noteRolloutSize, TURN_STALL_POLL_MS, type RolloutProgress } from "./turn-stall.js";
 import { appendBoundedLines } from "./log-file.js";
 import { readCodexRolloutCached } from "./codex-rollout-cache.js";
@@ -552,6 +552,14 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       // selected conversation through the common history reconciliation.
       if (!adopting) await runners.get(tabId).freeze().catch(() => undefined);
       const switchedAt = isoNow();
+      // Codex rolls a long conversation into a fresh thread by itself, keeping
+      // the old rollout as the new one's history base. Following that is right;
+      // calling it a conversation switch is not, because nobody switched.
+      const rolloutPath = provider === "codex"
+        ? session.transcriptPath ?? await rolloutFile(session.sessionId)
+        : null;
+      const historyBase = rolloutPath ? await readRolloutHistoryBase(rolloutPath).catch(() => null) : null;
+      const method = continuesThread(historyBase, fromThreadId) ? "thread/fork" as const : "session/start" as const;
       const workingDirectory = await validWorkingDirectory(session.cwd) ?? tab.session.workingDirectory;
       await storage.updateTab(tabId, (current) => ({
         ...current,
@@ -566,7 +574,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           lastError: null,
           lastThreadSwitch: adopting
             ? current.session.lastThreadSwitch
-            : { fromThreadId: fromThreadId!, toThreadId: session.sessionId, method: "session/start", switchedAt },
+            : { fromThreadId: fromThreadId!, toThreadId: session.sessionId, method, switchedAt },
         },
         updatedAt: switchedAt,
       }));
@@ -576,7 +584,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       } else if (provider === "claude") await syncClaudeHistory(storage, tabId, session.sessionId, session.transcriptPath);
       else await syncCursorHistoryIfAvailable(tabId, session.sessionId, session.transcriptPath);
       await clearSessionNotReadyError(storage, tabId);
-      if (!adopting) emit(tabId, { type: "thread.switched", switch: { fromThreadId: fromThreadId!, toThreadId: session.sessionId, method: "session/start", switchedAt } });
+      if (!adopting) emit(tabId, { type: "thread.switched", switch: { fromThreadId: fromThreadId!, toThreadId: session.sessionId, method, switchedAt } });
       emit(tabId, { type: "snapshot", data: await readClientTab(tabId) }, true);
     }).catch(async (error) => {
       const message = error instanceof Error ? error.message : String(error);

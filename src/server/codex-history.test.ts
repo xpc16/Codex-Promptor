@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { mergeRolloutTurns, parseCodexRollout, readCodexRollout, readCodexThreadForHistory } from "./codex-history.js";
+import { mergeRolloutTurns, parseCodexRollout, readCodexRollout, readCodexThreadForHistory, continuesThread } from "./codex-history.js";
 
 const line = (value: unknown) => JSON.stringify(value);
 const event = (type: string, turnId: string, extra: Record<string, unknown> = {}, timestamp = "2026-08-25T14:22:20.489Z") =>
@@ -206,5 +206,21 @@ describe("choosing a history source", () => {
 
     expect(thread.turns).toHaveLength(1);
     expect(rpc.readThread).toHaveBeenCalledWith("thread-unwritten");
+  });
+});
+
+describe("a thread Codex rolled over by itself", () => {
+  it("is recognised as carrying on from the thread it left", () => {
+    // Codex forks a long conversation into a fresh thread, keeping the old
+    // rollout as the new one's history base. Reported as a conversation switch
+    // it read as though the reader had changed something; they had only typed
+    // a prompt.
+    expect(continuesThread({ threadId: "old", endByteOffset: 62119053 }, "old")).toBe(true);
+  });
+
+  it("is not claimed for a thread that came from somewhere else", () => {
+    expect(continuesThread({ threadId: "other", endByteOffset: 10 }, "old")).toBe(false);
+    expect(continuesThread(null, "old")).toBe(false);
+    expect(continuesThread({ threadId: "old", endByteOffset: 10 }, null)).toBe(false);
   });
 });
