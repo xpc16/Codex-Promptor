@@ -26,7 +26,7 @@ import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
 import { buildConversationMarkdown, conversationExportFilename } from "./conversation-export.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
-import { continuesThread, locateCodexRollout, readCodexRolloutThread, readCodexThreadForHistory, readRolloutHistoryBase } from "./codex-history.js";
+import { continuesThread, locateCodexRollout, readCodexRolloutThread, readCodexThreadForHistory, readRolloutHistoryBase, repointThread } from "./codex-history.js";
 import { decideStall, noteRolloutSize, TURN_STALL_POLL_MS, type RolloutProgress } from "./turn-stall.js";
 import { appendBoundedLines } from "./log-file.js";
 import { readCodexRolloutCached } from "./codex-rollout-cache.js";
@@ -578,6 +578,17 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         },
         updatedAt: switchedAt,
       }));
+      // A roll-over is the same conversation continuing, so what was already
+      // said follows it onto the new thread. Done before the sync below, so a
+      // turn the fork's own rollout repeats is recognised as one of these
+      // rather than stored a second time.
+      if (method === "thread/fork" && fromThreadId) {
+        const bundle = await storage.readTab(tabId);
+        const prompts = repointThread(bundle.prompts.prompts, fromThreadId, session.sessionId);
+        if (prompts.moved) await storage.writePrompts(tabId, { ...bundle.prompts, prompts: prompts.records });
+        const answers = repointThread(bundle.answers.answers, fromThreadId, session.sessionId);
+        if (answers.moved) await storage.writeAnswers(tabId, { ...bundle.answers, answers: answers.records });
+      }
       if (provider === "codex") {
         const thread = await readCodexRolloutThread(session.sessionId, session.transcriptPath);
         if (thread) await syncHistory(storage, tabId, thread, { mode: "merge" });

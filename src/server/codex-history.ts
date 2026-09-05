@@ -353,6 +353,36 @@ export function continuesThread(base: RolloutHistoryBase | null, threadId: strin
   return Boolean(base && threadId && base.threadId === threadId);
 }
 
+/**
+ * Moves records off the thread Codex rolled over and onto the one it rolled
+ * into.
+ *
+ * Prompts and answers carry the thread they were recorded under, and the
+ * conversation view shows only the tab's current thread. A roll-over therefore
+ * emptied the page of everything said before it -- the records were intact on
+ * disk and simply no longer matched. They belong to one conversation, so they
+ * follow it.
+ *
+ * Re-pointing rather than re-reading is what keeps this exact: the parent's
+ * turns could be read again through the fork's history base, but they would be
+ * stored beside the originals rather than recognised as them, since records are
+ * matched by thread and turn together.
+ */
+export function repointThread<T extends { threadId?: string | null }>(
+  records: readonly T[],
+  fromThreadId: string,
+  toThreadId: string,
+): { records: T[]; moved: number } {
+  if (!fromThreadId || !toThreadId || fromThreadId === toThreadId) return { records: [...records], moved: 0 };
+  let moved = 0;
+  const next = records.map((record) => {
+    if (record.threadId !== fromThreadId) return record;
+    moved += 1;
+    return { ...record, threadId: toThreadId };
+  });
+  return { records: next, moved };
+}
+
 /** How far in the opening record is looked for. Session metadata carries the whole system prompt. */
 const SESSION_META_SCAN_BYTES = 8 * 1024 * 1024;
 

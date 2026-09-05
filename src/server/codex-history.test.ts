@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { mergeRolloutTurns, parseCodexRollout, readCodexRollout, readCodexThreadForHistory, continuesThread } from "./codex-history.js";
+import { mergeRolloutTurns, parseCodexRollout, readCodexRollout, readCodexThreadForHistory, continuesThread, repointThread } from "./codex-history.js";
 
 const line = (value: unknown) => JSON.stringify(value);
 const event = (type: string, turnId: string, extra: Record<string, unknown> = {}, timestamp = "2026-08-25T14:22:20.489Z") =>
@@ -222,5 +222,33 @@ describe("a thread Codex rolled over by itself", () => {
     expect(continuesThread({ threadId: "other", endByteOffset: 10 }, "old")).toBe(false);
     expect(continuesThread(null, "old")).toBe(false);
     expect(continuesThread({ threadId: "old", endByteOffset: 10 }, null)).toBe(false);
+  });
+});
+
+describe("records following a thread Codex rolled over", () => {
+  const records = [
+    { id: "a", threadId: "old" },
+    { id: "b", threadId: "old" },
+    { id: "c", threadId: "somebody-else" },
+    { id: "d", threadId: null },
+  ];
+
+  it("moves only what belonged to the thread being left", () => {
+    // The page shows the tab's current thread alone, so a roll-over emptied it
+    // of everything said before: intact on disk, no longer matching.
+    const moved = repointThread(records, "old", "new");
+    expect(moved.moved).toBe(2);
+    expect(moved.records.map((record) => record.threadId)).toEqual(["new", "new", "somebody-else", null]);
+  });
+
+  it("does nothing without two different threads to move between", () => {
+    expect(repointThread(records, "old", "old").moved).toBe(0);
+    expect(repointThread(records, "", "new").moved).toBe(0);
+    expect(repointThread(records, "old", "").moved).toBe(0);
+  });
+
+  it("leaves the originals untouched", () => {
+    repointThread(records, "old", "new");
+    expect(records[0].threadId).toBe("old");
   });
 });
