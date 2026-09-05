@@ -64,3 +64,32 @@ describe("a link that cites a line", () => {
     expect(extractDocumentTarget("file:///D:/docs/notes.md:140").path).toBe("D:/docs/notes.md");
   });
 });
+
+describe("a link written the way an answer describes a workspace", () => {
+  it("treats a bare relative path as a file, not as a URL", () => {
+    // The reported case: clicking one navigated the page and the reader lost
+    // the conversation, because nothing recognised it as a path.
+    expect(extractDocumentTarget("iter_desk_model/output_v2/renders/ITER_closed_final.png"))
+      .toMatchObject({ kind: "local-file", path: "iter_desk_model/output_v2/renders/ITER_closed_final.png" });
+    expect(extractDocumentTarget("README.md")).toMatchObject({ kind: "local-file", path: "README.md" });
+    expect(extractDocumentTarget(String.raw`docs\notes.md`)).toMatchObject({ kind: "local-file", path: String.raw`docs\notes.md` });
+  });
+
+  it("still refuses a site-absolute path", () => {
+    // `/api/...` is the app's own surface, never a file beside the project.
+    expect(extractDocumentTarget("/api/tabs").kind).toBe("unknown");
+    expect(extractDocumentTarget(String.raw`\api\tabs`).kind).toBe("unknown");
+  });
+
+  it("leaves protocols alone", () => {
+    expect(extractDocumentTarget("https://example.com/a.png").kind).toBe("external");
+    expect(extractDocumentTarget("mailto:someone@example.com").kind).toBe("external");
+    expect(extractDocumentTarget("javascript:alert(1)").kind).toBe("blocked");
+    expect(extractDocumentTarget("weird+scheme:payload").kind).toBe("unknown");
+  });
+
+  it("keeps the fragment and the cited line off the path", () => {
+    expect(extractDocumentTarget("docs/notes.md#install")).toMatchObject({ path: "docs/notes.md", fragment: "install" });
+    expect(extractDocumentTarget("docs/notes.md:140")).toMatchObject({ kind: "local-file", path: "docs/notes.md" });
+  });
+});

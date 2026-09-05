@@ -45,11 +45,18 @@ async function tabInRepo() {
 }
 
 describe("a Markdown link to a document in this repository", () => {
-  it("is recognised as a local file only when the path says it is relative", () => {
-    // The bare form is the one people reach for first, and it is deliberately
-    // not a document link: without a leading `./` it is indistinguishable from
-    // a site-relative URL, so treating it as a file would be a guess.
-    expect(extractDocumentTarget("docs/TRAFFIC_OPTIMIZATION.md").kind).toBe("unknown");
+  it("is recognised as a local file in the bare form people reach for first", () => {
+    // This was once refused on the grounds that a bare path is
+    // indistinguishable from a site-relative URL. The refusal was not neutral:
+    // the link still rendered, and following it navigated the page away, so a
+    // reader who clicked one lost the conversation they were reading. A final
+    // answer has no site to be relative to -- it describes a workspace -- so
+    // the bare form is read as the file it names.
+    expect(extractDocumentTarget("docs/TRAFFIC_OPTIMIZATION.md")).toMatchObject({
+      kind: "local-file",
+      path: "docs/TRAFFIC_OPTIMIZATION.md",
+      displayName: "TRAFFIC_OPTIMIZATION.md",
+    });
 
     expect(extractDocumentTarget("./docs/TRAFFIC_OPTIMIZATION.md")).toMatchObject({
       kind: "local-file",

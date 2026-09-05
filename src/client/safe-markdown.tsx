@@ -48,7 +48,11 @@ export function SafeMarkdown({ source, onDocumentLink, headingIds }: SafeMarkdow
         onDocumentLink?.(originalHref);
       }}>{children}</a>;
       if (target.kind === "external" && /^https?:/i.test(href)) return <a {...props} href={href} target="_blank" rel="noreferrer noopener">{children}</a>;
-      return <a {...props} href={href}>{children}</a>;
+      if (target.kind === "external" || target.kind === "fragment") return <a {...props} href={href}>{children}</a>;
+      // Whatever is left is not something to follow, and following it would
+      // unload the app. An answer must never be able to take the reader out of
+      // the conversation they are reading.
+      return <a {...props} href={href} onClick={(event) => event.preventDefault()}>{children}</a>;
     },
     h1: heading("h1", nextHeadingId),
     h2: heading("h2", nextHeadingId),

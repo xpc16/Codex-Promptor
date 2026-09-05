@@ -69,6 +69,15 @@ export function extractDocumentTarget(value: unknown): DocumentTarget {
     return target("local-file", rawHref, splitLineAnchor(pathPart).path, fragment);
   }
   if (UNKNOWN_PROTOCOL_RE.test(rawHref)) return target("unknown", rawHref);
+  // A final answer describes a workspace, not a website, so a bare
+  // `renders/closed.png` names a file beside the project. Leaving it
+  // unrecognised rendered it as an ordinary relative URL, and clicking one
+  // navigated the page away -- the reader lost the conversation they were in.
+  // A leading slash is the exception: that shape reads as site-absolute, and
+  // `/api/...` must not be mistaken for a path.
+  if (pathPart && !pathPart.startsWith("/") && !pathPart.startsWith("\\")) {
+    return target("local-file", rawHref, splitLineAnchor(pathPart).path, fragment);
+  }
   return target("unknown", rawHref);
 }
 
