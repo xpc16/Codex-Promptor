@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isInjectedClaudePrompt } from "./claude-injected-prompt.js";
 import type { HistoryReport } from "./history.js";
 import { syncHistory } from "./history.js";
 import type { StorageService } from "./storage.js";
@@ -213,9 +214,8 @@ function normalizedHumanPrompt(record: TranscriptRecord, content: any): string |
   // Claude persists background-task notifications and other system injections
   // as user-role records. They can have prompt ids, but are not user prompts.
   if ((originKind && originKind !== "human") || promptSource === "system") return null;
-  if (record.isCompactSummary
-    || /^This session is being continued from a previous conversation that ran out of context\./i.test(text)) return null;
-  if (/^\s*<(?:task-notification|system-reminder|local-command-(?:caveat|stdout|stderr))\b/i.test(text)) return null;
+  if (record.isCompactSummary) return null;
+  if (isInjectedClaudePrompt(text)) return null;
   if (/^\s*\/compact(?:\s|$)/i.test(text)) return null;
 
   // Slash commands are stored as an internal XML-like envelope. Reconstruct

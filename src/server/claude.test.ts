@@ -87,6 +87,49 @@ describe("Claude Code provider", () => {
     await expect(manager.rpc.startTurn("session-2", "too late", "client-5", directory)).rejects.toThrow("SESSION_NOT_READY");
   });
 
+  it("ignores a prompt Claude injected, and leaves a queued one waiting", async () => {
+    // Every finished background command fires UserPromptSubmit with the
+    // notification as its text. Recorded as manual, each one became a
+    // hand-typed conversation in the history.
+    const submitted: string[] = [];
+    const started: string[] = [];
+    const fakePty = {
+      submitPrompt: (_tabId: string, text: string) => { submitted.push(text); return true; },
+      write: () => {},
+    } as any;
+    const manager = new ClaudeCodeManager("tab-injected", fakePty);
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-claude-"));
+    temporaryDirectories.push(directory);
+    await manager.beginLaunch({
+      cwd: directory,
+      launch: { mode: "new" },
+      hookScriptPath: path.join(process.cwd(), "scripts", "claude-hook.mjs"),
+      settingsPath: path.join(directory, "settings.json"),
+      theme: "light",
+      exitMarker: "__CLAUDE_PROMPTOR_EXIT__:test:",
+    });
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "session-injected", cwd: directory, transcript_path: path.join(directory, "session-injected.jsonl") });
+    await manager.waitForSession();
+    manager.on("turnStarted", (event: any) => started.push(event.origin));
+
+    await manager.handleHook({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "session-injected",
+      prompt_id: "notification-1",
+      prompt: ["<task-notification>", "<task-id>b2oicv3dq</task-id>", "</task-notification>"].join("\n"),
+    });
+    expect(started).toEqual([]);
+    expect(manager.rpc.activeTurnIds("session-injected")).toEqual([]);
+
+    // The queued prompt is still waiting for its own hook rather than having
+    // been consumed by the notification that arrived first.
+    const starting = manager.rpc.startTurn("session-injected", "real prompt", "client-injected", directory);
+    await vi.waitFor(() => expect(submitted).toEqual(["real prompt"]));
+    await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-injected", prompt_id: "prompt-real", prompt: "real prompt" });
+    expect((await starting).turnId).toBe("prompt-real");
+    expect(started).toEqual(["queue"]);
+  });
+
   it("returns a transcript-reconciled completion instead of losing the finished turn", async () => {
     const submitted: string[] = [];
     const fakePty = {
