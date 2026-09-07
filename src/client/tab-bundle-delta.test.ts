@@ -20,6 +20,38 @@ describe("tab bundle realtime deltas", () => {
     expect(next.bundle.answers).toBe(bundle.answers);
   });
 
+  it("moves only the runtime sections a delta names", () => {
+    // The whole runtime used to arrive for any change. What the page needs is
+    // the sections that moved; the rest must stay identical, not be rebuilt.
+    const bundle = fixture();
+    const terminal = bundle.runtime.terminal;
+    const next = applyTabMessage(bundle, {
+      type: "runner.changed",
+      delta: { from: bundle.runtime.revision, revision: bundle.runtime.revision + 1, runner: { ...bundle.runtime.runner, state: "running" } },
+    });
+    expect(next).toMatchObject({ changed: true, needsSnapshot: false });
+    expect(next.bundle.runtime.runner.state).toBe("running");
+    expect(next.bundle.runtime.terminal).toBe(terminal);
+  });
+
+  it("asks for a snapshot when a runtime delta does not line up", () => {
+    const bundle = fixture();
+    const result = applyTabMessage(bundle, {
+      type: "runner.changed",
+      delta: { from: bundle.runtime.revision + 5, revision: bundle.runtime.revision + 6, runner: bundle.runtime.runner },
+    });
+    expect(result).toMatchObject({ changed: false, needsSnapshot: true });
+  });
+
+  it("still accepts a whole runtime, which is what a tab with no previous one gets", () => {
+    const bundle = fixture();
+    const next = applyTabMessage(bundle, {
+      type: "runner.changed",
+      runner: { ...bundle.runtime, revision: bundle.runtime.revision + 1 },
+    });
+    expect(next).toMatchObject({ changed: true, needsSnapshot: false });
+  });
+
   it("requests one authoritative snapshot after a missed revision", () => {
     const result = applyTabMessage(fixture(), { type: "prompts.changed", delta: { revision: 3, updatedAt: "later", total: 0, upserts: [], deletedIds: [] } });
     expect(result).toMatchObject({ changed: false, needsSnapshot: true });

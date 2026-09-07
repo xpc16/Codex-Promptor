@@ -1,4 +1,5 @@
 import type { AnswerRecord, RuntimeFile, TabBundle, TabMeta } from "../shared/schemas.js";
+import { applyRuntimeDelta, type RuntimeDelta } from "../shared/runtime-delta.js";
 import { applyRecordDelta, moveIsApplicable, type AnswerDelta, type PromptDelta } from "../shared/tab-delta.js";
 
 export type TabMessageResult = { bundle: TabBundle; changed: boolean; needsSnapshot: boolean };
@@ -39,6 +40,15 @@ export function applyTabMessage(bundle: TabBundle, message: any): TabMessageResu
     const runtime = message.runner as RuntimeFile;
     if (runtime.revision <= bundle.runtime.revision) return unchanged(bundle);
     if (runtime.revision > bundle.runtime.revision + 1) return missing(bundle);
+    return { bundle: { ...bundle, runtime }, changed: true, needsSnapshot: false };
+  }
+  if ((message?.type === "runner.changed" || message?.type === "runtime.changed") && message.delta) {
+    const delta = message.delta as RuntimeDelta;
+    if (delta.revision <= bundle.runtime.revision) return unchanged(bundle);
+    // A delta that does not line up with what this bundle holds cannot be
+    // applied halfway; a snapshot is the path a missed revision already takes.
+    const runtime = applyRuntimeDelta(bundle.runtime, delta);
+    if (!runtime) return missing(bundle);
     return { bundle: { ...bundle, runtime }, changed: true, needsSnapshot: false };
   }
   if (message?.type === "prompts.changed" && message.delta) {

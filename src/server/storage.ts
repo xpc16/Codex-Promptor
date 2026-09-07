@@ -34,6 +34,7 @@ import {
 } from "../shared/schemas.js";
 import { latestQueueCompletion, type TabActivitySummary } from "../shared/tab-activity.js";
 import { sortSettledByCompletion } from "../shared/prompt-order.js";
+import { buildRuntimeDelta, type RuntimeDelta } from "../shared/runtime-delta.js";
 import { buildRecordDelta, type AnswerDelta, type PromptDelta } from "../shared/tab-delta.js";
 import {
   EARLIER_ANSWER_PAGE,
@@ -103,7 +104,7 @@ export class StorageService {
   private readonly tabListeners = new Set<(tabId: string, tab: TabMeta) => void>();
   private readonly promptListeners = new Set<(tabId: string, delta: PromptDelta) => void>();
   private readonly answerListeners = new Set<(tabId: string, delta: AnswerDelta) => void>();
-  private readonly runtimeListeners = new Set<(tabId: string, runtime: RuntimeFile) => void>();
+  private readonly runtimeListeners = new Set<(tabId: string, runtime: RuntimeFile, delta: RuntimeDelta | null) => void>();
 
   constructor(rootDir: string) {
     this.rootDir = path.resolve(rootDir);
@@ -181,7 +182,7 @@ export class StorageService {
   onTabChanged(listener: (tabId: string, tab: TabMeta) => void): () => void { this.tabListeners.add(listener); return () => { this.tabListeners.delete(listener); }; }
   onPromptsChanged(listener: (tabId: string, delta: PromptDelta) => void): () => void { this.promptListeners.add(listener); return () => { this.promptListeners.delete(listener); }; }
   onAnswersChanged(listener: (tabId: string, delta: AnswerDelta) => void): () => void { this.answerListeners.add(listener); return () => { this.answerListeners.delete(listener); }; }
-  onRuntimeChanged(listener: (tabId: string, runtime: RuntimeFile) => void): () => void { this.runtimeListeners.add(listener); return () => { this.runtimeListeners.delete(listener); }; }
+  onRuntimeChanged(listener: (tabId: string, runtime: RuntimeFile, delta: RuntimeDelta | null) => void): () => void { this.runtimeListeners.add(listener); return () => { this.runtimeListeners.delete(listener); }; }
 
   async writeIndex(index: IndexFile): Promise<void> {
     const value = IndexFileSchema.parse(index);
@@ -442,8 +443,13 @@ export class StorageService {
 
   async writeRuntime(tabId: string, runtime: RuntimeFile): Promise<void> {
     const value = RuntimeFileSchema.parse(runtime);
+    // Read before the write so subscribers can be told which sections moved
+    // rather than the whole document. A tab with no runtime yet has nothing to
+    // compare against, and its listeners get the full value.
+    const previous = await this.readFile(this.runtimePath(tabId), (raw) => RuntimeFileSchema.parse(raw)).catch(() => null);
     await this.writeFile(this.runtimePath(tabId), value);
-    notify(this.runtimeListeners, (listener) => listener(tabId, value));
+    const delta = previous ? buildRuntimeDelta(previous, value) : null;
+    notify(this.runtimeListeners, (listener) => listener(tabId, value, delta));
   }
 
   async updateTab(tabId: string, mutator: (tab: TabMeta) => TabMeta | Promise<TabMeta>): Promise<TabMeta> {

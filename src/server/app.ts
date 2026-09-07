@@ -403,7 +403,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   storage.onAnswersChanged((tabId, delta) => {
     emit(tabId, { type: "answers.changed", delta }, true);
   });
-  storage.onRuntimeChanged((tabId, runtime) => emit(tabId, { type: "runner.changed", runner: runtime }));
+  // The delta when there is one to send, the whole runtime only for a tab that
+  // had none to compare against. A receiver that cannot apply the delta asks
+  // for a snapshot, which is the same path a missed revision already takes.
+  storage.onRuntimeChanged((tabId, runtime, delta) => emit(tabId, delta
+    ? { type: "runner.changed", delta }
+    : { type: "runner.changed", runner: runtime }));
 
   const scheduleCompactionTerminalResync = (tabId: string): void => {
     const previous = terminalResyncTimers.get(tabId);

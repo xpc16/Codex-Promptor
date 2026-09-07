@@ -16,6 +16,7 @@ import {
 } from "react";
 import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta, TabRecordPage } from "../shared/schemas.js";
 import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-link.js";
+import type { RuntimeDelta } from "../shared/runtime-delta.js";
 import type { TerminalScreenFrame, TerminalTransportMode } from "../shared/terminal-protocol.js";
 import { DOCUMENT_RAW_CATCH_UP_BYTES } from "../shared/document-protocol.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
@@ -286,14 +287,18 @@ export function App() {
         let message: any;
         try { message = JSON.parse(String(event.data)); } catch { return; }
         const tabId = typeof message.tabId === "string" ? message.tabId : "";
-        if (message.type === "runner.changed" && tabId && message.runner?.runner) {
-          const runtime = message.runner as RuntimeFile;
+        // This socket keeps only three fields, so a delta without a runner
+        // section says exactly what it needs to know: they did not move.
+        const runnerSection = message.type === "runner.changed"
+          ? (message.runner as RuntimeFile | undefined)?.runner ?? (message.delta as RuntimeDelta | undefined)?.runner
+          : undefined;
+        if (runnerSection && tabId) {
           setActivities((current) => ({
             ...current,
             [tabId]: {
-              runnerState: runtime.runner.state,
-              desiredState: runtime.runner.desiredState,
-              activePromptId: runtime.runner.activePromptId,
+              runnerState: runnerSection.state,
+              desiredState: runnerSection.desiredState,
+              activePromptId: runnerSection.activePromptId,
               lastQueueCompletedAt: current[tabId]?.lastQueueCompletedAt ?? null,
             },
           }));
