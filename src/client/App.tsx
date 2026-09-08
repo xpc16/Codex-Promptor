@@ -549,7 +549,7 @@ export function App() {
     <main className="workspace" aria-label={t("aria.conversationPage")}>
       {Boolean(error) && <div className="toast error-toast">{i18n.errorText(error)}<button onClick={() => setError(null)}>×</button></div>}
       {notice && <div className="toast notice-toast" role="status">{notice}<button onClick={() => setNotice(null)}>×</button></div>}
-      {e2ee.required && !e2ee.unlocked && kdf && <E2eeUnlock state={e2ee} kdf={kdf} onError={setError} />}
+      {e2ee.required && !e2ee.proved && kdf && <E2eeUnlock state={e2ee} kdf={kdf} onError={setError} />}
       {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} onBundleChanged={applyTabBundle} onError={setError} onNotice={setNotice} />)}
       {!selected && <Welcome onCreate={() => void createTab()} />}
     </main>

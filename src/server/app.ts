@@ -1845,7 +1845,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return reply.send({ data: traffic.snapshot() });
   });
 
-  app.get("/api/bootstrap", async (_request, reply) => {
+  app.get("/api/bootstrap", async (request, reply) => {
     const index = await storage.readIndex();
     const activities: Record<string, TabActivitySummary> = {};
     await Promise.all(index.tabs.map(async (tab) => {
@@ -1856,6 +1856,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     // it needs. The salt is here because without it the far end can derive
     // nothing, and neither it nor the fingerprint is secret.
     const encryption = await encryptionState();
+    // Only a connection that will actually be challenged is told it must
+    // prove itself. Loopback never is -- it is where the passphrase was typed
+    // -- and a local page that waited for a proof it would never be asked for
+    // would sit behind its own prompt forever.
+    const mustProve = Boolean(encryption)
+      && classifyNetworkScope(request.raw.socket?.remoteAddress, request.headers.host) !== "local";
     return reply.send({ data: {
       index,
       activities,
@@ -1863,8 +1869,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       // it is not a secret: its job is to make a precomputed table useless,
       // not to be unknown.
       e2ee: encryption
-        ? { required: true, fingerprint: encryption.fingerprint, salt: encryption.salt, iterations: encryption.iterations }
-        : { required: false },
+        ? { required: mustProve, on: true, fingerprint: encryption.fingerprint, salt: encryption.salt, iterations: encryption.iterations }
+        : { required: false, on: false },
       app: {
         version: "0.1.0",
         codex: codex.status,

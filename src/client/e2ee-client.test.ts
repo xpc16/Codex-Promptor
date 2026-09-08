@@ -1,10 +1,11 @@
 import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { encodeBase64 } from "../shared/e2ee-keys.js";
-import { handshakeAad } from "../shared/e2ee-handshake.js";
+import { HANDSHAKE_READY, handshakeAad } from "../shared/e2ee-handshake.js";
 import { deriveMasterKey, fingerprintOf, subKey } from "../server/e2ee-key-material.js";
 import { handshakeAnswered, open, seal, startHandshake } from "../server/e2ee-session.js";
 import { answerChallenge, deriveSessionKey } from "./e2ee-client.js";
+import { applyRequirement, e2eeState, handleGateMessage, useKey } from "./e2ee-gate.js";
 
 /**
  * The two halves are written against different crypto libraries -- WebCrypto in
@@ -87,5 +88,57 @@ describe("the page answering the server's challenge", () => {
     const sealed = seal(auth, nonce, new TextEncoder().encode("hello"), aad);
     expect(open(auth, nonce, sealed, aad)?.toString("utf8")).toBe("hello");
     expect(open(auth, nonce, sealed, handshakeAad("client", "TEST-TEST"))).toBeNull();
+  });
+});
+
+describe("the gate, on a key that has not proved itself", () => {
+  const passphrase = "correct horse battery staple";
+  const salt = encodeBase64(new Uint8Array(randomBytes(16)));
+  const iterations = 60_000;
+
+  const serverSide = async () => {
+    const master = await deriveMasterKey(passphrase, Buffer.from(salt, "base64"), iterations);
+    return { pending: startHandshake(master, fingerprintOf(master)) };
+  };
+
+  const socket = () => {
+    const sent: any[] = [];
+    return { sent, send: (data: string) => sent.push(JSON.parse(data)) };
+  };
+
+  it("does not call itself unlocked just because a key was typed", async () => {
+    // The bug this replaces: deriving from the wrong passphrase succeeds --
+    // PBKDF2 has no idea what the right one is -- so the prompt disappeared for
+    // any input at all, and the mistake only surfaced when the next socket
+    // happened to be challenged.
+    const { pending } = await serverSide();
+    const peer = socket();
+    await applyRequirement({ required: true, fingerprint: pending.message.fingerprint });
+    await handleGateMessage(peer, pending.message);
+    await useKey(await deriveSessionKey("口令输错了", salt, iterations), false);
+
+    expect(e2eeState().proved).toBe(false);
+    expect(e2eeState().rejected).toBe(true);
+    expect(peer.sent, "nothing is sent under a key that cannot open the server's proof").toHaveLength(0);
+  });
+
+  it("answers a challenge that arrived before the key did", async () => {
+    // A page is challenged the moment it connects, which is before the reader
+    // has typed anything. Losing that challenge is what made the failure show
+    // up one conversation late.
+    const { pending } = await serverSide();
+    const peer = socket();
+    await applyRequirement({ required: true, fingerprint: pending.message.fingerprint });
+    await handleGateMessage(peer, pending.message);
+    expect(peer.sent).toHaveLength(0);
+
+    await useKey(await deriveSessionKey(passphrase, salt, iterations), false);
+    expect(peer.sent).toHaveLength(1);
+    expect(handshakeAnswered(pending, peer.sent[0].proof)).toBe(true);
+
+    // And still not proved until the server says so.
+    expect(e2eeState().proved).toBe(false);
+    await handleGateMessage(peer, { type: HANDSHAKE_READY });
+    expect(e2eeState().proved).toBe(true);
   });
 });
