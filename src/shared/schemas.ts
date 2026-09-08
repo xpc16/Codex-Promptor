@@ -10,7 +10,7 @@ const makeId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.
 // wearing a tab's clothes, so that turning encryption on and off is the same
 // gesture as opening and deleting a conversation. It has no terminal, no queue
 // and no history, and its working directory field holds the passphrase, which
-// never leaves this machine (see docs/P2P_E2EE_MINIMAL_DESIGN.md).
+// never leaves this machine (see docs/E2EE_MINIMAL_DESIGN.md).
 export const AgentProviderSchema = z.enum(["codex", "claude", "cursor", "shell", "e2ee"]);
 export type AgentProvider = z.infer<typeof AgentProviderSchema>;
 

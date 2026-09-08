@@ -12,7 +12,7 @@
  *
  * That trade is proportionate to what this layer defends against: a tunnel
  * operator logging traffic in bulk, not somebody spending compute on one
- * person's terminal. See docs/P2P_E2EE_MINIMAL_DESIGN.md §3.1.
+ * person's terminal. See docs/E2EE_MINIMAL_DESIGN.md §3.1.
  */
 
 /** OWASP's floor for PBKDF2-HMAC-SHA256. Paid once, at pairing, on both ends. */
