@@ -17,6 +17,8 @@ import {
 import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta, TabRecordPage } from "../shared/schemas.js";
 import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-link.js";
 import { randomPassphrase } from "../shared/e2ee-keys.js";
+import { deriveSessionKey } from "./e2ee-client.js";
+import { applyRequirement, e2eeState, handleGateMessage, observeE2ee, useKey, type E2eeState } from "./e2ee-gate.js";
 import type { RuntimeDelta } from "../shared/runtime-delta.js";
 import type { TerminalScreenFrame, TerminalTransportMode } from "../shared/terminal-protocol.js";
 import { DOCUMENT_RAW_CATCH_UP_BYTES } from "../shared/document-protocol.js";
@@ -141,6 +143,9 @@ export function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [service, setService] = useState<any>(null);
   const [error, setError] = useState<unknown | null>(null);
+  const [e2ee, setE2ee] = useState<E2eeState>(e2eeState);
+  const [kdf, setKdf] = useState<{ salt: string; iterations: number } | null>(null);
+  useEffect(() => observeE2ee(setE2ee), []);
   // Says that something changed which leaves no other mark on the page --
   // turning encryption on or off changes no visible control, only what crosses
   // the network, so without this the reader has no way to know it took.
@@ -227,7 +232,10 @@ export function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const data = await api<{ index: IndexFile; activities: Record<string, TabActivitySummary>; app: any }>("/api/bootstrap");
+      const data = await api<{ index: IndexFile; activities: Record<string, TabActivitySummary>; app: any; e2ee?: { required: boolean; fingerprint?: string; salt?: string; iterations?: number } }>("/api/bootstrap");
+      await applyRequirement(data.e2ee);
+      setE2ee(e2eeState());
+      setKdf(data.e2ee?.required ? { salt: data.e2ee.salt ?? "", iterations: data.e2ee.iterations ?? 0 } : null);
       adoptIndex(data.index);
       setActivities(data.activities);
       for (const [tabId, activity] of Object.entries(data.activities)) {
@@ -293,9 +301,12 @@ export function App() {
         // change or a reconnect than a navigation change anyone made.
         indexRevision: indexRef.current?.revision ?? null,
       }));
-      socket.onmessage = (event) => {
+      socket.onmessage = async (event) => {
         let message: any;
         try { message = JSON.parse(String(event.data)); } catch { return; }
+        // The gate answers challenges for every socket; everything else falls
+        // through untouched.
+        if (socket && await handleGateMessage(socket, message)) return;
         const tabId = typeof message.tabId === "string" ? message.tabId : "";
         // This socket keeps only three fields, so a delta without a runner
         // section says exactly what it needs to know: they did not move.
@@ -538,6 +549,7 @@ export function App() {
     <main className="workspace" aria-label={t("aria.conversationPage")}>
       {Boolean(error) && <div className="toast error-toast">{i18n.errorText(error)}<button onClick={() => setError(null)}>×</button></div>}
       {notice && <div className="toast notice-toast" role="status">{notice}<button onClick={() => setNotice(null)}>×</button></div>}
+      {e2ee.required && !e2ee.unlocked && kdf && <E2eeUnlock state={e2ee} kdf={kdf} onError={setError} />}
       {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} onBundleChanged={applyTabBundle} onError={setError} onNotice={setNotice} />)}
       {!selected && <Welcome onCreate={() => void createTab()} />}
     </main>
@@ -687,6 +699,48 @@ function ConsoleTabRow({ tab, activity, recentlyCompleted, selected, dropTarget,
           : t("tab.unconfigured");
   return <div className={`tab-row ${selected ? "selected" : ""} ${dropTarget ? "navigation-drop-target" : ""}`} data-provider={tab.session.provider} draggable onDragStart={onDragStart} onDragEnd={onDragEnd} onDragOver={(event) => { if (!onDragOver()) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => { event.preventDefault(); event.stopPropagation(); onDrop(); }}>
     <span className="console-drag" title={t("nav.dragConversation")}>⠿</span><button className="tab-button" onClick={onClick}><span className="tab-label">{tab.name}</span><span className="tab-status-cluster">{recentlyCompleted && <span className="tab-completion-bell" role="img" aria-label={t("tab.justCompleted")} title={t("tab.justCompletedRecent")}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg></span>}<span className={`tab-status-indicator ${visualState}`} role="img" aria-label={tabStatus} title={tabStatus} /></span></button><RowActionsMenu subject={t("nav.conversationSubject", { name: tab.name })} onEdit={onRename} onDelete={onDelete} />
+  </div>;
+}
+
+/**
+ * The first thing a remote page shows when encryption is on.
+ *
+ * Ahead of everything else on purpose: the passphrase is what makes the rest
+ * of the page legible, and asking for it after the terminal has failed to load
+ * would present a key problem as a connection problem.
+ */
+function E2eeUnlock({ state, kdf, onError }: { state: E2eeState; kdf: { salt: string; iterations: number }; onError: (error: unknown) => void }) {
+  const { t } = useI18n();
+  const [value, setValue] = useState("");
+  const [working, setWorking] = useState(false);
+  const unlock = async () => {
+    if (working || !value.trim()) return;
+    setWorking(true);
+    try {
+      // Deriving takes a moment by design; the button says so rather than
+      // looking stuck.
+      await useKey(await deriveSessionKey(value.trim(), kdf.salt, kdf.iterations));
+      setValue("");
+    } catch (reason) { onError(reason); }
+    finally { setWorking(false); }
+  };
+  return <div className="e2ee-unlock" role="dialog" aria-modal="true">
+    <div className="e2ee-unlock-card">
+      <strong>{t("e2ee.unlockTitle")}</strong>
+      <p>{t("e2ee.unlockBody")}</p>
+      {state.rejected && <div className="inline-error">{t("e2ee.wrongKey")}</div>}
+      <input
+        type="password"
+        autoFocus
+        value={value}
+        disabled={working}
+        placeholder={t("session.e2eeKeyPlaceholder")}
+        onChange={(event) => setValue(event.target.value)}
+        onKeyDown={(event) => { if (event.key === "Enter") void unlock(); }}
+      />
+      <button className="primary" disabled={working || !value.trim()} onClick={() => void unlock()}>{t(working ? "e2ee.unlocking" : "e2ee.unlock")}</button>
+      {state.fingerprint && <small className="field-hint">{t("e2ee.expectFingerprint", { fingerprint: state.fingerprint })}</small>}
+    </div>
   </div>;
 }
 
@@ -1925,9 +1979,10 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
         sendSubscription(wanted, reconnecting);
         if (!projectionMode && wanted) scheduleSize();
       };
-      ws.onmessage = (event) => {
+      ws.onmessage = async (event) => {
         try {
           const message = JSON.parse(event.data);
+          if (await handleGateMessage(ws, message)) return;
           if (!projectionMode && message.type === "terminal.output") handleOutput(message);
           else if (!projectionMode && message.type === "terminal.screen" && message.oneShot === true) handleRawOneShot(message as TerminalScreenFrame);
           else if (projectionMode && message.type === "terminal.screen") handleScreen(message as TerminalScreenFrame);

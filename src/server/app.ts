@@ -225,8 +225,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
    * moves whenever the passphrase or its salt does, so a stale cache cannot
    * outlive the key it was derived from.
    */
-  let cachedKey: { fingerprint: string; master: Buffer } | null = null;
-  const encryptionState = async (): Promise<{ master: Buffer; fingerprint: string } | null> => {
+  let cachedKey: { fingerprint: string; master: Buffer; salt: string; iterations: number } | null = null;
+  const encryptionState = async (): Promise<{ master: Buffer; fingerprint: string; salt: string; iterations: number } | null> => {
     const tabs = await storage.listTabMeta().catch(() => []);
     const switchTab = tabs.find((tab) => tab.session.provider === "p2p" && tab.session.e2ee);
     if (!switchTab) { cachedKey = null; return null; }
@@ -234,8 +234,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     if (cachedKey?.fingerprint === declared) return cachedKey;
     const derived = await masterKeyFor(switchTab.session).catch(() => null);
     if (!derived) { cachedKey = null; return null; }
-    cachedKey = derived;
-    return derived;
+    cachedKey = { ...derived, salt: switchTab.session.e2ee!.salt, iterations: switchTab.session.e2ee!.iterations };
+    return cachedKey;
   };
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
   /**
@@ -1859,8 +1859,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return reply.send({ data: {
       index,
       activities,
+      // The salt is here because the far end derives nothing without it, and
+      // it is not a secret: its job is to make a precomputed table useless,
+      // not to be unknown.
       e2ee: encryption
-        ? { required: true, fingerprint: encryption.fingerprint }
+        ? { required: true, fingerprint: encryption.fingerprint, salt: encryption.salt, iterations: encryption.iterations }
         : { required: false },
       app: {
         version: "0.1.0",

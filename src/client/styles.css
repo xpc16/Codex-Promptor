@@ -464,6 +464,11 @@ input, textarea, select { color: var(--text); }
 /* A statement, not a problem: encryption changing state leaves no other mark. */
 .toast.notice-toast { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); color: var(--text); }
 .e2ee-hint { margin-top: 6px; }
+/* Ahead of the page rather than beside it: without the key nothing below is legible. */
+.e2ee-unlock { position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; background: color-mix(in srgb, var(--bg) 82%, transparent); backdrop-filter: blur(3px); }
+.e2ee-unlock-card { width: min(420px, 88vw); display: flex; flex-direction: column; gap: 10px; padding: 20px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); box-shadow: var(--shadow); }
+.e2ee-unlock-card p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.e2ee-unlock-card input { width: 100%; }
 
 .dialog-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px; background: rgba(25, 33, 46, .42); backdrop-filter: blur(3px); }
 .text-dialog { width: min(480px, 100%); padding: 21px; border: 1px solid var(--border-strong); border-radius: 13px; background: var(--panel); box-shadow: 0 24px 70px rgba(24, 34, 52, .28); }
