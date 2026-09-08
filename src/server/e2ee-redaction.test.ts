@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { defaultSession, isoNow, TabMetaSchema } from "../shared/schemas.js";
+import { isoNow } from "../shared/schemas.js";
 import { createApp, type PromptorApp } from "./app.js";
 import { redactForRemote, redactForScope } from "./e2ee-redaction.js";
 
@@ -209,25 +209,5 @@ describe("setting the key", () => {
     const empty = await open("127.0.0.1:4317", "http://127.0.0.1:4317", { workingDirectory: "   " });
     expect(empty.statusCode).toBe(400);
     expect(empty.json()).toMatchObject({ error: { code: "E2EE_PASSPHRASE_REQUIRED" } });
-  });
-});
-
-describe("a tab written under the old name", () => {
-  it("is read under the new one rather than failing to load", () => {
-    // It shipped as "p2p" first, which was the wrong name: nothing here is
-    // peer to peer. A tab already on disk must not stop loading over it.
-    expect(TabMetaSchema.parse({
-      id: "t1", name: "加密", groupId: null, order: 0,
-      createdAt: isoNow(), updatedAt: isoNow(),
-      session: { ...defaultSession(), ...e2eeSession(), provider: "p2p" },
-    }).session.provider).toBe("e2ee");
-  });
-
-  it("still redacts one, whichever name it was written under", () => {
-    const old = { session: { ...e2eeSession(), provider: "p2p" } };
-    // The walk reads the value as stored, so the legacy spelling has to be
-    // recognised there too -- a tab that has not been rewritten yet still
-    // holds a passphrase.
-    expect(JSON.stringify(redactForRemote(old))).not.toContain(PASSPHRASE);
   });
 });

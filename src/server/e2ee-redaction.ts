@@ -24,11 +24,8 @@ import type { NetworkScope } from "./traffic-scope.js";
 /** Deep enough for a bundle inside a snapshot inside an envelope, and no deeper. */
 const MAX_DEPTH = 12;
 
-// Both spellings. Storage normalizes the legacy "p2p" through the schema, so
-// in practice only one arrives -- but this is the last thing standing between
-// a passphrase and the network, and it should not depend on a step upstream.
 function isE2eeSession(value: Record<string, unknown>): boolean {
-  return (value.provider === "e2ee" || value.provider === "p2p") && "workingDirectory" in value;
+  return value.provider === "e2ee" && "workingDirectory" in value;
 }
 
 /**
