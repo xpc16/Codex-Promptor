@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { encodeBase64 } from "../shared/e2ee-keys.js";
 import { HANDSHAKE_READY, handshakeAad } from "../shared/e2ee-handshake.js";
 import { deriveMasterKey, fingerprintOf, subKey } from "../server/e2ee-key-material.js";
@@ -92,6 +92,10 @@ describe("the page answering the server's challenge", () => {
 });
 
 describe("the gate, on a key that has not proved itself", () => {
+  // The gate is one object for the whole page, so a test that inherits the key
+  // a previous one left behind is not testing what it says it is.
+  beforeEach(async () => { await applyRequirement({ required: false }); });
+
   const passphrase = "correct horse battery staple";
   const salt = encodeBase64(new Uint8Array(randomBytes(16)));
   const iterations = 60_000;
@@ -140,5 +144,61 @@ describe("the gate, on a key that has not proved itself", () => {
     expect(e2eeState().proved).toBe(false);
     await handleGateMessage(peer, { type: HANDSHAKE_READY });
     expect(e2eeState().proved).toBe(true);
+  });
+});
+
+describe("the gate, on a list of sockets that is not tidy", () => {
+  // The gate is one object for the whole page, so a test that inherits the key
+  // a previous one left behind is not testing what it says it is.
+  beforeEach(async () => { await applyRequirement({ required: false }); });
+
+  const passphrase = "correct horse battery staple";
+  const salt = encodeBase64(new Uint8Array(randomBytes(16)));
+  const iterations = 60_000;
+
+  const live = () => {
+    const sent: any[] = [];
+    return { sent, readyState: 1, send: (data: string) => sent.push(JSON.parse(data)) };
+  };
+  const dead = () => ({
+    readyState: 3,
+    send: () => { throw new Error("InvalidStateError: socket is closed"); },
+  });
+
+  it("answers the live socket even when a dead one is waiting first", async () => {
+    // The reported failure: a page reconnects while the reader is typing, and
+    // the throw from the socket that is already gone abandoned the loop, so
+    // the connection that mattered never got its answer.
+    const master = await deriveMasterKey(passphrase, Buffer.from(salt, "base64"), iterations);
+    const first = startHandshake(master, fingerprintOf(master));
+    const second = startHandshake(master, fingerprintOf(master));
+    const gone = dead();
+    const open = live();
+
+    await applyRequirement({ required: true, fingerprint: first.message.fingerprint });
+    await handleGateMessage(gone, first.message);
+    await handleGateMessage(open, second.message);
+    await useKey(await deriveSessionKey(passphrase, salt, iterations), false);
+
+    expect(open.sent, "the socket that is still open was answered").toHaveLength(1);
+    expect(handshakeAnswered(second, open.sent[0].proof)).toBe(true);
+    expect(e2eeState().rejected, "and nothing was mistaken for a wrong key").toBe(false);
+  });
+
+  it("reports a key that cannot answer, whichever key the challenge names", async () => {
+    // Telling a wrong key from a stale challenge by fingerprint cannot be
+    // done: a wrong passphrase derives one that matches neither. Trying cost
+    // the ability to report a wrong key at all.
+    const master = await deriveMasterKey(passphrase, Buffer.from(salt, "base64"), iterations);
+    const current = startHandshake(master, fingerprintOf(master));
+    const open = live();
+
+    await applyRequirement({ required: true, fingerprint: current.message.fingerprint });
+    await handleGateMessage(open, current.message);
+    await useKey(await deriveSessionKey("口令输错了", salt, iterations), false);
+
+    expect(e2eeState().rejected).toBe(true);
+    expect(e2eeState().proved).toBe(false);
+    expect(open.sent).toHaveLength(0);
   });
 });

@@ -30,7 +30,8 @@ export type E2eeState = {
   rejected: boolean;
 };
 
-type Waiting = { socket: { send: (data: string) => void }; challenge: HandshakeChallenge };
+type GateSocket = { send: (data: string) => void; readyState?: number };
+type Waiting = { socket: GateSocket; challenge: HandshakeChallenge };
 
 let state: E2eeState = { required: false, fingerprint: null, proved: false, rejected: false };
 let key: SessionKey | null = null;
@@ -79,20 +80,35 @@ export async function applyRequirement(requirement: E2eeRequirement | undefined)
   if (key) await answerWaiting();
 }
 
+/** A socket that closed while the reader was typing has nothing left to prove. */
+const isOpen = (socket: GateSocket) => socket.readyState === undefined || socket.readyState === 1;
+
 /**
  * Answers every challenge that is still waiting.
  *
- * The first failure drops the key: all of these are from the same server under
- * the same fingerprint, so one of them failing means none of them can succeed.
+ * Deliberately tolerant of the list, because the list is not tidy. A page
+ * reconnects while the reader is typing -- after bootstrap, on a tab change --
+ * and leaves a challenge behind on a socket that is already gone. Sending to
+ * that socket throws, and the first version let the throw abandon the loop, so
+ * the live connection never got its answer and a correct key looked like it
+ * had done nothing until the page was reloaded.
  */
 async function answerWaiting(): Promise<void> {
   if (!key) return;
-  const pending = waiting;
+  const pending = waiting.filter((entry) => isOpen(entry.socket));
   waiting = [];
   for (const entry of pending) {
     const answer = await answerChallenge(key, entry.challenge);
+    // Any challenge that cannot be answered means this key does not work.
+    // Trying to tell a wrong key from a stale challenge by fingerprint cannot
+    // be done -- a wrong passphrase derives a fingerprint that matches neither
+    // -- and the attempt stopped a wrong key being reported at all, which is
+    // the whole point. A challenge left over from a rotation costs one extra
+    // prompt; a wrong key that is never reported costs the reader the feature.
     if (!answer) { await dropKey(); return; }
-    entry.socket.send(JSON.stringify(answer));
+    // It can close between the check above and here; one dead socket must not
+    // decide anything for the others.
+    try { entry.socket.send(JSON.stringify(answer)); } catch { /* gone */ }
   }
 }
 
@@ -103,9 +119,13 @@ async function answerWaiting(): Promise<void> {
  */
 export async function useKey(next: SessionKey, remember = true): Promise<void> {
   key = next;
-  if (remember) await rememberKey(next);
   publish({ rejected: false });
+  // Answered before it is stored, and stored without being waited on. Proving
+  // is what the reader is waiting for; remembering is a convenience for next
+  // time, and IndexedDB can be blocked or absent -- in a private window, or
+  // behind another tab holding the database -- in ways that never resolve.
   await answerWaiting();
+  if (remember) void rememberKey(next);
 }
 
 export async function dropKey(): Promise<void> {
@@ -121,7 +141,7 @@ export async function dropKey(): Promise<void> {
  * Returns whether the message belonged to this gate, so a caller can pass
  * everything else through untouched.
  */
-export async function handleGateMessage(socket: { send: (data: string) => void }, message: any): Promise<boolean> {
+export async function handleGateMessage(socket: GateSocket, message: any): Promise<boolean> {
   if (message?.type === HANDSHAKE_READY) {
     // The only place a page learns its key is the right one.
     publish({ proved: true, rejected: false });
@@ -130,7 +150,7 @@ export async function handleGateMessage(socket: { send: (data: string) => void }
   if (message?.type !== HANDSHAKE_CHALLENGE) return false;
   if (!challengeIsWellFormed(message)) return true;
   publish({ required: true, fingerprint: message.fingerprint });
-  waiting = [...waiting.filter((entry) => entry.socket !== socket), { socket, challenge: message }];
+  waiting = [...waiting.filter((entry) => entry.socket !== socket && isOpen(entry.socket)), { socket, challenge: message }];
   await answerWaiting();
   return true;
 }
