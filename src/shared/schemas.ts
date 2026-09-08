@@ -6,12 +6,21 @@ const makeId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.
 // "shell" is a conversation with no coding agent at all: just a PowerShell in
 // a working directory. Turns, final answers and history do not apply to it.
 //
-// "p2p" is not a conversation either: it is the end-to-end encryption switch
+// "e2ee" is not a conversation either: it is the end-to-end encryption switch
 // wearing a tab's clothes, so that turning encryption on and off is the same
 // gesture as opening and deleting a conversation. It has no terminal, no queue
 // and no history, and its working directory field holds the passphrase, which
 // never leaves this machine (see docs/P2P_E2EE_MINIMAL_DESIGN.md).
-export const AgentProviderSchema = z.enum(["codex", "claude", "cursor", "shell", "p2p"]);
+const ProviderNameSchema = z.enum(["codex", "claude", "cursor", "shell", "e2ee"]);
+
+// It shipped as "p2p" first, which was the wrong name: nothing here is peer to
+// peer, the data still goes through the relay and only stops being readable by
+// it. Tabs written under the old name are read under the new one rather than
+// failing to load, and take the new spelling the next time they are saved.
+export const AgentProviderSchema = z.preprocess(
+  (value) => (value === "p2p" ? "e2ee" : value),
+  ProviderNameSchema,
+);
 export type AgentProvider = z.infer<typeof AgentProviderSchema>;
 
 export const OriginSchema = z.enum(["queue", "manual", "imported", "timer"]);

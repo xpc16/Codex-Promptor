@@ -24,14 +24,17 @@ import type { NetworkScope } from "./traffic-scope.js";
 /** Deep enough for a bundle inside a snapshot inside an envelope, and no deeper. */
 const MAX_DEPTH = 12;
 
-function isP2pSession(value: Record<string, unknown>): boolean {
-  return value.provider === "p2p" && "workingDirectory" in value;
+// Both spellings. Storage normalizes the legacy "p2p" through the schema, so
+// in practice only one arrives -- but this is the last thing standing between
+// a passphrase and the network, and it should not depend on a step upstream.
+function isE2eeSession(value: Record<string, unknown>): boolean {
+  return (value.provider === "e2ee" || value.provider === "p2p") && "workingDirectory" in value;
 }
 
 /**
  * The same reference when nothing was found, a copy only along the path to
  * what was. Most outbound messages carry no tab at all, and the ones that do
- * usually carry no p2p tab; neither should pay for a clone.
+ * usually carry no encryption tab; neither should pay for a clone.
  */
 function walk(value: unknown, depth: number): unknown {
   if (depth > MAX_DEPTH || value === null || typeof value !== "object") return value;
@@ -47,7 +50,7 @@ function walk(value: unknown, depth: number): unknown {
   }
 
   const record = value as Record<string, unknown>;
-  if (isP2pSession(record)) {
+  if (isE2eeSession(record)) {
     // Null rather than removed: the far end must still see that this tab
     // exists, or it cannot know encryption is on or show its state. What it
     // does not need is what was typed into it.

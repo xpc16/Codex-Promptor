@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import WebSocket from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { isoNow } from "../shared/schemas.js";
+import { defaultSession, isoNow, TabMetaSchema } from "../shared/schemas.js";
 import { createApp, type PromptorApp } from "./app.js";
 import { redactForRemote, redactForScope } from "./e2ee-redaction.js";
 
@@ -11,8 +11,8 @@ import { redactForRemote, redactForScope } from "./e2ee-redaction.js";
 const PASSPHRASE = "correct-horse-battery-staple-4f2a9c";
 const REMOTE_HOST = "promptor.example.com";
 
-const p2pSession = (over: Record<string, unknown> = {}) => ({
-  provider: "p2p",
+const e2eeSession = (over: Record<string, unknown> = {}) => ({
+  provider: "e2ee",
   state: "ready",
   workingDirectory: PASSPHRASE,
   threadId: null,
@@ -26,9 +26,9 @@ describe("taking the passphrase out of what leaves this machine", () => {
     // delta's upserts, a bundle inside a snapshot.
     const message = {
       type: "snapshot",
-      data: { tab: { id: "t1", session: p2pSession() }, prompts: { prompts: [] } },
-      index: { tabs: [{ id: "t1", session: p2pSession() }] },
-      delta: { tabs: { upserts: [{ id: "t1", session: p2pSession() }] } },
+      data: { tab: { id: "t1", session: e2eeSession() }, prompts: { prompts: [] } },
+      index: { tabs: [{ id: "t1", session: e2eeSession() }] },
+      delta: { tabs: { upserts: [{ id: "t1", session: e2eeSession() }] } },
     };
     expect(JSON.stringify(redactForRemote(message))).not.toContain(PASSPHRASE);
   });
@@ -36,8 +36,8 @@ describe("taking the passphrase out of what leaves this machine", () => {
   it("leaves the tab itself standing", () => {
     // The far end has to see that this tab exists, or it cannot know
     // encryption is on. What it does not need is what was typed into it.
-    const redacted = redactForRemote({ session: p2pSession() }) as any;
-    expect(redacted.session.provider).toBe("p2p");
+    const redacted = redactForRemote({ session: e2eeSession() }) as any;
+    expect(redacted.session.provider).toBe("e2ee");
     expect(redacted.session.workingDirectory).toBeNull();
     expect(redacted.session.e2ee.salt).toBe("c2FsdA");
   });
@@ -52,18 +52,18 @@ describe("taking the passphrase out of what leaves this machine", () => {
     // a clone of themselves.
     const message = { type: "terminal.screen", rows: [{ cells: "abc" }] };
     expect(redactForRemote(message)).toBe(message);
-    expect(redactForRemote({ session: p2pSession({ workingDirectory: null }) })).toBeTruthy();
+    expect(redactForRemote({ session: e2eeSession({ workingDirectory: null }) })).toBeTruthy();
   });
 
   it("keeps loopback unredacted, because that is where it was typed", () => {
-    const message = { session: p2pSession() };
+    const message = { session: e2eeSession() };
     expect(redactForScope(message, "local")).toBe(message);
     expect(JSON.stringify(redactForScope(message, "tunnel"))).not.toContain(PASSPHRASE);
     expect(JSON.stringify(redactForScope(message, "remote"))).not.toContain(PASSPHRASE);
   });
 
   it("survives a cycle rather than hanging on one", () => {
-    const cyclic: any = { session: p2pSession() };
+    const cyclic: any = { session: e2eeSession() };
     cyclic.self = cyclic;
     expect(() => redactForRemote(cyclic)).not.toThrow();
   });
@@ -86,7 +86,7 @@ describe("the passphrase over a real connection", () => {
     tabId = tab.id;
     await app.promptor.storage.updateTab(tabId, (current) => ({
       ...current,
-      session: { ...current.session, ...p2pSession() } as never,
+      session: { ...current.session, ...e2eeSession() } as never,
       updatedAt: isoNow(),
     }));
   });
@@ -169,7 +169,7 @@ describe("setting the key", () => {
     method: "POST",
     url: `/api/tabs/${tabId}/session`,
     headers: { "x-codex-promptor-token": app.promptor.token, host, origin },
-    payload: { provider: "p2p", ...payload } as never,
+    payload: { provider: "e2ee", ...payload } as never,
   });
 
   it("is refused from anywhere but this machine", async () => {
@@ -178,14 +178,14 @@ describe("setting the key", () => {
     const remote = await open(REMOTE_HOST, `https://${REMOTE_HOST}`, { workingDirectory: PASSPHRASE });
     expect(remote.statusCode).toBe(403);
     expect(remote.json()).toMatchObject({ error: { code: "E2EE_LOCAL_ONLY" } });
-    expect((await app.promptor.storage.getTabMeta(tabId)).session.provider).not.toBe("p2p");
+    expect((await app.promptor.storage.getTabMeta(tabId)).session.provider).not.toBe("e2ee");
   });
 
   it("derives a salt and a fingerprint, and keeps the passphrase local", async () => {
     const response = await open("127.0.0.1:4317", "http://127.0.0.1:4317", { workingDirectory: PASSPHRASE });
     expect(response.statusCode).toBe(200);
     const session = (await app.promptor.storage.getTabMeta(tabId)).session;
-    expect(session.provider).toBe("p2p");
+    expect(session.provider).toBe("e2ee");
     expect(session.workingDirectory).toBe(PASSPHRASE);
     expect(session.e2ee?.iterations).toBe(600000);
     expect(session.e2ee?.fingerprint).toMatch(/^[A-Z2-7]{4}-[A-Z2-7]{4}$/);
@@ -209,5 +209,25 @@ describe("setting the key", () => {
     const empty = await open("127.0.0.1:4317", "http://127.0.0.1:4317", { workingDirectory: "   " });
     expect(empty.statusCode).toBe(400);
     expect(empty.json()).toMatchObject({ error: { code: "E2EE_PASSPHRASE_REQUIRED" } });
+  });
+});
+
+describe("a tab written under the old name", () => {
+  it("is read under the new one rather than failing to load", () => {
+    // It shipped as "p2p" first, which was the wrong name: nothing here is
+    // peer to peer. A tab already on disk must not stop loading over it.
+    expect(TabMetaSchema.parse({
+      id: "t1", name: "加密", groupId: null, order: 0,
+      createdAt: isoNow(), updatedAt: isoNow(),
+      session: { ...defaultSession(), ...e2eeSession(), provider: "p2p" },
+    }).session.provider).toBe("e2ee");
+  });
+
+  it("still redacts one, whichever name it was written under", () => {
+    const old = { session: { ...e2eeSession(), provider: "p2p" } };
+    // The walk reads the value as stored, so the legacy spelling has to be
+    // recognised there too -- a tab that has not been rewritten yet still
+    // holds a passphrase.
+    expect(JSON.stringify(redactForRemote(old))).not.toContain(PASSPHRASE);
   });
 });

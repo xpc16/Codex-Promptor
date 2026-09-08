@@ -228,7 +228,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   let cachedKey: { fingerprint: string; master: Buffer; salt: string; iterations: number } | null = null;
   const encryptionState = async (): Promise<{ master: Buffer; fingerprint: string; salt: string; iterations: number } | null> => {
     const tabs = await storage.listTabMeta().catch(() => []);
-    const switchTab = tabs.find((tab) => tab.session.provider === "p2p" && tab.session.e2ee);
+    const switchTab = tabs.find((tab) => tab.session.provider === "e2ee" && tab.session.e2ee);
     if (!switchTab) { cachedKey = null; return null; }
     const declared = switchTab.session.e2ee!.fingerprint;
     if (cachedKey?.fingerprint === declared) return cachedKey;
@@ -2116,7 +2116,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     // resume id to parse, no terminal to start. Loopback only -- letting the
     // far end set the key it will be checked against is the same as having no
     // key at all.
-    if (provider === "p2p") {
+    if (provider === "e2ee") {
       if (!isLocalBrowserRequest(request.headers)) {
         return apiError(reply, 403, "E2EE_LOCAL_ONLY", "Encryption can only be set up from this machine.");
       }
@@ -2124,7 +2124,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const typed = normalizePassphrase(String(body.workingDirectory ?? body.passphrase ?? ""));
       // An empty box means "keep what is already set", which is what makes
       // reopening the tab harmless. It only fails when there is nothing yet.
-      const passphrase = typed ?? (previous?.session.provider === "p2p" ? previous.session.workingDirectory : null);
+      const passphrase = typed ?? (previous?.session.provider === "e2ee" ? previous.session.workingDirectory : null);
       if (!passphrase) return apiError(reply, 400, "E2EE_PASSPHRASE_REQUIRED", "Enter a passphrase to turn encryption on.");
       const { material } = await newKeyMaterial(passphrase);
       const now = isoNow();
@@ -2132,7 +2132,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         ...current,
         session: {
           ...current.session,
-          provider: "p2p",
+          provider: "e2ee",
           state: "ready",
           reopenOnLaunch: true,
           workingDirectory: passphrase,

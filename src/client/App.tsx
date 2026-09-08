@@ -457,7 +457,7 @@ export function App() {
     if (!dialog || (dialog.kind !== "delete-tab" && dialog.kind !== "delete-group")) return;
     try {
       if (dialog.kind === "delete-tab") {
-        const wasEncryption = index?.tabs.find((entry) => entry.id === dialog.tabId)?.session.provider === "p2p";
+        const wasEncryption = index?.tabs.find((entry) => entry.id === dialog.tabId)?.session.provider === "e2ee";
         await api(`/api/tabs/${dialog.tabId}`, { method: "DELETE" });
         forgetCachedTab(dialog.tabId);
         forgetCachedTerminal(dialog.tabId);
@@ -713,6 +713,7 @@ function E2eeUnlock({ state, kdf, onError }: { state: E2eeState; kdf: { salt: st
   const { t } = useI18n();
   const [value, setValue] = useState("");
   const [working, setWorking] = useState(false);
+  const [masked, setMasked] = useState(false);
   const unlock = async () => {
     if (working || !value.trim()) return;
     setWorking(true);
@@ -729,16 +730,29 @@ function E2eeUnlock({ state, kdf, onError }: { state: E2eeState; kdf: { salt: st
       <strong>{t("e2ee.unlockTitle")}</strong>
       <p>{t("e2ee.unlockBody")}</p>
       {state.rejected && <div className="inline-error">{t("e2ee.wrongKey")}</div>}
-      <input
-        type="password"
-        autoFocus
-        value={value}
-        disabled={working}
-        placeholder={t("session.e2eeKeyPlaceholder")}
-        onChange={(event) => setValue(event.target.value)}
-        onKeyDown={(event) => { if (event.key === "Enter") void unlock(); }}
-      />
+      {/*
+        A plain text field, not a password one. Windows and macOS disable the
+        IME inside password inputs, so a passphrase in Chinese -- or any other
+        language that composes -- simply cannot be typed into one. Masking it
+        is the reader's choice instead, and choosing to mask means giving up
+        the IME, which is a trade only they can make.
+      */}
+      <div className="e2ee-key-row">
+        <input
+          type={masked ? "password" : "text"}
+          autoFocus
+          value={value}
+          disabled={working}
+          autoComplete="off"
+          spellCheck={false}
+          placeholder={t("session.e2eeKeyPlaceholder")}
+          onChange={(event) => setValue(event.target.value)}
+          onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) void unlock(); }}
+        />
+        <button className="ghost" type="button" onClick={() => setMasked((current) => !current)}>{t(masked ? "e2ee.reveal" : "e2ee.mask")}</button>
+      </div>
       <button className="primary" disabled={working || !value.trim()} onClick={() => void unlock()}>{t(working ? "e2ee.unlocking" : "e2ee.unlock")}</button>
+      <small className="field-hint">{t("e2ee.imeHint")}</small>
       {state.fingerprint && <small className="field-hint">{t("e2ee.expectFingerprint", { fingerprint: state.fingerprint })}</small>}
     </div>
   </div>;
@@ -1125,11 +1139,11 @@ function SessionPanel({ bundle, height, reopening, onReopen, onSyncHistory, onBu
     try {
       // The mode switch and its id stay usable for every provider, but a p2p
       // tab has no conversation to start or resume, so neither is sent.
-      const result = await api<{ bundle: TabBundle }>(`/api/tabs/${bundle.tab.id}/session`, jsonBody(isP2p
+      const result = await api<{ bundle: TabBundle }>(`/api/tabs/${bundle.tab.id}/session`, jsonBody(isE2ee
         ? { provider, workingDirectory: cwd }
         : { provider, mode, workingDirectory: cwd, resumeId }));
       onBundle(result.bundle);
-      if (isP2p) {
+      if (isE2ee) {
         setCwd("");
         onNotice(t("session.e2eeOn"));
       }
@@ -1160,13 +1174,13 @@ function SessionPanel({ bundle, height, reopening, onReopen, onSyncHistory, onBu
     finally { setSyncing(false); }
   };
   const activeProvider = connected ? session.provider : provider;
-  const providerName = t(activeProvider === "claude" ? "provider.claude" : activeProvider === "cursor" ? "provider.cursor" : activeProvider === "shell" ? "provider.shell" : activeProvider === "p2p" ? "provider.p2p" : "provider.codex");
+  const providerName = t(activeProvider === "claude" ? "provider.claude" : activeProvider === "cursor" ? "provider.cursor" : activeProvider === "shell" ? "provider.shell" : activeProvider === "e2ee" ? "provider.e2ee" : "provider.codex");
   // A terminal has no agent, so everything downstream of one is switched off.
   const isShell = activeProvider === "shell";
-  const isP2p = activeProvider === "p2p";
+  const isE2ee = activeProvider === "e2ee";
   // An empty box means "keep the passphrase already set", which is what makes
   // reopening this tab harmless. It is only unusable when nothing is set yet.
-  const p2pReady = isP2p && (cwd.trim().length > 0 || Boolean(session.e2ee));
+  const e2eeReady = isE2ee && (cwd.trim().length > 0 || Boolean(session.e2ee));
   const sessionTitle = session.state === "ready"
     ? t("session.ready", { provider: providerName })
     : session.state === "closed"
@@ -1177,15 +1191,15 @@ function SessionPanel({ bundle, height, reopening, onReopen, onSyncHistory, onBu
   const sessionHelp = restoring
     ? t("session.restoringHelp", { provider: providerName })
     : connected
-      ? t(session.provider === "claude" ? "session.connectedHelp.claude" : session.provider === "cursor" ? "session.connectedHelp.cursor" : session.provider === "shell" ? "session.connectedHelp.shell" : session.provider === "p2p" ? "session.connectedHelp.p2p" : "session.connectedHelp.codex")
+      ? t(session.provider === "claude" ? "session.connectedHelp.claude" : session.provider === "cursor" ? "session.connectedHelp.cursor" : session.provider === "shell" ? "session.connectedHelp.shell" : session.provider === "e2ee" ? "session.connectedHelp.e2ee" : "session.connectedHelp.codex")
       : t("session.setupHelp");
   return <div className="session-card" style={height === null ? undefined : { height: `${height}%`, maxHeight: "none" }}>
     <div className="section-title"><span className="section-icon">◌</span><div><strong>{sessionTitle}</strong><small>{sessionHelp}</small></div></div>
-    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t(session.provider === "p2p" ? "session.e2eeFingerprint" : "session.workingDirectory")}</span><code>{session.provider === "p2p" ? (session.e2ee?.fingerprint ?? "—") : session.workingDirectory}</code></div>{session.provider === "p2p" && <div className="field-hint e2ee-hint">{t("session.e2eeCompare")}</div>}{session.provider !== "shell" && session.provider !== "p2p" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && session.lastThreadSwitch.method !== "thread/fork" && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring || syncing} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <><button className="danger-action" disabled={busy || syncing} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>{session.provider !== "shell" && session.provider !== "p2p" && session.threadId && <button className="ghost" disabled={busy || reopening || syncing} onClick={() => void syncHistory()}>{t("footer.syncHistory")}</button>}</>}{localFolderPicker && <button className="ghost" disabled={exporting} onClick={() => void exportConversation()}>{t(exporting ? "session.exporting" : "session.export")}</button>}</div></div> : <>
-      <label className="field-label">{t(isP2p ? "session.e2eeKey" : localFolderPicker ? "session.localPath" : "session.remotePath")}</label><div className={`path-row ${localFolderPicker && !isP2p ? "" : "remote"}`}><input value={cwd} title={isP2p ? undefined : cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t(isP2p ? "session.e2eeKeyPlaceholder" : "session.pathExample")} />{isP2p ? <button className="ghost" onClick={() => setCwd(randomPassphrase())}>{t("session.e2eeGenerate")}</button> : localFolderPicker && <button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button>}</div>{isP2p ? <small className="field-hint">{t(session.e2ee ? "session.e2eeKeepHint" : "session.e2eeKeyHint")}</small> : <>{!localFolderPicker && <small className="field-hint">{t("session.remotePathHint")}</small>}{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}</>}
+    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t(session.provider === "e2ee" ? "session.e2eeFingerprint" : "session.workingDirectory")}</span><code>{session.provider === "e2ee" ? (session.e2ee?.fingerprint ?? "—") : session.workingDirectory}</code></div>{session.provider === "e2ee" && <div className="field-hint e2ee-hint">{t("session.e2eeCompare")}</div>}{session.provider !== "shell" && session.provider !== "e2ee" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && session.lastThreadSwitch.method !== "thread/fork" && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring || syncing} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <><button className="danger-action" disabled={busy || syncing} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>{session.provider !== "shell" && session.provider !== "e2ee" && session.threadId && <button className="ghost" disabled={busy || reopening || syncing} onClick={() => void syncHistory()}>{t("footer.syncHistory")}</button>}</>}{localFolderPicker && <button className="ghost" disabled={exporting} onClick={() => void exportConversation()}>{t(exporting ? "session.exporting" : "session.export")}</button>}</div></div> : <>
+      <label className="field-label">{t(isE2ee ? "session.e2eeKey" : localFolderPicker ? "session.localPath" : "session.remotePath")}</label><div className={`path-row ${localFolderPicker && !isE2ee ? "" : "remote"}`}><input value={cwd} title={isE2ee ? undefined : cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t(isE2ee ? "session.e2eeKeyPlaceholder" : "session.pathExample")} />{isE2ee ? <button className="ghost" onClick={() => setCwd(randomPassphrase())}>{t("session.e2eeGenerate")}</button> : localFolderPicker && <button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button>}</div>{isE2ee ? <small className="field-hint">{t(session.e2ee ? "session.e2eeKeepHint" : "session.e2eeKeyHint")}</small> : <>{!localFolderPicker && <small className="field-hint">{t("session.remotePathHint")}</small>}{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}</>}
       {!isShell && <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => setMode("new")}>{t("session.createNew")}</button><button className={mode === "resume" ? "active" : ""} onClick={() => setMode("resume")}>{t("session.resumeOld")}</button></div>}
       {!isShell && mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} placeholder={t("session.resumePlaceholder")} />}
-      <div className="connect-row"><button className="primary connect" disabled={busy || (isP2p ? !p2pReady : !isShell && !cwd.trim())} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button><select value={provider} disabled={busy} onChange={(event) => setProvider(event.target.value as AgentProvider)} aria-label={providerName}><option value="codex">{t("provider.codex")}</option><option value="claude">{t("provider.claude")}</option><option value="cursor">{t("provider.cursor")}</option><option value="shell">{t("provider.shell")}</option><option value="p2p">{t("provider.p2p")}</option></select></div>
+      <div className="connect-row"><button className="primary connect" disabled={busy || (isE2ee ? !e2eeReady : !isShell && !cwd.trim())} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button><select value={provider} disabled={busy} onChange={(event) => setProvider(event.target.value as AgentProvider)} aria-label={providerName}><option value="codex">{t("provider.codex")}</option><option value="claude">{t("provider.claude")}</option><option value="cursor">{t("provider.cursor")}</option><option value="shell">{t("provider.shell")}</option><option value="e2ee">{t("provider.e2ee")}</option></select></div>
     </>}
     {session.lastError && <div className="inline-error">{i18n.errorText(session.lastError)}</div>}
   </div>;

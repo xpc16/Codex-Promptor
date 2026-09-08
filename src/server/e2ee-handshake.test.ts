@@ -37,7 +37,7 @@ describe("proving both ends hold the same key", () => {
       method: "POST",
       url: `/api/tabs/${tabId}/session`,
       headers: { "x-codex-promptor-token": app.promptor.token, host: "127.0.0.1:4317", origin: "http://127.0.0.1:4317" },
-      payload: { provider: "p2p", workingDirectory: PASSPHRASE } as never,
+      payload: { provider: "e2ee", workingDirectory: PASSPHRASE } as never,
     });
     expect(created.statusCode).toBe(200);
     const session = (await app.promptor.storage.getTabMeta(tabId)).session;

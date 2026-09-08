@@ -96,7 +96,7 @@ export function handshakeAnswered(pending: PendingHandshake, proof: unknown): bo
 export async function masterKeyFor(
   session: { provider: string; workingDirectory: string | null; e2ee: { salt: string; iterations: number; fingerprint: string } | null },
 ): Promise<{ master: Buffer; fingerprint: string } | null> {
-  if (session.provider !== "p2p" || !session.workingDirectory || !session.e2ee) return null;
+  if (session.provider !== "e2ee" || !session.workingDirectory || !session.e2ee) return null;
   const master = await deriveMasterKey(session.workingDirectory, Buffer.from(decodeBase64(session.e2ee.salt)), session.e2ee.iterations);
   return { master, fingerprint: fingerprintOf(master) };
 }

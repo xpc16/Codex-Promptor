@@ -469,6 +469,8 @@ input, textarea, select { color: var(--text); }
 .e2ee-unlock-card { width: min(420px, 88vw); display: flex; flex-direction: column; gap: 10px; padding: 20px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); box-shadow: var(--shadow); }
 .e2ee-unlock-card p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .e2ee-unlock-card input { width: 100%; }
+.e2ee-key-row { display: flex; gap: 8px; align-items: center; }
+.e2ee-key-row input { flex: 1 1 auto; min-width: 0; }
 
 .dialog-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px; background: rgba(25, 33, 46, .42); backdrop-filter: blur(3px); }
 .text-dialog { width: min(480px, 100%); padding: 21px; border: 1px solid var(--border-strong); border-radius: 13px; background: var(--panel); box-shadow: 0 24px 70px rgba(24, 34, 52, .28); }
