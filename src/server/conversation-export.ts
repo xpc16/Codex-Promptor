@@ -7,6 +7,8 @@ const providerNames: Record<AgentProvider, string> = {
   claude: "Claude Code",
   cursor: "Cursor CLI",
   shell: "PowerShell",
+  // Never exported: a p2p tab is the encryption switch, not a conversation.
+  p2p: "P2P",
 };
 
 const zh = {

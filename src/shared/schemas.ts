@@ -5,7 +5,13 @@ const makeId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.
 
 // "shell" is a conversation with no coding agent at all: just a PowerShell in
 // a working directory. Turns, final answers and history do not apply to it.
-export const AgentProviderSchema = z.enum(["codex", "claude", "cursor", "shell"]);
+//
+// "p2p" is not a conversation either: it is the end-to-end encryption switch
+// wearing a tab's clothes, so that turning encryption on and off is the same
+// gesture as opening and deleting a conversation. It has no terminal, no queue
+// and no history, and its working directory field holds the passphrase, which
+// never leaves this machine (see docs/P2P_E2EE_MINIMAL_DESIGN.md).
+export const AgentProviderSchema = z.enum(["codex", "claude", "cursor", "shell", "p2p"]);
 export type AgentProvider = z.infer<typeof AgentProviderSchema>;
 
 export const OriginSchema = z.enum(["queue", "manual", "imported", "timer"]);
@@ -111,6 +117,15 @@ export const SessionSchema = z.object({
     toThreadId: z.string(),
     method: z.enum(["thread/start", "thread/resume", "thread/fork", "session/start"]),
     switchedAt: z.string(),
+  }).nullable().default(null),
+  // Everything a remote page needs to derive the same key, and nothing it must
+  // not have. The passphrase lives in workingDirectory and is stripped on the
+  // way out; these three are not secret and must go out, because without the
+  // salt the other side cannot derive anything at all.
+  e2ee: z.object({
+    salt: z.string(),
+    iterations: z.number().int().positive(),
+    fingerprint: z.string(),
   }).nullable().default(null),
 });
 export type Session = z.infer<typeof SessionSchema>;
@@ -344,6 +359,7 @@ export const defaultSession = (): Session => ({
   connectedAt: null,
   lastError: null,
   lastThreadSwitch: null,
+  e2ee: null,
 });
 
 export const defaultRuntime = (): RuntimeFile => RuntimeFileSchema.parse({

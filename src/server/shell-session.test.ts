@@ -139,6 +139,7 @@ describe("terminal-only conversations", () => {
       connectedAt: isoNow(),
       lastError: null,
       lastThreadSwitch: null,
+    e2ee: null,
     };
     const tab = (id: string, session: Partial<TabMeta["session"]>): TabMeta => ({
       id, name: id, groupId: null, order: 0, createdAt: isoNow(), updatedAt: isoNow(),

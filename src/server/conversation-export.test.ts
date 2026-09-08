@@ -72,6 +72,7 @@ describe("conversation Markdown export", () => {
         connectedAt: NOW,
         lastError: null,
         lastThreadSwitch: null,
+      e2ee: null,
       },
       layout: { leftWidthPercent: 42 },
     },

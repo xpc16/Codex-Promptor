@@ -2123,6 +2123,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             connectedAt: isoNow(),
             lastError: null,
             lastThreadSwitch: null,
+          e2ee: null,
           },
           updatedAt: isoNow(),
         }));
@@ -2153,6 +2154,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             connectedAt: isoNow(),
             lastError: null,
             lastThreadSwitch: null,
+          e2ee: null,
           },
           updatedAt: isoNow(),
         }));
@@ -2183,6 +2185,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             connectedAt: isoNow(),
             lastError: null,
             lastThreadSwitch: null,
+          e2ee: null,
           },
           updatedAt: isoNow(),
         }));
@@ -2217,6 +2220,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             connectedAt: isoNow(),
             lastError: null,
             lastThreadSwitch: null,
+          e2ee: null,
           },
           updatedAt: isoNow(),
         }));
@@ -2292,6 +2296,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           connectedAt: isoNow(),
           lastError: null,
           lastThreadSwitch: null,
+        e2ee: null,
         },
         updatedAt: isoNow(),
       }));
@@ -2318,7 +2323,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await codexTui.stop(tabId).catch(() => undefined);
       await cursor.stop(tabId).catch(() => undefined);
       await claude.stop(tabId).catch(() => undefined);
-      if (provider !== "shell") revokeHookLease(provider, tabId);
+      if (provider !== "shell" && provider !== "p2p") revokeHookLease(provider, tabId);
       await stopAppServer(storage, codex, tabId).catch(() => undefined);
       await updateTerminalRuntime(storage, tabId, { state: "stopped" }).catch(() => undefined);
       const activeWriter = provider === "codex" && isActiveWriterError(message);
