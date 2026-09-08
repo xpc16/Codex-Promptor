@@ -52,6 +52,7 @@ import {
 } from "./terminal-transport.js";
 import { defaultProjectionSchedulerConfig, fullTerminalScreenFrame, TerminalProjectionScheduler } from "./terminal-projection.js";
 import { createTrafficLedger, rollupBuckets, type TrafficLedger } from "./traffic-ledger.js";
+import { redactForScope } from "./e2ee-redaction.js";
 import { classifyNetworkScope, type NetworkScope } from "./traffic-scope.js";
 import { buildIndexDelta, indexDeltaIsEmpty } from "../shared/index-delta.js";
 import { createTrafficLog } from "./traffic-log.js";
@@ -245,7 +246,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   };
 
   const sendClient = (client: Client, message: Record<string, unknown>, kind: TerminalTrafficKind): boolean => {
-    const payload = JSON.stringify(message);
+    // Every WebSocket message is serialized here and nowhere else, and the
+    // scope is already known, so this is the one place the passphrase has to
+    // be taken back out (see e2ee-redaction.ts).
+    const payload = JSON.stringify(redactForScope(message, client.scope));
     const sent = socketSender.send(client.id, client.socket, payload, kind);
     // Counted only when it actually left: a frame dropped for backpressure
     // costs no bandwidth, and counting it would hide the drop.
@@ -1508,6 +1512,14 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   // this hook chain sees is the one *before* @fastify/compress rewrites it:
   // plugin hooks are added when the plugin loads, not when register() is
   // called, so hook order cannot be relied on to see the compressed bytes.
+  // The HTTP counterpart of the redaction in sendClient. preSerialization sees
+  // the object before it becomes JSON, which is the last point at which a tab
+  // is still a tab rather than a string to search.
+  app.addHook("preSerialization", async (request, _reply, payload) => {
+    const scope = classifyNetworkScope(request.raw.socket?.remoteAddress, request.headers.host);
+    return redactForScope(payload, scope);
+  });
+
   app.addHook("onRequest", async (request) => {
     (request as any).trafficSocketStart = Number((request.raw.socket as any)?.bytesWritten ?? Number.NaN);
   });
@@ -2934,7 +2946,13 @@ export function parseTerminalSubscriptions(value: unknown, defaultCatchUpBytes: 
  * payload, so it identifies the content and not one particular encoding.
  */
 function sendRevalidatable(request: FastifyRequest, reply: FastifyReply, data: unknown): FastifyReply {
-  const body = JSON.stringify({ data });
+  // Serializes here rather than handing Fastify an object, which means the
+  // preSerialization hook never sees it -- that hook is skipped for a payload
+  // that is already a string. So the redaction has to happen here too, and the
+  // ETag is computed over what actually goes out: loopback and the tunnel are
+  // sent different bodies and must not share a validator.
+  const scope = classifyNetworkScope(request.raw.socket?.remoteAddress, request.headers.host);
+  const body = JSON.stringify(redactForScope({ data }, scope));
   const etag = entityTag(body);
   reply.header("cache-control", REVALIDATE_CACHE_CONTROL);
   reply.header("vary", REVALIDATE_VARY);
