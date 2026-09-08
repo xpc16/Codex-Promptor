@@ -32,6 +32,17 @@ export const HANDSHAKE_PROOF = "e2ee.proof";
 export const HANDSHAKE_READY = "e2ee.ready";
 
 /**
+ * Why a connection was closed when the key it was using stopped being the key.
+ *
+ * Setting a new passphrase, or deleting the tab that holds one, has to reach
+ * the far end somehow. Without this the remote page keeps a connection it can
+ * no longer read anything on, and only a reload tells it why. Closing with a
+ * code it recognises turns that into one unsealed bootstrap request: either it
+ * is asked for the new passphrase, or it learns encryption is off.
+ */
+export const KEY_CHANGED_CLOSE_CODE = 4001;
+
+/**
  * What each side's proof is bound to.
  *
  * The role is in here so that the server's proof can never be replayed as the

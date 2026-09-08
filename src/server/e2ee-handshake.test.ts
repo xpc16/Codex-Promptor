@@ -8,9 +8,11 @@ import {
   HANDSHAKE_CHALLENGE,
   HANDSHAKE_PROOF,
   HANDSHAKE_READY,
+  KEY_CHANGED_CLOSE_CODE,
   challengeIsWellFormed,
   handshakeAad,
 } from "../shared/e2ee-handshake.js";
+import { ClientWire, connectionWireKeys } from "../client/e2ee-wire.js";
 import { createApp, type PromptorApp } from "./app.js";
 import { deriveMasterKey, subKey } from "./e2ee-key-material.js";
 import { open, seal } from "./e2ee-session.js";
@@ -62,15 +64,45 @@ describe("proving both ends hold the same key", () => {
     const socket = new WebSocket(url, host ? { headers: { host } } : undefined);
     sockets.push(socket);
     const messages: any[] = [];
+    const frames: Buffer[] = [];
     let closed: { code: number } | null = null;
-    socket.on("message", (raw: Buffer) => messages.push(JSON.parse(raw.toString())));
+    // Deliberately the browser's own module, run against the real server: the
+    // interop that can break here is between two crypto libraries, and a test
+    // that used the server's implementation for both ends would not see it.
+    let wire: ClientWire | null = null;
+    socket.on("message", (raw: Buffer) => {
+      frames.push(Buffer.from(raw));
+      if (!wire) { messages.push(JSON.parse(raw.toString())); return; }
+      void wire.open(new Uint8Array(raw)).then((text) => { if (text !== null) messages.push(JSON.parse(text)); });
+    });
     socket.on("close", (code: number) => { closed = { code }; });
     await new Promise<void>((resolve, reject) => { socket.on("open", () => resolve()); socket.on("error", reject); });
     const settle = async (done: () => boolean, ms = 3_000) => {
       const deadline = Date.now() + ms;
       while (Date.now() < deadline && !done()) await new Promise((resolve) => setTimeout(resolve, 20));
     };
-    return { socket, messages, settle, isClosed: () => closed !== null };
+    return {
+      socket,
+      messages,
+      frames,
+      settle,
+      isClosed: () => closed !== null,
+      closeCode: () => closed?.code ?? null,
+      /** Everything from here is sealed, in both directions. */
+      useWire: (next: ClientWire) => { wire = next; },
+      send: (message: unknown) => {
+        if (wire) wire.send(JSON.stringify(message));
+        else socket.send(JSON.stringify(message));
+      },
+    };
+  };
+
+  /** The data-plane keys a page derives once the far end says the handshake passed. */
+  const dataPlane = async (socket: WebSocket, challenge: any, passphrase: string) => {
+    const master = await deriveMasterKey(passphrase, Buffer.from(decodeBase64(salt)), iterations);
+    const hkdf = await crypto.subtle.importKey("raw", new Uint8Array(master), "HKDF", false, ["deriveKey"]);
+    const keys = await connectionWireKeys(hkdf, decodeBase64(challenge.connectionSalt));
+    return new ClientWire(socket as never, keys.toClient, keys.toServer);
   };
 
   const answer = async (challenge: any, passphrase: string) => {
@@ -101,10 +133,66 @@ describe("proving both ends hold the same key", () => {
     await peer.settle(() => peer.messages.some((message) => message.type === HANDSHAKE_READY));
     expect(peer.messages.some((message) => message.type === HANDSHAKE_READY)).toBe(true);
 
-    // And only now is the connection allowed to ask for anything.
-    peer.socket.send(JSON.stringify({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {} }));
+    // And only now is the connection allowed to ask for anything -- sealed,
+    // because the ready message is the last readable frame either way.
+    peer.useWire(await dataPlane(peer.socket, challenge, PASSPHRASE));
+    peer.send({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {} });
     await peer.settle(() => peer.messages.some((message) => message.type === "index.changed"));
     expect(peer.messages.some((message) => message.type === "index.changed")).toBe(true);
+
+    // The name of a conversation is the cheapest thing to look for, and the
+    // reason this step exists: before it, every terminal frame and keystroke
+    // crossed the tunnel as readable JSON.
+    const index = peer.messages.find((message) => message.type === "index.changed");
+    expect(JSON.stringify(index)).toContain("加密");
+    const readable = peer.frames.map((frame) => frame.toString("utf8")).join("");
+    expect(readable, "nothing on the wire says what any of it is").not.toContain("加密");
+    expect(readable).not.toContain("index.changed");
+  });
+
+  it("hangs up on the devices paired to a key that has just been replaced", async () => {
+    const peer = await connect(REMOTE_HOST);
+    await peer.settle(() => peer.messages.length >= 1);
+    const challenge = peer.messages[0];
+    const { proof } = await answer(challenge, PASSPHRASE);
+    peer.socket.send(JSON.stringify({ type: HANDSHAKE_PROOF, proof }));
+    await peer.settle(() => peer.messages.some((message) => message.type === HANDSHAKE_READY));
+    peer.useWire(await dataPlane(peer.socket, challenge, PASSPHRASE));
+
+    // This connection's keys came from the old master and would go on working
+    // for as long as it stayed open, which is the wrong answer to "I rotated
+    // the key". Setting a new one has to reach it.
+    const tabId = (await app.promptor.storage.listTabMeta()).find((tab) => tab.session.provider === "e2ee")!.id;
+    const rotated = await app.inject({
+      method: "POST",
+      url: `/api/tabs/${tabId}/session`,
+      headers: { "x-codex-promptor-token": app.promptor.token, host: "127.0.0.1:4317", origin: "http://127.0.0.1:4317" },
+      payload: { provider: "e2ee", workingDirectory: "换了一句新的口令" } as never,
+    });
+    expect(rotated.statusCode).toBe(200);
+    await peer.settle(() => peer.isClosed());
+    expect(peer.isClosed()).toBe(true);
+    expect(peer.closeCode(), "and says why, so the page asks bootstrap instead of retrying blind").toBe(KEY_CHANGED_CLOSE_CODE);
+  });
+
+  it("leaves loopback connected when the key changes, because that is where it changed", async () => {
+    const peer = await connect();
+    peer.send({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {} });
+    await peer.settle(() => peer.messages.some((message) => message.type === "index.changed"));
+    const tabId = (await app.promptor.storage.listTabMeta()).find((tab) => tab.session.provider === "e2ee")!.id;
+    await app.inject({
+      method: "POST",
+      url: `/api/tabs/${tabId}/session/close`,
+      headers: { "x-codex-promptor-token": app.promptor.token, host: "127.0.0.1:4317", origin: "http://127.0.0.1:4317" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(peer.isClosed()).toBe(false);
+
+    // And with the switch closed, a fresh remote connection is not challenged.
+    const after = await connect(REMOTE_HOST);
+    after.send({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {} });
+    await after.settle(() => after.messages.some((message) => message.type === "index.changed"));
+    expect(after.messages.some((message) => message.type === HANDSHAKE_CHALLENGE)).toBe(false);
   });
 
   it("closes on a wrong key rather than letting it look like a slow terminal", async () => {

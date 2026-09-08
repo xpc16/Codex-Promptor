@@ -56,7 +56,8 @@ import { newKeyMaterial } from "./e2ee-key-material.js";
 import { openHttpBody, sealHttpBody } from "./e2ee-http-body.js";
 import { E2EE_BODY_CONTENT_TYPE, E2EE_BODY_HEADER, bodyMustStayReadable, bodyNeedsEncryption } from "../shared/e2ee-http.js";
 import { handshakeAnswered, masterKeyFor, startHandshake, type PendingHandshake } from "./e2ee-session.js";
-import { HANDSHAKE_PROOF, HANDSHAKE_READY, allowedBeforeHandshake } from "../shared/e2ee-handshake.js";
+import { ServerWire } from "./e2ee-wire.js";
+import { HANDSHAKE_PROOF, HANDSHAKE_READY, KEY_CHANGED_CLOSE_CODE, allowedBeforeHandshake } from "../shared/e2ee-handshake.js";
 import { redactForScope } from "./e2ee-redaction.js";
 import { normalizePassphrase } from "../shared/e2ee-keys.js";
 import { classifyNetworkScope, type NetworkScope } from "./traffic-scope.js";
@@ -124,6 +125,13 @@ type Client = {
   payloadIn: number;
   /** The index revision this client was last sent, so the next one can be a delta. */
   indexRevision: number | null;
+  /**
+   * The data plane, installed once this connection has proved it holds the
+   * key. Null on loopback, which has nothing to prove and nothing to hide
+   * from, and null before the handshake, which is what makes the handshake
+   * itself readable.
+   */
+  wire: ServerWire | null;
 };
 
 export type RestoreOpenSessionsSummary = {
@@ -230,7 +238,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   let cachedKey: { fingerprint: string; master: Buffer; salt: string; iterations: number } | null = null;
   const encryptionState = async (): Promise<{ master: Buffer; fingerprint: string; salt: string; iterations: number } | null> => {
     const tabs = await storage.listTabMeta().catch(() => []);
-    const switchTab = tabs.find((tab) => tab.session.provider === "e2ee" && tab.session.e2ee);
+    // Closed means off. The passphrase stays on the tab so it can be switched
+    // back on without being carried to every device again, but a closed switch
+    // is a switch that is not switching anything.
+    const switchTab = tabs.find((tab) => tab.session.provider === "e2ee" && tab.session.state === "ready" && tab.session.e2ee);
     if (!switchTab) { cachedKey = null; return null; }
     const declared = switchTab.session.e2ee!.fingerprint;
     if (cachedKey?.fingerprint === declared) return cachedKey;
@@ -238,6 +249,27 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     if (!derived) { cachedKey = null; return null; }
     cachedKey = { ...derived, salt: switchTab.session.e2ee!.salt, iterations: switchTab.session.e2ee!.iterations };
     return cachedKey;
+  };
+
+  /**
+   * Ends every connection that is not on this machine, because the key it was
+   * using has stopped being the key.
+   *
+   * A connection's data-plane keys come from the master it handshook with, so
+   * they keep working after the passphrase is replaced or switched off -- which
+   * is exactly the wrong outcome: the reader who rotated a key expects the old
+   * one to stop opening things. Closing is what makes that true, and the close
+   * code tells the far end to ask bootstrap what is true now rather than sit
+   * there reconnecting into a wall.
+   *
+   * Loopback is left alone. It is where the change was just made.
+   */
+  const revokeEncryptedConnections = (): void => {
+    cachedKey = null;
+    for (const client of [...clients]) {
+      if (client.scope === "local") continue;
+      try { client.socket.close(KEY_CHANGED_CLOSE_CODE, "e2ee_key_changed"); } catch { /* already gone */ }
+    }
   };
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
   /**
@@ -275,15 +307,30 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const sendClient = (client: Client, message: Record<string, unknown>, kind: TerminalTrafficKind): boolean => {
     // Every WebSocket message is serialized here and nowhere else, and the
     // scope is already known, so this is the one place the passphrase has to
-    // be taken back out (see e2ee-redaction.ts).
-    const payload = JSON.stringify(redactForScope(message, client.scope));
+    // be taken back out (see e2ee-redaction.ts), and the one place a frame is
+    // sealed.
+    const plain = JSON.stringify(redactForScope(message, client.scope));
+    const payload = client.wire ? client.wire.seal(plain) : plain;
+    // A spent counter is the one condition that must not be papered over:
+    // reusing a nonce under a key is what AES-GCM cannot survive, so the
+    // connection is replaced rather than the guarantee.
+    if (payload === null) {
+      try { client.socket.close(KEY_CHANGED_CLOSE_CODE, "e2ee_counter_exhausted"); } catch { /* already gone */ }
+      return false;
+    }
     const sent = socketSender.send(client.id, client.socket, payload, kind);
     // Counted only when it actually left: a frame dropped for backpressure
     // costs no bandwidth, and counting it would hide the drop.
     if (sent) {
-      const bytes = Buffer.byteLength(payload, "utf8");
+      // What crossed the tunnel, not what produced it. Compression now happens
+      // inside the seal, so this is the number the wire ratio is against, and
+      // `rawBytes` keeps what the application actually generated.
+      const bytes = typeof payload === "string" ? Buffer.byteLength(payload, "utf8") : payload.length;
       client.payloadOut += bytes;
-      recordTraffic("out", "ws", trafficTypeOf(message, kind), bytes, { scope: client.scope });
+      recordTraffic("out", "ws", trafficTypeOf(message, kind), bytes, {
+        scope: client.scope,
+        ...(client.wire ? { rawBytes: Buffer.byteLength(plain, "utf8") } : {}),
+      });
     }
     return sent;
   };
@@ -1190,6 +1237,21 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (tab.session.provider === "claude") return performClaudeTerminalReopen(tab, recorder);
       if (tab.session.provider === "cursor") return performCursorTerminalReopen(tab, recorder);
       if (tab.session.provider === "shell") return performShellTerminalReopen(tab, recorder);
+      // Switching encryption back on, with the key this tab already holds.
+      // Nothing starts; the only thing that has to happen is that connections
+      // still running in the clear are made to handshake again.
+      if (tab.session.provider === "e2ee") {
+        if (!tab.session.e2ee) {
+          return { ok: false, statusCode: 400, code: "E2EE_PASSPHRASE_REQUIRED", message: "Enter a passphrase to turn encryption on." };
+        }
+        await storage.updateTab(tabId, (current) => ({
+          ...current,
+          session: { ...current.session, state: "ready", reopenOnLaunch: true, connectedAt: isoNow(), lastError: null },
+          updatedAt: isoNow(),
+        }));
+        revokeEncryptedConnections();
+        return { ok: true, bundle: await readClientTab(tabId) };
+      }
       if (codexConnectionMode === "pty-hooks") return performCodexNativeTerminalReopen(tab, recorder);
       if (!tab.session.threadId || !tab.session.workingDirectory) {
         return { ok: false, statusCode: 400, code: "SESSION_NOT_READY", message: "This tab has no active session." };
@@ -2075,11 +2137,15 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     revokeHookLease("cursor", tabId);
     await stopAppServer(storage, codex, tabId);
     await timers.detachTab(tabId);
+    const wasEncryptionSwitch = await storage.getTabMeta(tabId).then((tab) => tab.session.provider === "e2ee").catch(() => false);
     try { await storage.deleteTab(tabId); }
     catch (error) {
       await timers.reattachTab(tabId).catch(() => undefined);
       return apiError(reply, 404, "TAB_NOT_FOUND", error instanceof Error ? error.message : String(error));
     }
+    // Deleting this tab is how encryption is turned off, so it has to reach the
+    // devices that were using it rather than wait for them to notice.
+    if (wasEncryptionSwitch) revokeEncryptedConnections();
     return reply.send({ data: { deleted: true } });
   });
 
@@ -2194,6 +2260,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         updatedAt: now,
       }));
       await emitSnapshot(tabId);
+      // A device paired to the previous key would otherwise keep a connection
+      // that key no longer opens anything on, and only a reload would tell it.
+      revokeEncryptedConnections();
       return reply.send({ data: { bundle: await readClientTab(tabId) } });
     }
 
@@ -2520,6 +2589,21 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const tab = bundle.tab;
       // A Codex conversation that was opened but never prompted has a terminal
       // and no thread. Refusing to close it would strand the terminal.
+      // The encryption switch has nothing to stop -- no terminal, no agent, no
+      // thread -- so it leaves before all of that. Closing it turns encryption
+      // off while keeping the passphrase, which is what makes turning it back
+      // on not mean carrying the key to every device again.
+      if (tab.session.provider === "e2ee") {
+        const closedAt = isoNow();
+        await storage.updateTab(tabId, (current) => ({
+          ...current,
+          session: { ...current.session, state: "closed", reopenOnLaunch: false, lastError: null },
+          updatedAt: closedAt,
+        }));
+        await emitSnapshot(tabId);
+        revokeEncryptedConnections();
+        return reply.send({ data: await readClientTab(tabId) });
+      }
       const openWithoutThread = tab.session.state === "ready" && pty.has(tabId);
       if (!tab.session.threadId && tab.session.provider !== "shell" && !openWithoutThread) {
         return apiError(reply, 400, "SESSION_NOT_READY", "This tab has no active session.");
@@ -2719,6 +2803,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       payloadOut: 0,
       payloadIn: 0,
       indexRevision: null,
+      wire: null,
     };
     clients.add(client);
     ui.connect();
@@ -2746,12 +2831,21 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     });
     socket.on("message", async (raw: Buffer) => {
       try {
-        const message = JSON.parse(raw.toString()) as any;
+        // A sealed connection reads its frames here and nowhere else. A frame
+        // that does not open is dropped without a word: it is either a
+        // plaintext one this page sent before it saw the handshake answered,
+        // or something nobody holding the key could have produced.
+        const text = client.wire ? client.wire.open(new Uint8Array(raw)) : raw.toString();
+        if (text === null) return;
+        const message = JSON.parse(text) as any;
         // Inbound was never measured before. It is small per message but
         // keystrokes are frequent, and "frequent and small" is exactly the
         // shape that hides in a total.
         client.payloadIn += raw.length;
-        recordTraffic("in", "ws", String(message?.type ?? "unparsed"), raw.length, { scope: client.scope });
+        recordTraffic("in", "ws", String(message?.type ?? "unparsed"), raw.length, {
+          scope: client.scope,
+          ...(client.wire ? { rawBytes: Buffer.byteLength(text, "utf8") } : {}),
+        });
         if (!verified) {
           // One gate rather than a check in each handler: a message type added
           // later cannot forget to ask.
@@ -2759,8 +2853,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           if (message.type === HANDSHAKE_PROOF) {
             if (!pending || !handshakeAnswered(pending, message.proof)) { socket.close(1008, "Encryption handshake failed"); return; }
             verified = true;
+            const keys = pending.keys;
             pending = null;
+            // The last readable frame on this connection, and deliberately so:
+            // the page has to be able to read the word that tells it to start
+            // sealing. Everything after this, both ways, is ciphertext.
             socket.send(JSON.stringify({ type: HANDSHAKE_READY }));
+            client.wire = new ServerWire(keys.toClient, keys.toServer);
           }
           return;
         }
@@ -2797,11 +2896,22 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
               isOpen: () => client.socket.readyState === 1,
               bufferedAmount: () => Number(client.socket.bufferedAmount ?? 0),
               send: (payload) => {
-                const result = socketSender.sendProjection(client.id, client.socket, payload);
+                // The other place a frame reaches a socket. Projection is
+                // latest-state, so it does not go through sendClient -- which
+                // means the seal has to be here too, not only there.
+                const sealed = client.wire ? client.wire.seal(payload) : payload;
+                if (sealed === null) {
+                  try { client.socket.close(KEY_CHANGED_CLOSE_CODE, "e2ee_counter_exhausted"); } catch { /* already gone */ }
+                  return "closed";
+                }
+                const result = socketSender.sendProjection(client.id, client.socket, sealed);
                 if (result === "sent") {
-                  const bytes = Buffer.byteLength(payload, "utf8");
+                  const bytes = typeof sealed === "string" ? Buffer.byteLength(sealed, "utf8") : sealed.length;
                   client.payloadOut += bytes;
-                  recordTraffic("out", "ws", payload.includes('"full":true') ? "terminal.screen.full" : "terminal.screen.delta", bytes, { scope: client.scope });
+                  recordTraffic("out", "ws", payload.includes('"full":true') ? "terminal.screen.full" : "terminal.screen.delta", bytes, {
+                    scope: client.scope,
+                    ...(client.wire ? { rawBytes: Buffer.byteLength(payload, "utf8") } : {}),
+                  });
                 }
                 return result;
               },

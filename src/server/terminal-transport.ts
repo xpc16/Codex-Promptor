@@ -179,9 +179,17 @@ type SocketLike = {
   readyState: number;
   bufferedAmount?: number;
   extensions?: string;
-  send(payload: string): void;
+  send(payload: string | Uint8Array, options?: { compress?: boolean }): void;
   close(code?: number, reason?: string): void;
 };
+
+/**
+ * A sealed frame is high-entropy, so permessage-deflate can only make it
+ * bigger while spending CPU to do it. Compression that pays for itself now
+ * happens inside the seal, before the ciphertext exists.
+ */
+const payloadBytes = (payload: string | Uint8Array): number =>
+  typeof payload === "string" ? Buffer.byteLength(payload, "utf8") : payload.length;
 
 type TrafficCounters = {
   messages: number;
@@ -303,7 +311,7 @@ export class BoundedWebSocketSender {
     private readonly config: TerminalTransportConfig = defaultTerminalTransportConfig,
   ) {}
 
-  send(id: string, socket: SocketLike, payload: string, kind: TerminalTrafficKind): boolean {
+  send(id: string, socket: SocketLike, payload: string | Uint8Array, kind: TerminalTrafficKind): boolean {
     if (socket.readyState !== 1) return false;
     const bufferedAmount = Number.isFinite(socket.bufferedAmount) ? Number(socket.bufferedAmount) : 0;
     const terminalStream = kind.startsWith("terminal.");
@@ -313,8 +321,8 @@ export class BoundedWebSocketSender {
       return false;
     }
     try {
-      socket.send(payload);
-      this.meter.recordSend(id, kind, Buffer.byteLength(payload, "utf8"), bufferedAmount);
+      socket.send(payload, typeof payload === "string" ? undefined : { compress: false });
+      this.meter.recordSend(id, kind, payloadBytes(payload), bufferedAmount);
       return true;
     } catch {
       return false;
@@ -326,7 +334,7 @@ export class BoundedWebSocketSender {
    * candidates and later sends one fresh full frame instead of closing the
    * stream or queueing stale screens in ws.
    */
-  sendProjection(id: string, socket: SocketLike, payload: string): "sent" | "backpressured" | "closed" {
+  sendProjection(id: string, socket: SocketLike, payload: string | Uint8Array): "sent" | "backpressured" | "closed" {
     if (socket.readyState !== 1) return "closed";
     const bufferedAmount = Number.isFinite(socket.bufferedAmount) ? Number(socket.bufferedAmount) : 0;
     if (bufferedAmount >= this.config.websocketHighWaterBytes) {
@@ -334,8 +342,8 @@ export class BoundedWebSocketSender {
       return "backpressured";
     }
     try {
-      socket.send(payload);
-      this.meter.recordSend(id, "terminal.projection", Buffer.byteLength(payload, "utf8"), bufferedAmount);
+      socket.send(payload, typeof payload === "string" ? undefined : { compress: false });
+      this.meter.recordSend(id, "terminal.projection", payloadBytes(payload), bufferedAmount);
       return "sent";
     } catch {
       return "closed";

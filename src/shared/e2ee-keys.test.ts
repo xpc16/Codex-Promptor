@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeBase64, encodeBase64, keyFingerprint, keyId, normalizePassphrase } from "./e2ee-keys.js";
+import { decodeBase64, encodeBase64, keyFingerprint, normalizePassphrase } from "./e2ee-keys.js";
 
 const digest = (first: number, second: number) =>
   new Uint8Array([first, second, ...new Array(30).fill(0).map((_, i) => (i * 7) & 0xff)]);
@@ -18,14 +18,6 @@ describe("the name a reader compares", () => {
 
   it("is stable for the same key", () => {
     expect(keyFingerprint(digest(9, 9))).toBe(keyFingerprint(digest(9, 9)));
-  });
-});
-
-describe("the key id an envelope carries", () => {
-  it("is the first two bytes of the digest", () => {
-    expect(keyId(digest(0xbe, 0xef))).toBe(0xbeef);
-    expect(keyId(digest(0, 0))).toBe(0);
-    expect(keyId(digest(0xff, 0xff))).toBe(0xffff);
   });
 });
 

@@ -20,11 +20,16 @@ export type TrafficDirection = "out" | "in";
  * actually wrote or read over an interval.
  *
  * They are separate channels because they answer different questions and are
- * measured differently. A `ws` entry has `rawBytes === bytes` by construction
- * -- the sender knows one number, the serialized payload -- so its ratio is
- * always 1 and means nothing. Only a `wire` entry carries a real compression
- * ratio, because there `bytes` is the socket delta and `rawBytes` is the sum
- * of the payloads that produced it.
+ * measured differently. On a plaintext connection a `ws` entry has
+ * `rawBytes === bytes` by construction -- the sender knows one number, the
+ * serialized payload -- so its ratio is 1 and means nothing. A `wire` entry
+ * carries a real compression ratio, because there `bytes` is the socket delta
+ * and `rawBytes` is the sum of the payloads that produced it.
+ *
+ * An encrypted connection moves that ratio: compression happens inside the
+ * seal, so a `ws` entry's `bytes` is the sealed frame and `rawBytes` is the
+ * JSON that went into it -- and the `wire` ratio falls to about 1, which is
+ * what permessage-deflate is worth against ciphertext.
  */
 export type TrafficChannel = "ws" | "http" | "wire";
 

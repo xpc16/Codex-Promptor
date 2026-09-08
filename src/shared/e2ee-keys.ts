@@ -22,18 +22,32 @@ export const SALT_BYTES = 16;
 export const MASTER_KEY_BYTES = 32;
 
 /**
- * The four uses a master key is split into, so that ciphertext from one can
+ * The uses a master key is split into directly, so that ciphertext from one can
  * never be replayed as another. HKDF costs nothing and the alternative -- one
- * key everywhere -- is the mistake that makes those replays possible.
+ * key everywhere -- is the mistake that makes those replays possible. The two
+ * WebSocket directions are below, because they take a further step.
  */
 export const KEY_LABELS = {
   http: "promptor/http/v1",
-  wsToClient: "promptor/ws/s2c/v1",
-  wsToServer: "promptor/ws/c2s/v1",
   auth: "promptor/auth/v1",
 } as const;
 
 export type KeyPurpose = keyof typeof KEY_LABELS;
+
+/**
+ * The two WebSocket keys, which are derived one step further down than the
+ * others: from the master *and* a salt the connection alone will ever see.
+ *
+ * That extra step is what lets a frame carry no nonce. A bare counter can only
+ * repeat under a key that is reused, and no two connections share one of
+ * these, so counters legitimately start at zero on every reconnect.
+ */
+export const CONNECTION_LABELS = {
+  toClient: "promptor/ws/s2c/v1",
+  toServer: "promptor/ws/c2s/v1",
+} as const;
+
+export type ConnectionDirection = keyof typeof CONNECTION_LABELS;
 
 /**
  * A short, human-comparable name for a key.
@@ -57,11 +71,6 @@ export function keyFingerprint(digest: Uint8Array): string {
     }
   }
   return `${out.slice(0, 4)}-${out.slice(4, 8)}`;
-}
-
-/** The two bytes an envelope carries so a receiver can tell which key it needs. */
-export function keyId(digest: Uint8Array): number {
-  return ((digest[0]! << 8) | digest[1]!) & 0xffff;
 }
 
 export function encodeBase64(bytes: Uint8Array): string {

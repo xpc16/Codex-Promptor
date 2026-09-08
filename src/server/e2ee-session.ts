@@ -1,6 +1,6 @@
 import { createDecipheriv, createCipheriv, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 import { GCM_TAG_BYTES } from "../shared/e2ee-envelope.js";
-import { decodeBase64, encodeBase64 } from "../shared/e2ee-keys.js";
+import { CONNECTION_LABELS, decodeBase64, encodeBase64 } from "../shared/e2ee-keys.js";
 import {
   CHALLENGE_BYTES,
   CONNECTION_SALT_BYTES,
@@ -31,6 +31,8 @@ export function open(key: Buffer, nonce: Uint8Array, sealed: Uint8Array, aad: Ui
   }
 }
 
+export type ConnectionKeys = { toClient: Buffer; toServer: Buffer };
+
 /**
  * The keys one connection uses, derived from the master and a salt this
  * connection alone will ever see.
@@ -40,16 +42,23 @@ export function open(key: Buffer, nonce: Uint8Array, sealed: Uint8Array, aad: Ui
  * share one. It is also what makes a reconnect free -- new salt, new keys,
  * counters legitimately back to zero.
  */
-export function connectionKeys(master: Buffer, connectionSalt: Uint8Array) {
-  const derive = (direction: string) =>
-    Buffer.from(hkdfSync("sha256", master, connectionSalt, Buffer.from(`promptor/e2ee/v1/${direction}`, "utf8"), 32));
-  return { toClient: derive("s2c"), toServer: derive("c2s") };
+export function connectionKeys(master: Buffer, connectionSalt: Uint8Array): ConnectionKeys {
+  const derive = (label: string) =>
+    Buffer.from(hkdfSync("sha256", master, connectionSalt, Buffer.from(label, "utf8"), 32));
+  return { toClient: derive(CONNECTION_LABELS.toClient), toServer: derive(CONNECTION_LABELS.toServer) };
 }
 
 export type PendingHandshake = {
   message: HandshakeChallenge;
   /** Kept to check the answer, and never sent. */
   expected: Buffer;
+  /**
+   * Derived here, from the salt this challenge carries, and installed only
+   * once the answer checks out. Doing it now keeps the master key out of the
+   * connection's closure: what the socket ends up holding is two keys good for
+   * this connection alone.
+   */
+  keys: ConnectionKeys;
 };
 
 /**
@@ -75,6 +84,7 @@ export function startHandshake(master: Buffer, fingerprint: string): PendingHand
       fingerprint,
     },
     expected: seal(auth, nonce, challenge, handshakeAad("client", fingerprint)),
+    keys: connectionKeys(master, new Uint8Array(connectionSalt)),
   };
 }
 
@@ -92,7 +102,7 @@ export function handshakeAnswered(pending: PendingHandshake, proof: unknown): bo
   return timingSafeEqual(Buffer.from(received), pending.expected);
 }
 
-/** Derives the master key a stored p2p tab describes, or null when it describes none. */
+/** Derives the master key the encryption tab describes, or null when no tab describes one. */
 export async function masterKeyFor(
   session: { provider: string; workingDirectory: string | null; e2ee: { salt: string; iterations: number; fingerprint: string } | null },
 ): Promise<{ master: Buffer; fingerprint: string } | null> {

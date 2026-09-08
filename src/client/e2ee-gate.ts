@@ -1,5 +1,7 @@
 import { HANDSHAKE_CHALLENGE, HANDSHAKE_READY, challengeIsWellFormed, type HandshakeChallenge } from "../shared/e2ee-handshake.js";
+import { decodeBase64 } from "../shared/e2ee-keys.js";
 import { answerChallenge, forgetKey, recallKey, rememberKey, type SessionKey } from "./e2ee-client.js";
+import { ClientWire, connectionWireKeys } from "./e2ee-wire.js";
 
 /**
  * One key for the whole page, and one place that answers challenges with it.
@@ -30,8 +32,70 @@ export type E2eeState = {
   rejected: boolean;
 };
 
-type GateSocket = { send: (data: string) => void; readyState?: number };
+type GateSocket = { send: (data: any) => void; readyState?: number; close?: (code?: number, reason?: string) => void };
 type Waiting = { socket: GateSocket; challenge: HandshakeChallenge };
+
+/**
+ * What this page knows about one socket.
+ *
+ * The challenge is kept because its salt is what the data-plane keys are
+ * derived from, and that derivation only happens once the far end has said the
+ * handshake passed -- there is no point deriving keys for a connection that is
+ * about to be closed for holding the wrong passphrase.
+ */
+type SocketState = {
+  challenge: HandshakeChallenge | null;
+  wire: ClientWire | null;
+  /**
+   * Called when the far end confirms the handshake. Every subscription a page
+   * sent on open was refused while it was still unproved, so this is where a
+   * socket asks for its stream again.
+   */
+  onReady: (() => void) | null;
+};
+
+const sockets = new WeakMap<object, SocketState>();
+
+const stateFor = (socket: GateSocket): SocketState => {
+  let entry = sockets.get(socket as object);
+  if (!entry) { entry = { challenge: null, wire: null, onReady: null }; sockets.set(socket as object, entry); }
+  return entry;
+};
+
+/** Registers what to do once this socket is proved. Safe to call before it connects. */
+export function attachSocket(socket: GateSocket, onReady: () => void): void {
+  stateFor(socket).onReady = onReady;
+}
+
+/**
+ * Sends on a socket, sealed if that socket has reached its data plane.
+ *
+ * Plaintext until the far end confirms the handshake, and encrypted from then
+ * on. That boundary has to be exactly here: a frame sealed before the server
+ * installed its own keys would be dropped, and a dropped frame is a counter
+ * the two ends no longer agree on.
+ */
+export function gateSend(socket: GateSocket, text: string): void {
+  const wire = sockets.get(socket as object)?.wire;
+  if (wire) { wire.send(text); return; }
+  try { socket.send(text); } catch { /* closed under us */ }
+}
+
+/**
+ * Turns whatever arrived into a message, or null when there is nothing for the
+ * caller: a handshake frame the gate consumed, or a frame that did not open.
+ */
+export async function gateReceive(socket: GateSocket, data: unknown): Promise<any | null> {
+  const wire = sockets.get(socket as object)?.wire;
+  if (wire && typeof data !== "string") {
+    const text = await wire.open(data);
+    if (text === null) return null;
+    try { return JSON.parse(text); } catch { return null; }
+  }
+  let message: any;
+  try { message = JSON.parse(String(data)); } catch { return null; }
+  return await handleGateMessage(socket, message) ? null : message;
+}
 
 let state: E2eeState = { required: false, fingerprint: null, proved: false, rejected: false };
 let key: SessionKey | null = null;
@@ -100,7 +164,8 @@ async function answerWaiting(): Promise<void> {
   if (!key) return;
   const pending = waiting.filter((entry) => isOpen(entry.socket));
   waiting = [];
-  for (const entry of pending) {
+  for (let index = 0; index < pending.length; index += 1) {
+    const entry = pending[index]!;
     const answer = await answerChallenge(key, entry.challenge);
     // Any challenge that cannot be answered means this key does not work.
     // Trying to tell a wrong key from a stale challenge by fingerprint cannot
@@ -108,7 +173,15 @@ async function answerWaiting(): Promise<void> {
     // -- and the attempt stopped a wrong key being reported at all, which is
     // the whole point. A challenge left over from a rotation costs one extra
     // prompt; a wrong key that is never reported costs the reader the feature.
-    if (!answer) { await dropKey(); return; }
+    if (!answer) {
+      // Put back what was not answered. Nothing was sent under the wrong key,
+      // so the far end is still holding each of these challenges open -- and
+      // without this, correcting a typo left the reader with no socket to
+      // answer and a prompt that would not go away until they reloaded.
+      waiting = pending.slice(index).filter((candidate) => isOpen(candidate.socket));
+      await dropKey();
+      return;
+    }
     // It can close between the check above and here; one dead socket must not
     // decide anything for the others.
     try { entry.socket.send(JSON.stringify(answer)); } catch { /* gone */ }
@@ -131,9 +204,12 @@ export async function useKey(next: SessionKey, remember = true): Promise<void> {
   if (remember) void rememberKey(next);
 }
 
+/**
+ * Forgets the key without forgetting what is waiting on one: the challenges
+ * outlive it, because they belong to sockets that are still open.
+ */
 export async function dropKey(): Promise<void> {
   key = null;
-  waiting = [];
   await forgetKey();
   publish({ proved: false, rejected: true });
 }
@@ -146,13 +222,21 @@ export async function dropKey(): Promise<void> {
  */
 export async function handleGateMessage(socket: GateSocket, message: any): Promise<boolean> {
   if (message?.type === HANDSHAKE_READY) {
-    // The only place a page learns its key is the right one.
+    // The only place a page learns its key is the right one, and the last
+    // frame on this socket that is not sealed.
     publish({ proved: true, rejected: false });
+    const entry = stateFor(socket);
+    if (key && entry.challenge) {
+      const keys = await connectionWireKeys(key.master, decodeBase64(entry.challenge.connectionSalt));
+      entry.wire = new ClientWire(socket, keys.toClient, keys.toServer);
+    }
+    entry.onReady?.();
     return true;
   }
   if (message?.type !== HANDSHAKE_CHALLENGE) return false;
   if (!challengeIsWellFormed(message)) return true;
   publish({ required: true, fingerprint: message.fingerprint });
+  stateFor(socket).challenge = message;
   waiting = [...waiting.filter((entry) => entry.socket !== socket && isOpen(entry.socket)), { socket, challenge: message }];
   await answerWaiting();
   return true;

@@ -18,7 +18,8 @@ import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, Runti
 import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-link.js";
 import { randomPassphrase } from "../shared/e2ee-keys.js";
 import { deriveSessionKey } from "./e2ee-client.js";
-import { applyRequirement, e2eeState, handleGateMessage, observeE2ee, useKey, type E2eeState } from "./e2ee-gate.js";
+import { KEY_CHANGED_CLOSE_CODE } from "../shared/e2ee-handshake.js";
+import { applyRequirement, attachSocket, e2eeState, gateReceive, gateSend, observeE2ee, useKey, type E2eeState } from "./e2ee-gate.js";
 import type { RuntimeDelta } from "../shared/runtime-delta.js";
 import type { TerminalScreenFrame, TerminalTransportMode } from "../shared/terminal-protocol.js";
 import { DOCUMENT_RAW_CATCH_UP_BYTES } from "../shared/document-protocol.js";
@@ -291,8 +292,11 @@ export function App() {
     const protocol = location.protocol === "https:" ? "wss" : "ws";
     const connect = () => {
       if (disposed) return;
-      socket = new WebSocket(`${protocol}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ""}`);
-      socket.onopen = () => socket?.send(JSON.stringify({
+      const live = new WebSocket(`${protocol}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ""}`);
+      socket = live;
+      // Encrypted frames are binary; without this they arrive as Blobs.
+      live.binaryType = "arraybuffer";
+      const sendSubscribe = () => gateSend(live, JSON.stringify({
         type: "subscribe",
         tabIds: tabIdsKey ? tabIdsKey.split(",") : [],
         snapshots: false,
@@ -305,12 +309,16 @@ export function App() {
         // change or a reconnect than a navigation change anyone made.
         indexRevision: indexRef.current?.revision ?? null,
       }));
-      socket.onmessage = async (event) => {
-        let message: any;
-        try { message = JSON.parse(String(event.data)); } catch { return; }
-        // The gate answers challenges for every socket; everything else falls
-        // through untouched.
-        if (socket && await handleGateMessage(socket, message)) return;
+      // Everything sent before the handshake finished was refused, this
+      // subscribe included, so it is sent again the moment the far end says
+      // the key is right.
+      attachSocket(live, sendSubscribe);
+      live.onopen = sendSubscribe;
+      live.onmessage = async (event) => {
+        // The gate answers challenges, opens sealed frames, and hands back
+        // only what this page has business reading.
+        const message = await gateReceive(live, event.data);
+        if (!message) return;
         const tabId = typeof message.tabId === "string" ? message.tabId : "";
         // This socket keeps only three fields, so a delta without a runner
         // section says exactly what it needs to know: they did not move.
@@ -352,12 +360,16 @@ export function App() {
             // Deliberately without indexRevision: this page has just proved
             // it cannot line up with what the server holds, so it wants the
             // whole index, which is the one thing that always applies.
-            else socket?.send(JSON.stringify({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {} }));
+            else gateSend(live, JSON.stringify({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {} }));
           }
         }
       };
-      socket.onclose = () => {
+      live.onclose = (event) => {
         socket = null;
+        // The key changed, or encryption was turned off, on the machine at the
+        // other end. What this page holds is stale either way, and bootstrap is
+        // the one route that is never sealed -- so ask it before reconnecting.
+        if (event.code === KEY_CHANGED_CLOSE_CODE) void refresh();
         if (!disposed) retryTimer = window.setTimeout(connect, 1_000);
       };
     };
@@ -367,7 +379,7 @@ export function App() {
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       socket?.close();
     };
-  }, [adoptIndex, markRecentCompletion, tabIdsKey]);
+  }, [adoptIndex, markRecentCompletion, refresh, tabIdsKey]);
   useEffect(() => {
     const timer = window.setInterval(() => setClock(new Date()), 30_000);
     return () => window.clearInterval(timer);
@@ -1164,7 +1176,13 @@ function SessionPanel({ bundle, height, reopening, onReopen, onSyncHistory, onBu
     } catch (reason) { onError(reason); }
     finally { setBrowsing(false); }
   };
-  const closeConversation = async () => { try { setBusy(true); onBundle(await api<TabBundle>(`/api/tabs/${bundle.tab.id}/session/close`, { method: "POST" })); } catch (reason) { onError(reason); } finally { setBusy(false); } };
+  const closeConversation = async () => {
+    try {
+      setBusy(true);
+      onBundle(await api<TabBundle>(`/api/tabs/${bundle.tab.id}/session/close`, { method: "POST" }));
+      if (isE2ee) onNotice(t("session.e2eeOff"));
+    } catch (reason) { onError(reason); } finally { setBusy(false); }
+  };
   const exportConversation = async () => {
     if (exporting) return;
     try { setExporting(true); await downloadConversationMarkdown(bundle.tab.id, i18n.locale); }
@@ -1199,7 +1217,7 @@ function SessionPanel({ bundle, height, reopening, onReopen, onSyncHistory, onBu
       : t("session.setupHelp");
   return <div className="session-card" style={height === null ? undefined : { height: `${height}%`, maxHeight: "none" }}>
     <div className="section-title"><span className="section-icon">◌</span><div><strong>{sessionTitle}</strong><small>{sessionHelp}</small></div></div>
-    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t(session.provider === "e2ee" ? "session.e2eeFingerprint" : "session.workingDirectory")}</span><code>{session.provider === "e2ee" ? (session.e2ee?.fingerprint ?? "—") : session.workingDirectory}</code></div>{session.provider === "e2ee" && <div className="field-hint e2ee-hint">{t("session.e2eeCompare")}</div>}{session.provider !== "shell" && session.provider !== "e2ee" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && session.lastThreadSwitch.method !== "thread/fork" && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring || syncing} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <><button className="danger-action" disabled={busy || syncing} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>{session.provider !== "shell" && session.provider !== "e2ee" && session.threadId && <button className="ghost" disabled={busy || reopening || syncing} onClick={() => void syncHistory()}>{t("footer.syncHistory")}</button>}</>}{localFolderPicker && <button className="ghost" disabled={exporting} onClick={() => void exportConversation()}>{t(exporting ? "session.exporting" : "session.export")}</button>}</div></div> : <>
+    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t(session.provider === "e2ee" ? "session.e2eeClosedNotice" : "session.closedNotice")}</div>}<div className="session-path"><span>{t(session.provider === "e2ee" ? "session.e2eeFingerprint" : "session.workingDirectory")}</span><code>{session.provider === "e2ee" ? (session.e2ee?.fingerprint ?? "—") : session.workingDirectory}</code></div>{session.provider === "e2ee" && <div className="field-hint e2ee-hint">{t("session.e2eeCompare")}</div>}{session.provider !== "shell" && session.provider !== "e2ee" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && session.lastThreadSwitch.method !== "thread/fork" && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring || syncing} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <><button className="danger-action" disabled={busy || syncing} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>{session.provider !== "shell" && session.provider !== "e2ee" && session.threadId && <button className="ghost" disabled={busy || reopening || syncing} onClick={() => void syncHistory()}>{t("footer.syncHistory")}</button>}</>}{localFolderPicker && <button className="ghost" disabled={exporting} onClick={() => void exportConversation()}>{t(exporting ? "session.exporting" : "session.export")}</button>}</div></div> : <>
       <label className="field-label">{t(isE2ee ? "session.e2eeKey" : localFolderPicker ? "session.localPath" : "session.remotePath")}</label><div className={`path-row ${localFolderPicker && !isE2ee ? "" : "remote"}`}><input value={cwd} title={isE2ee ? undefined : cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t(isE2ee ? "session.e2eeKeyPlaceholder" : "session.pathExample")} />{isE2ee ? <button className="ghost" onClick={() => setCwd(randomPassphrase())}>{t("session.e2eeGenerate")}</button> : localFolderPicker && <button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button>}</div>{isE2ee ? <small className="field-hint">{t(session.e2ee ? "session.e2eeKeepHint" : "session.e2eeKeyHint")}</small> : <>{!localFolderPicker && <small className="field-hint">{t("session.remotePathHint")}</small>}{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}</>}
       {!isShell && <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => setMode("new")}>{t("session.createNew")}</button><button className={mode === "resume" ? "active" : ""} onClick={() => setMode("resume")}>{t("session.resumeOld")}</button></div>}
       {!isShell && mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} placeholder={t("session.resumePlaceholder")} />}
@@ -1625,6 +1643,8 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     let rawLeaseWritable = true;
     let awaitingRawOneShot = false;
     let rawOneShotAttempts = 0;
+    /** The last subscription this socket asked for, replayed once it is proved. */
+    let lastSubscription: { includeTerminal: boolean; snapshots: boolean; boundedCatchUp: boolean } | null = null;
     // What was last asked for, so the wanted state can be reconciled against
     // it from whatever the page's visibility actually is. A latched transition
     // could not recover from an event that never arrived.
@@ -1658,7 +1678,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     const resizeScheduler = new TerminalResizeScheduler(({ cols, rows }) => {
       if (documentVisibleRef.current || projectionMode || !rawLeaseWritable) return;
       const ws = socket.current;
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "terminal.resize", tabId, cols, rows }));
+      if (ws?.readyState === WebSocket.OPEN) gateSend(ws, JSON.stringify({ type: "terminal.resize", tabId, cols, rows }));
     }, 220, initialSize);
     const beginTerminalUpdate = () => {
       const sequence = ++terminalWriteSequence;
@@ -1693,7 +1713,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       // 1.03x compression. The tab id becomes a handle the server resolves
       // against this socket's own subscriptions, and printable text skips
       // base64 -- together about 36 bytes for the same keystroke.
-      ws.send(JSON.stringify(terminalInputIsPlain(data)
+      gateSend(ws, JSON.stringify(terminalInputIsPlain(data)
         ? { type: TERMINAL_INPUT_COMPACT_TYPE, s: inputHandle, d: data }
         : { type: TERMINAL_INPUT_COMPACT_TYPE, s: inputHandle, b: encodeBase64(data) }));
     };
@@ -1849,12 +1869,16 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     const sendSubscription = (includeTerminal: boolean, snapshots = false, boundedCatchUp = false) => {
       const ws = socket.current;
       if (ws?.readyState !== WebSocket.OPEN) return;
+      // Remembered so it can be sent again once the handshake completes: the
+      // first one went out while the connection was still unproved, and the
+      // server refuses everything but the proof until then.
+      lastSubscription = { includeTerminal, snapshots, boundedCatchUp };
       terminalSubscribed = includeTerminal;
       if (!includeTerminal) heldInput.length = 0;
       // After the subscribe, never before it: the socket keeps them in order,
       // so the server has the stream back by the time the keys arrive.
       else for (const held of heldInput.splice(0)) inputCoalescer.push(held);
-      ws.send(JSON.stringify({
+      gateSend(ws, JSON.stringify({
         type: "subscribe",
         terminalProtocolVersion: 2,
         tabIds: [tabId],
@@ -1875,13 +1899,13 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       // Retire the raw stream first. The following one-shot is generated from
       // the server's parsed screen and carries the matching raw cursor.
       sendSubscription(false);
-      ws.send(JSON.stringify({ type: "terminal.screen.snapshot.request", tabId, viewportRows: Math.max(5, Math.min(60, term.rows)), oneShot: true }));
+      gateSend(ws, JSON.stringify({ type: "terminal.screen.snapshot.request", tabId, viewportRows: Math.max(5, Math.min(60, term.rows)), oneShot: true }));
     };
     const requestSync = () => {
       const ws = socket.current;
       if (ws?.readyState !== WebSocket.OPEN) return;
       if (projectionMode) {
-        ws.send(JSON.stringify({
+        gateSend(ws, JSON.stringify({
           type: "terminal.screen.snapshot.request",
           tabId,
           generation: projectionState?.generation ?? null,
@@ -1891,7 +1915,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
           viewportRows: 20,
         }));
       } else {
-        ws.send(JSON.stringify({ type: "terminal.sync", tabId, cursor }));
+        gateSend(ws, JSON.stringify({ type: "terminal.sync", tabId, cursor }));
       }
     };
     const handleOutput = (message: any) => {
@@ -1976,6 +2000,15 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       if (disposed || closedRef.current || !activeRef.current || socket.current?.readyState === WebSocket.OPEN || socket.current?.readyState === WebSocket.CONNECTING) return;
       const ws = new WebSocket(`${protocol}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ""}`);
       socket.current = ws;
+      // Encrypted frames are binary; without this they arrive as Blobs.
+      ws.binaryType = "arraybuffer";
+      // The subscribe sent on open was refused while this connection was still
+      // unproved, so it is asked for again the moment the far end confirms the
+      // key. Without this the terminal stays blank until something else
+      // happens to resubscribe it.
+      attachSocket(ws, () => {
+        if (lastSubscription) sendSubscription(lastSubscription.includeTerminal, lastSubscription.snapshots, lastSubscription.boundedCatchUp);
+      });
       ws.onopen = () => {
         if (disposed || closedRef.current || !activeRef.current) { closeSocketQuietly(ws); return; }
         alarm.noteSuccess();
@@ -1999,8 +2032,8 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       };
       ws.onmessage = async (event) => {
         try {
-          const message = JSON.parse(event.data);
-          if (await handleGateMessage(ws, message)) return;
+          const message = await gateReceive(ws, event.data);
+          if (!message) return;
           if (!projectionMode && message.type === "terminal.output") handleOutput(message);
           else if (!projectionMode && message.type === "terminal.screen" && message.oneShot === true) handleRawOneShot(message as TerminalScreenFrame);
           else if (projectionMode && message.type === "terminal.screen") handleScreen(message as TerminalScreenFrame);

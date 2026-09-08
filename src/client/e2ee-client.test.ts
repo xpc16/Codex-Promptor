@@ -185,6 +185,25 @@ describe("the gate, on a list of sockets that is not tidy", () => {
     expect(e2eeState().rejected, "and nothing was mistaken for a wrong key").toBe(false);
   });
 
+  it("takes the corrected key without waiting for a reconnect", async () => {
+    // Nothing was sent under the wrong key, so the far end is still holding
+    // that challenge open. Dropping it here left the reader typing the right
+    // passphrase into a prompt that could not act on it.
+    const master = await deriveMasterKey(passphrase, Buffer.from(salt, "base64"), iterations);
+    const current = startHandshake(master, fingerprintOf(master));
+    const open = live();
+
+    await applyRequirement({ required: true, fingerprint: current.message.fingerprint });
+    await handleGateMessage(open, current.message);
+    await useKey(await deriveSessionKey("口令输错了", salt, iterations), false);
+    expect(e2eeState().rejected).toBe(true);
+
+    await useKey(await deriveSessionKey(passphrase, salt, iterations), false);
+    expect(open.sent, "the second attempt reaches the connection the first one could not").toHaveLength(1);
+    expect(handshakeAnswered(current, open.sent[0].proof)).toBe(true);
+    expect(e2eeState().rejected).toBe(false);
+  });
+
   it("reports a key that cannot answer, whichever key the challenge names", async () => {
     // Telling a wrong key from a stale challenge by fingerprint cannot be
     // done: a wrong passphrase derives one that matches neither. Trying cost
