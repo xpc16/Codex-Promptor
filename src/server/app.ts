@@ -53,6 +53,8 @@ import {
 import { defaultProjectionSchedulerConfig, fullTerminalScreenFrame, TerminalProjectionScheduler } from "./terminal-projection.js";
 import { createTrafficLedger, rollupBuckets, type TrafficLedger } from "./traffic-ledger.js";
 import { newKeyMaterial } from "./e2ee-key-material.js";
+import { handshakeAnswered, masterKeyFor, startHandshake, type PendingHandshake } from "./e2ee-session.js";
+import { HANDSHAKE_PROOF, HANDSHAKE_READY, allowedBeforeHandshake } from "../shared/e2ee-handshake.js";
 import { redactForScope } from "./e2ee-redaction.js";
 import { normalizePassphrase } from "../shared/e2ee-keys.js";
 import { classifyNetworkScope, type NetworkScope } from "./traffic-scope.js";
@@ -214,6 +216,27 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const trustedHosts = await loadTrustedBrowserHosts(rootDir, process.env.CODEX_PROMPTOR_TRUSTED_HOSTS);
   const documents = await DocumentService.create(rootDir, storage);
   const readClientTab = (tabId: string): Promise<TabBundle> => storage.readTabWindow(tabId, INITIAL_PROMPT_WINDOW, INITIAL_ANSWER_WINDOW);
+
+  /**
+   * The key this machine is currently using, or null when encryption is off.
+   *
+   * Derived lazily and cached by fingerprint: PBKDF2 is a few hundred
+   * milliseconds and a connection should not pay for it, but the fingerprint
+   * moves whenever the passphrase or its salt does, so a stale cache cannot
+   * outlive the key it was derived from.
+   */
+  let cachedKey: { fingerprint: string; master: Buffer } | null = null;
+  const encryptionState = async (): Promise<{ master: Buffer; fingerprint: string } | null> => {
+    const tabs = await storage.listTabMeta().catch(() => []);
+    const switchTab = tabs.find((tab) => tab.session.provider === "p2p" && tab.session.e2ee);
+    if (!switchTab) { cachedKey = null; return null; }
+    const declared = switchTab.session.e2ee!.fingerprint;
+    if (cachedKey?.fingerprint === declared) return cachedKey;
+    const derived = await masterKeyFor(switchTab.session).catch(() => null);
+    if (!derived) { cachedKey = null; return null; }
+    cachedKey = derived;
+    return derived;
+  };
   const startupOpenTabIds = tabsToRestore(await storage.listTabMeta());
   /**
    * Reads this tab's rollout incrementally. The five conversations open on the
@@ -1829,9 +1852,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       try { activities[tab.id] = await storage.readTabActivity(tab.id); }
       catch { /* a concurrently deleted or incomplete tab is omitted */ }
     }));
+    // Cleartext on purpose: a page cannot be asked for a key it does not know
+    // it needs. The salt is here because without it the far end can derive
+    // nothing, and neither it nor the fingerprint is secret.
+    const encryption = await encryptionState();
     return reply.send({ data: {
       index,
       activities,
+      e2ee: encryption
+        ? { required: true, fingerprint: encryption.fingerprint }
+        : { required: false },
       app: {
         version: "0.1.0",
         codex: codex.status,
@@ -2636,6 +2666,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     };
     clients.add(client);
     ui.connect();
+    // Loopback is where the passphrase was typed; it has nothing to prove.
+    let pending: PendingHandshake | null = null;
+    let verified = client.scope === "local";
+    if (!verified) {
+      void encryptionState().then((encryption) => {
+        if (!encryption) { verified = true; return; }
+        pending = startHandshake(encryption.master, encryption.fingerprint);
+        if (socket.readyState === 1) socket.send(JSON.stringify(pending.message));
+      }).catch(() => { socket.close(1011, "Encryption unavailable"); });
+    }
     socket.on("close", () => {
       if (!clients.delete(client)) return;
       // A connection that lived and died between two flushes still spent bytes.
@@ -2656,6 +2696,18 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         // shape that hides in a total.
         client.payloadIn += raw.length;
         recordTraffic("in", "ws", String(message?.type ?? "unparsed"), raw.length, { scope: client.scope });
+        if (!verified) {
+          // One gate rather than a check in each handler: a message type added
+          // later cannot forget to ask.
+          if (!allowedBeforeHandshake(message?.type)) return;
+          if (message.type === HANDSHAKE_PROOF) {
+            if (!pending || !handshakeAnswered(pending, message.proof)) { socket.close(1008, "Encryption handshake failed"); return; }
+            verified = true;
+            pending = null;
+            socket.send(JSON.stringify({ type: HANDSHAKE_READY }));
+          }
+          return;
+        }
         if (message.type === "subscribe") {
           const previousRawTabs = [...client.terminalSubscriptions.entries()]
             .filter(([, stream]) => stream.mode === "raw")
