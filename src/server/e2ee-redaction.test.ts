@@ -6,17 +6,22 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isoNow } from "../shared/schemas.js";
 import { createApp, type PromptorApp } from "./app.js";
 import { redactForRemote, redactForScope } from "./e2ee-redaction.js";
+import { decodeBase64 } from "../shared/e2ee-keys.js";
+import { E2EE_BODY_HEADER } from "../shared/e2ee-http.js";
+import { deriveMasterKey } from "./e2ee-key-material.js";
+import { openHttpBody } from "./e2ee-http-body.js";
 
 /** Distinctive enough that finding it anywhere is unambiguous. */
 const PASSPHRASE = "correct-horse-battery-staple-4f2a9c";
 const REMOTE_HOST = "promptor.example.com";
+const E2EE_SALT = "c2FsdA==";
 
 const e2eeSession = (over: Record<string, unknown> = {}) => ({
   provider: "e2ee",
   state: "ready",
   workingDirectory: PASSPHRASE,
   threadId: null,
-  e2ee: { salt: "c2FsdA", iterations: 600000, fingerprint: "K7M2-9QXF" },
+  e2ee: { salt: E2EE_SALT, iterations: 600000, fingerprint: "K7M2-9QXF" },
   ...over,
 });
 
@@ -39,7 +44,7 @@ describe("taking the passphrase out of what leaves this machine", () => {
     const redacted = redactForRemote({ session: e2eeSession() }) as any;
     expect(redacted.session.provider).toBe("e2ee");
     expect(redacted.session.workingDirectory).toBeNull();
-    expect(redacted.session.e2ee.salt).toBe("c2FsdA");
+    expect(redacted.session.e2ee.salt).toBe(E2EE_SALT);
   });
 
   it("does not touch a conversation's working directory", () => {
@@ -111,6 +116,12 @@ describe("the passphrase over a real connection", () => {
   it("is served to loopback and withheld from everything else", async () => {
     // Asserting the result, not that a function was called: every response a
     // remote can ask for, searched for the passphrase itself.
+    //
+    // Opened before searching, now that bodies are sealed. Searching the
+    // ciphertext would pass for any content whatsoever and prove nothing --
+    // the point is that the passphrase is absent from what a reader holding
+    // the key can see, not merely from what the relay can.
+    const master = await deriveMasterKey(PASSPHRASE, Buffer.from(decodeBase64(E2EE_SALT)), 600_000);
     for (const url of ["/api/bootstrap", `/api/tabs/${tabId}`]) {
       const local = await fetchAs("127.0.0.1:4317", url);
       expect(local.statusCode, url).toBe(200);
@@ -118,9 +129,13 @@ describe("the passphrase over a real connection", () => {
 
       const remote = await fetchAs(REMOTE_HOST, url);
       expect(remote.statusCode, url).toBe(200);
-      expect(remote.body, `${url} over the tunnel`).not.toContain(PASSPHRASE);
+      const plain = remote.headers[E2EE_BODY_HEADER]
+        ? openHttpBody(master, new Uint8Array(remote.rawPayload))
+        : remote.body;
+      expect(plain, `${url} could be opened`).not.toBeNull();
+      expect(plain!, `${url} over the tunnel`).not.toContain(PASSPHRASE);
       // Still visible as a tab, so the far end knows encryption is on.
-      expect(remote.body, `${url} still names the tab`).toContain(tabId);
+      expect(plain!, `${url} still names the tab`).toContain(tabId);
     }
   });
 

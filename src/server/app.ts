@@ -53,6 +53,8 @@ import {
 import { defaultProjectionSchedulerConfig, fullTerminalScreenFrame, TerminalProjectionScheduler } from "./terminal-projection.js";
 import { createTrafficLedger, rollupBuckets, type TrafficLedger } from "./traffic-ledger.js";
 import { newKeyMaterial } from "./e2ee-key-material.js";
+import { openHttpBody, sealHttpBody } from "./e2ee-http-body.js";
+import { E2EE_BODY_CONTENT_TYPE, E2EE_BODY_HEADER, bodyMustStayReadable, bodyNeedsEncryption } from "../shared/e2ee-http.js";
 import { handshakeAnswered, masterKeyFor, startHandshake, type PendingHandshake } from "./e2ee-session.js";
 import { HANDSHAKE_PROOF, HANDSHAKE_READY, allowedBeforeHandshake } from "../shared/e2ee-handshake.js";
 import { redactForScope } from "./e2ee-redaction.js";
@@ -1543,6 +1545,51 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   app.addHook("preSerialization", async (request, _reply, payload) => {
     const scope = classifyNetworkScope(request.raw.socket?.remoteAddress, request.headers.host);
     return redactForScope(payload, scope);
+  });
+
+  /**
+   * Request bodies, opened before anything reads them.
+   *
+   * A prompt is submitted as the body of a POST, so leaving requests in the
+   * clear would have left the most sensitive half of the conversation
+   * readable while the answers to it were sealed. A body that does not open is
+   * refused rather than guessed at: holding the key is the authorization here,
+   * and this is the only place that checks it for HTTP.
+   */
+  app.addContentTypeParser(E2EE_BODY_CONTENT_TYPE, { parseAs: "buffer" }, async (_request: FastifyRequest, body: Buffer | string) => {
+    const encryption = await encryptionState();
+    if (!encryption) throw Object.assign(new Error("Encryption is not configured."), { statusCode: 400, code: "E2EE_NOT_CONFIGURED" });
+    const opened = openHttpBody(encryption.master, new Uint8Array(Buffer.isBuffer(body) ? body : Buffer.from(String(body))));
+    if (opened === null) throw Object.assign(new Error("This request was not sealed with the key this machine holds."), { statusCode: 403, code: "E2EE_BODY_UNREADABLE" });
+    if (!opened.trim()) return {};
+    try { return JSON.parse(opened); }
+    catch { throw Object.assign(new Error("The sealed body was not JSON."), { statusCode: 400, code: "E2EE_BODY_INVALID" }); }
+  });
+
+  /**
+   * Response bodies, sealed for anything that is not loopback.
+   *
+   * onSend rather than preSerialization, because this has to replace a string
+   * with bytes -- and because it is the one hook that also sees the payloads
+   * routes serialized themselves, which is how `sendRevalidatable` slipped
+   * past the redaction earlier.
+   */
+  app.addHook("onSend", async (request, reply, payload) => {
+    if (!bodyNeedsEncryption(request.url) || bodyMustStayReadable(request.url)) return payload;
+    if (reply.statusCode === 304 || payload === null || payload === undefined) return payload;
+    if (typeof payload !== "string") return payload;
+    const scope = classifyNetworkScope(request.raw.socket?.remoteAddress, request.headers.host);
+    if (scope === "local") return payload;
+    const encryption = await encryptionState();
+    if (!encryption) return payload;
+    const sealed = sealHttpBody(encryption.master, payload);
+    reply.header(E2EE_BODY_HEADER, encryption.fingerprint);
+    reply.type(E2EE_BODY_CONTENT_TYPE);
+    // Ciphertext does not compress; letting the compressor try would spend CPU
+    // to add bytes. The plaintext was already deflated before sealing.
+    reply.header("content-encoding", "identity");
+    reply.header("content-length", String(sealed.length));
+    return sealed;
   });
 
   app.addHook("onRequest", async (request) => {

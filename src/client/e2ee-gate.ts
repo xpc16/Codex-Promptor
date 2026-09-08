@@ -54,6 +54,9 @@ const publish = (next: Partial<E2eeState>) => {
 
 export function e2eeState(): E2eeState { return state; }
 
+/** The key HTTP seals with. Null while encryption is off or none has been given. */
+export function currentKey(): SessionKey | null { return key; }
+
 export function observeE2ee(listener: (next: E2eeState) => void): () => void {
   listeners.add(listener);
   return () => { listeners.delete(listener); };

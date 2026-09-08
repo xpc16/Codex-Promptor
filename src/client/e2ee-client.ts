@@ -7,6 +7,12 @@ import {
   type KeyPurpose,
 } from "../shared/e2ee-keys.js";
 import {
+  HTTP_NONCE_BYTES,
+  decodeHttpHeader,
+  encodeHttpHeader,
+  httpCiphertext,
+} from "../shared/e2ee-http.js";
+import {
   HANDSHAKE_PROOF,
   handshakeAad,
   type HandshakeChallenge,
@@ -109,6 +115,41 @@ export async function answerChallenge(key: SessionKey, challenge: HandshakeChall
   if (!opened) return null;
   const proof = await seal(auth, nonce, opened, handshakeAad("client", challenge.fingerprint));
   return { type: HANDSHAKE_PROOF, proof: encodeBase64(proof) };
+}
+
+/**
+ * Sealing a request body, and opening a response.
+ *
+ * The nonce is carried here, unlike on the WebSocket: HTTP has no ordered
+ * connection for both ends to count along, so a counter either side guessed
+ * wrong would repeat one. Twelve random bytes on a body averaging kilobytes is
+ * nothing next to what a repeated nonce would cost.
+ *
+ * Outgoing bodies are not compressed. They are the small direction -- 1.49 MB
+ * inbound against 8.31 MB out over the measured six days -- and skipping it
+ * keeps this free of the streaming compression API and its browser floor.
+ */
+export async function sealRequestBody(key: SessionKey, json: string): Promise<Uint8Array> {
+  const http = await subKey(key.master, "http");
+  const nonce = crypto.getRandomValues(new Uint8Array(HTTP_NONCE_BYTES));
+  const header = encodeHttpHeader({ compressed: false, nonce });
+  const sealed = await seal(http, nonce, new TextEncoder().encode(json), header);
+  const out = new Uint8Array(header.length + sealed.length);
+  out.set(header);
+  out.set(sealed, header.length);
+  return out;
+}
+
+/** Null for a body that does not open, which is a wrong key or a changed byte. */
+export async function openResponseBody(key: SessionKey, body: Uint8Array): Promise<string | null> {
+  const header = decodeHttpHeader(body);
+  if (!header) return null;
+  const http = await subKey(key.master, "http");
+  const opened = await open(http, header.nonce, httpCiphertext(body), body.subarray(0, 1 + HTTP_NONCE_BYTES));
+  if (!opened) return null;
+  if (!header.compressed) return new TextDecoder().decode(opened);
+  const stream = new Blob([opened as BufferSource]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Response(stream).text();
 }
 
 /**

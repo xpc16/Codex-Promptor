@@ -142,7 +142,11 @@ export function App() {
   const indexRef = useRef<IndexFile | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [service, setService] = useState<any>(null);
-  const [error, setError] = useState<unknown | null>(null);
+  const [rawError, setError] = useState<unknown | null>(null);
+  // A call refused for want of the key is not a problem to report: the unlock
+  // prompt is already on screen saying exactly that, and a toast beside it
+  // would only make a barrier working as intended look like a fault.
+  const error = rawError instanceof PromptorApiError && rawError.code === "E2EE_LOCKED" ? null : rawError;
   const [e2ee, setE2ee] = useState<E2eeState>(e2eeState);
   const [kdf, setKdf] = useState<{ salt: string; iterations: number } | null>(null);
   useEffect(() => observeE2ee(setE2ee), []);
