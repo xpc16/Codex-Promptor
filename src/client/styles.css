@@ -461,6 +461,9 @@ input, textarea, select { color: var(--text); }
 .spinner { width: 26px; height: 26px; }
 .toast { position: absolute; z-index: 20; top: 14px; right: 18px; max-width: min(520px, 80vw); padding: 11px 13px; border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border)); border-radius: 9px; background: color-mix(in srgb, var(--danger) 10%, var(--panel)); color: var(--danger); box-shadow: var(--shadow); font-size: 13px; }
 .toast button { margin-left: 10px; background: transparent; color: inherit; font-size: 18px; }
+/* A statement, not a problem: encryption changing state leaves no other mark. */
+.toast.notice-toast { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); background: color-mix(in srgb, var(--accent) 10%, var(--panel)); color: var(--text); }
+.e2ee-hint { margin-top: 6px; }
 
 .dialog-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 20px; background: rgba(25, 33, 46, .42); backdrop-filter: blur(3px); }
 .text-dialog { width: min(480px, 100%); padding: 21px; border: 1px solid var(--border-strong); border-radius: 13px; background: var(--panel); box-shadow: 0 24px 70px rgba(24, 34, 52, .28); }

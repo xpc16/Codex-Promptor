@@ -52,7 +52,9 @@ import {
 } from "./terminal-transport.js";
 import { defaultProjectionSchedulerConfig, fullTerminalScreenFrame, TerminalProjectionScheduler } from "./terminal-projection.js";
 import { createTrafficLedger, rollupBuckets, type TrafficLedger } from "./traffic-ledger.js";
+import { newKeyMaterial } from "./e2ee-key-material.js";
 import { redactForScope } from "./e2ee-redaction.js";
+import { normalizePassphrase } from "../shared/e2ee-keys.js";
 import { classifyNetworkScope, type NetworkScope } from "./traffic-scope.js";
 import { buildIndexDelta, indexDeltaIsEmpty } from "../shared/index-delta.js";
 import { createTrafficLog } from "./traffic-log.js";
@@ -2069,6 +2071,46 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const parsedProvider = AgentProviderSchema.safeParse(body.provider ?? "codex");
     if (!parsedProvider.success) return apiError(reply, 400, "INVALID_PROVIDER", "Choose Codex, Claude Code, Cursor CLI, or Terminal.");
     const provider: AgentProvider = parsedProvider.data;
+
+    // A p2p tab is the encryption switch, not a conversation, so it leaves
+    // before any of the machinery below: no working directory to validate, no
+    // resume id to parse, no terminal to start. Loopback only -- letting the
+    // far end set the key it will be checked against is the same as having no
+    // key at all.
+    if (provider === "p2p") {
+      if (!isLocalBrowserRequest(request.headers)) {
+        return apiError(reply, 403, "E2EE_LOCAL_ONLY", "Encryption can only be set up from this machine.");
+      }
+      const previous = await storage.getTabMeta(tabId).catch(() => null);
+      const typed = normalizePassphrase(String(body.workingDirectory ?? body.passphrase ?? ""));
+      // An empty box means "keep what is already set", which is what makes
+      // reopening the tab harmless. It only fails when there is nothing yet.
+      const passphrase = typed ?? (previous?.session.provider === "p2p" ? previous.session.workingDirectory : null);
+      if (!passphrase) return apiError(reply, 400, "E2EE_PASSPHRASE_REQUIRED", "Enter a passphrase to turn encryption on.");
+      const { material } = await newKeyMaterial(passphrase);
+      const now = isoNow();
+      await storage.updateTab(tabId, (current) => ({
+        ...current,
+        session: {
+          ...current.session,
+          provider: "p2p",
+          state: "ready",
+          reopenOnLaunch: true,
+          workingDirectory: passphrase,
+          threadId: null,
+          sessionId: null,
+          createdAt: current.session.createdAt ?? now,
+          connectedAt: now,
+          lastError: null,
+          lastThreadSwitch: null,
+          e2ee: material,
+        },
+        updatedAt: now,
+      }));
+      await emitSnapshot(tabId);
+      return reply.send({ data: { bundle: await readClientTab(tabId) } });
+    }
+
     const mode = body.mode === "resume" ? "resume" : "new";
     // An agent session always needs a real project directory. A terminal does
     // not: leaving the path empty is a request for the default one, resolved
@@ -2335,7 +2377,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await codexTui.stop(tabId).catch(() => undefined);
       await cursor.stop(tabId).catch(() => undefined);
       await claude.stop(tabId).catch(() => undefined);
-      if (provider !== "shell" && provider !== "p2p") revokeHookLease(provider, tabId);
+      if (provider !== "shell") revokeHookLease(provider, tabId);
       await stopAppServer(storage, codex, tabId).catch(() => undefined);
       await updateTerminalRuntime(storage, tabId, { state: "stopped" }).catch(() => undefined);
       const activeWriter = provider === "codex" && isActiveWriterError(message);

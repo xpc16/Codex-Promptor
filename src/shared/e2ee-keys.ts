@@ -78,6 +78,22 @@ export function decodeBase64(value: string): Uint8Array {
 }
 
 /**
+ * A passphrase for the reader who would rather not think of one.
+ *
+ * Grouped base32 because it gets typed again on another device, by hand, from
+ * a phone screen: no case to get wrong, and none of the characters that are
+ * read as each other. 20 characters of this alphabet is 100 bits, which is
+ * past the point where the KDF is what matters.
+ */
+export function randomPassphrase(): string {
+  const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  const bytes = new Uint8Array(20);
+  globalThis.crypto.getRandomValues(bytes);
+  const chars = [...bytes].map((byte) => alphabet[byte % alphabet.length]);
+  return [0, 5, 10, 15].map((start) => chars.slice(start, start + 5).join("")).join("-");
+}
+
+/**
  * Whether a passphrase is usable at all.
  *
  * Deliberately not a strength meter. A typed passphrase is accepted by design

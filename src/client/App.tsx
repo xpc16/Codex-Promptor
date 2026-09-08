@@ -16,6 +16,7 @@ import {
 } from "react";
 import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta, TabRecordPage } from "../shared/schemas.js";
 import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-link.js";
+import { randomPassphrase } from "../shared/e2ee-keys.js";
 import type { RuntimeDelta } from "../shared/runtime-delta.js";
 import type { TerminalScreenFrame, TerminalTransportMode } from "../shared/terminal-protocol.js";
 import { DOCUMENT_RAW_CATCH_UP_BYTES } from "../shared/document-protocol.js";
@@ -140,6 +141,15 @@ export function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [service, setService] = useState<any>(null);
   const [error, setError] = useState<unknown | null>(null);
+  // Says that something changed which leaves no other mark on the page --
+  // turning encryption on or off changes no visible control, only what crosses
+  // the network, so without this the reader has no way to know it took.
+  const [notice, setNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), 6_000);
+    return () => clearTimeout(timer);
+  }, [notice]);
   const [retainedTabIds, setRetainedTabIds] = useState<string[]>([]);
   const [viewRefreshNonces, setViewRefreshNonces] = useState<Record<string, number>>({});
   const [dialog, setDialog] = useState<AppDialog | null>(null);
@@ -435,7 +445,13 @@ export function App() {
   const confirmDelete = async () => {
     if (!dialog || (dialog.kind !== "delete-tab" && dialog.kind !== "delete-group")) return;
     try {
-      if (dialog.kind === "delete-tab") { await api(`/api/tabs/${dialog.tabId}`, { method: "DELETE" }); forgetCachedTab(dialog.tabId); forgetCachedTerminal(dialog.tabId); }
+      if (dialog.kind === "delete-tab") {
+        const wasEncryption = index?.tabs.find((entry) => entry.id === dialog.tabId)?.session.provider === "p2p";
+        await api(`/api/tabs/${dialog.tabId}`, { method: "DELETE" });
+        forgetCachedTab(dialog.tabId);
+        forgetCachedTerminal(dialog.tabId);
+        if (wasEncryption) setNotice(t("session.e2eeOff"));
+      }
       else await api(`/api/groups/${dialog.groupId}`, { method: "DELETE" });
       setDialog(null);
       await refresh();
@@ -521,7 +537,8 @@ export function App() {
     <div className="console-splitter" role="separator" aria-label={t("aria.resizeConsole")} onMouseDown={() => { consoleDrag.current = new PaneDrag(consoleWidthRef.current, applyConsoleWidth, (width) => writePaneSize(CONSOLE_WIDTH, width)); }} />
     <main className="workspace" aria-label={t("aria.conversationPage")}>
       {Boolean(error) && <div className="toast error-toast">{i18n.errorText(error)}<button onClick={() => setError(null)}>×</button></div>}
-      {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} onBundleChanged={applyTabBundle} onError={setError} />)}
+      {notice && <div className="toast notice-toast" role="status">{notice}<button onClick={() => setNotice(null)}>×</button></div>}
+      {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} onBundleChanged={applyTabBundle} onError={setError} onNotice={setNotice} />)}
       {!selected && <Welcome onCreate={() => void createTab()} />}
     </main>
     <nav className="mobile-pane-bar" aria-label={t("aria.paneSwitcher")}>
@@ -753,7 +770,7 @@ function LoadEarlier({ shown, busy, label, busyLabel, onReveal }: { shown: boole
   return <button type="button" className="load-earlier" disabled={busy} onClick={onReveal}>{busy ? busyLabel : label}</button>;
 }
 
-function TabView({ tab, active, refreshNonce, theme, projectionSupported, onBundleChanged, onError }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; projectionSupported: boolean; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void }) {
+function TabView({ tab, active, refreshNonce, theme, projectionSupported, onBundleChanged, onError, onNotice }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; projectionSupported: boolean; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void; onNotice: (message: string) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   // Re-selecting a conversation paints from what this page already downloaded
@@ -1015,7 +1032,7 @@ function TabView({ tab, active, refreshNonce, theme, projectionSupported, onBund
     } finally { documentOpenBusy.current = false; }
   };
   return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspaceRef}>
-    <section className="conversation-pane" ref={conversation}>{active && <><SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} onReopen={reopen} onSyncHistory={async () => { await api(`/api/tabs/${tab.id}/history/sync`, { method: "POST" }); await load(); }} onBundle={applyBundle} onError={onError} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
+    <section className="conversation-pane" ref={conversation}>{active && <><SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} onReopen={reopen} onSyncHistory={async () => { await api(`/api/tabs/${tab.id}/history/sync`, { method: "POST" }); await load(); }} onBundle={applyBundle} onError={onError} onNotice={onNotice} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
     <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) splitDrag.current = new PaneDrag(leftWidthRef.current, applyLeftWidth, (value) => writePaneSize(splitSpec, value)); }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
     <section className="queue-pane" ref={queuePaneRef}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" ref={queueSplitterRef} role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} /><TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} projectionSupported={projectionSupported} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
   </div></div>;
@@ -1025,7 +1042,7 @@ function orderedTabIds(tabs: TabMeta[], groupId: string | null): string[] {
   return tabs.filter((tab) => tab.groupId === groupId).sort((a, b) => a.order - b.order).map((tab) => tab.id);
 }
 
-function SessionPanel({ bundle, height, reopening, onReopen, onSyncHistory, onBundle, onError }: { bundle: TabBundle; height: number | null; reopening: boolean; onReopen: () => Promise<void>; onSyncHistory: () => Promise<void>; onBundle: (bundle: TabBundle) => void; onError: (error: unknown) => void }) {
+function SessionPanel({ bundle, height, reopening, onReopen, onSyncHistory, onBundle, onError, onNotice }: { bundle: TabBundle; height: number | null; reopening: boolean; onReopen: () => Promise<void>; onSyncHistory: () => Promise<void>; onBundle: (bundle: TabBundle) => void; onError: (error: unknown) => void; onNotice: (message: string) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   const session = bundle.tab.session;
@@ -1052,8 +1069,16 @@ function SessionPanel({ bundle, height, reopening, onReopen, onSyncHistory, onBu
   const connect = async () => {
     setBusy(true);
     try {
-      const result = await api<{ bundle: TabBundle }>(`/api/tabs/${bundle.tab.id}/session`, jsonBody({ provider, mode, workingDirectory: cwd, resumeId }));
+      // The mode switch and its id stay usable for every provider, but a p2p
+      // tab has no conversation to start or resume, so neither is sent.
+      const result = await api<{ bundle: TabBundle }>(`/api/tabs/${bundle.tab.id}/session`, jsonBody(isP2p
+        ? { provider, workingDirectory: cwd }
+        : { provider, mode, workingDirectory: cwd, resumeId }));
       onBundle(result.bundle);
+      if (isP2p) {
+        setCwd("");
+        onNotice(t("session.e2eeOn"));
+      }
     }
     catch (reason) { onError(reason); }
     finally { setBusy(false); }
@@ -1081,9 +1106,13 @@ function SessionPanel({ bundle, height, reopening, onReopen, onSyncHistory, onBu
     finally { setSyncing(false); }
   };
   const activeProvider = connected ? session.provider : provider;
-  const providerName = t(activeProvider === "claude" ? "provider.claude" : activeProvider === "cursor" ? "provider.cursor" : activeProvider === "shell" ? "provider.shell" : "provider.codex");
+  const providerName = t(activeProvider === "claude" ? "provider.claude" : activeProvider === "cursor" ? "provider.cursor" : activeProvider === "shell" ? "provider.shell" : activeProvider === "p2p" ? "provider.p2p" : "provider.codex");
   // A terminal has no agent, so everything downstream of one is switched off.
   const isShell = activeProvider === "shell";
+  const isP2p = activeProvider === "p2p";
+  // An empty box means "keep the passphrase already set", which is what makes
+  // reopening this tab harmless. It is only unusable when nothing is set yet.
+  const p2pReady = isP2p && (cwd.trim().length > 0 || Boolean(session.e2ee));
   const sessionTitle = session.state === "ready"
     ? t("session.ready", { provider: providerName })
     : session.state === "closed"
@@ -1094,15 +1123,15 @@ function SessionPanel({ bundle, height, reopening, onReopen, onSyncHistory, onBu
   const sessionHelp = restoring
     ? t("session.restoringHelp", { provider: providerName })
     : connected
-      ? t(session.provider === "claude" ? "session.connectedHelp.claude" : session.provider === "cursor" ? "session.connectedHelp.cursor" : session.provider === "shell" ? "session.connectedHelp.shell" : "session.connectedHelp.codex")
+      ? t(session.provider === "claude" ? "session.connectedHelp.claude" : session.provider === "cursor" ? "session.connectedHelp.cursor" : session.provider === "shell" ? "session.connectedHelp.shell" : session.provider === "p2p" ? "session.connectedHelp.p2p" : "session.connectedHelp.codex")
       : t("session.setupHelp");
   return <div className="session-card" style={height === null ? undefined : { height: `${height}%`, maxHeight: "none" }}>
     <div className="section-title"><span className="section-icon">◌</span><div><strong>{sessionTitle}</strong><small>{sessionHelp}</small></div></div>
-    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t("session.workingDirectory")}</span><code>{session.workingDirectory}</code></div>{session.provider !== "shell" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && session.lastThreadSwitch.method !== "thread/fork" && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring || syncing} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <><button className="danger-action" disabled={busy || syncing} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>{session.provider !== "shell" && session.threadId && <button className="ghost" disabled={busy || reopening || syncing} onClick={() => void syncHistory()}>{t("footer.syncHistory")}</button>}</>}{localFolderPicker && <button className="ghost" disabled={exporting} onClick={() => void exportConversation()}>{t(exporting ? "session.exporting" : "session.export")}</button>}</div></div> : <>
-      <label className="field-label">{t(localFolderPicker ? "session.localPath" : "session.remotePath")}</label><div className={`path-row ${localFolderPicker ? "" : "remote"}`}><input value={cwd} title={cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t("session.pathExample")} />{localFolderPicker && <button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button>}</div>{!localFolderPicker && <small className="field-hint">{t("session.remotePathHint")}</small>}{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}
+    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t("session.closedNotice")}</div>}<div className="session-path"><span>{t(session.provider === "p2p" ? "session.e2eeFingerprint" : "session.workingDirectory")}</span><code>{session.provider === "p2p" ? (session.e2ee?.fingerprint ?? "—") : session.workingDirectory}</code></div>{session.provider === "p2p" && <div className="field-hint e2ee-hint">{t("session.e2eeCompare")}</div>}{session.provider !== "shell" && session.provider !== "p2p" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.lastThreadSwitch && session.lastThreadSwitch.method !== "thread/fork" && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring || syncing} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <><button className="danger-action" disabled={busy || syncing} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>{session.provider !== "shell" && session.provider !== "p2p" && session.threadId && <button className="ghost" disabled={busy || reopening || syncing} onClick={() => void syncHistory()}>{t("footer.syncHistory")}</button>}</>}{localFolderPicker && <button className="ghost" disabled={exporting} onClick={() => void exportConversation()}>{t(exporting ? "session.exporting" : "session.export")}</button>}</div></div> : <>
+      <label className="field-label">{t(isP2p ? "session.e2eeKey" : localFolderPicker ? "session.localPath" : "session.remotePath")}</label><div className={`path-row ${localFolderPicker && !isP2p ? "" : "remote"}`}><input value={cwd} title={isP2p ? undefined : cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t(isP2p ? "session.e2eeKeyPlaceholder" : "session.pathExample")} />{isP2p ? <button className="ghost" onClick={() => setCwd(randomPassphrase())}>{t("session.e2eeGenerate")}</button> : localFolderPicker && <button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button>}</div>{isP2p ? <small className="field-hint">{t(session.e2ee ? "session.e2eeKeepHint" : "session.e2eeKeyHint")}</small> : <>{!localFolderPicker && <small className="field-hint">{t("session.remotePathHint")}</small>}{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}</>}
       {!isShell && <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => setMode("new")}>{t("session.createNew")}</button><button className={mode === "resume" ? "active" : ""} onClick={() => setMode("resume")}>{t("session.resumeOld")}</button></div>}
       {!isShell && mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} placeholder={t("session.resumePlaceholder")} />}
-      <div className="connect-row"><button className="primary connect" disabled={busy || (!isShell && !cwd.trim())} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button><select value={provider} disabled={busy} onChange={(event) => setProvider(event.target.value as AgentProvider)} aria-label={providerName}><option value="codex">{t("provider.codex")}</option><option value="claude">{t("provider.claude")}</option><option value="cursor">{t("provider.cursor")}</option><option value="shell">{t("provider.shell")}</option></select></div>
+      <div className="connect-row"><button className="primary connect" disabled={busy || (isP2p ? !p2pReady : !isShell && !cwd.trim())} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button><select value={provider} disabled={busy} onChange={(event) => setProvider(event.target.value as AgentProvider)} aria-label={providerName}><option value="codex">{t("provider.codex")}</option><option value="claude">{t("provider.claude")}</option><option value="cursor">{t("provider.cursor")}</option><option value="shell">{t("provider.shell")}</option><option value="p2p">{t("provider.p2p")}</option></select></div>
     </>}
     {session.lastError && <div className="inline-error">{i18n.errorText(session.lastError)}</div>}
   </div>;

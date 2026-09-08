@@ -144,3 +144,70 @@ describe("the passphrase over a real connection", () => {
     expect(await viewer(REMOTE_HOST), "tunnel viewer").not.toContain(PASSPHRASE);
   });
 });
+
+describe("setting the key", () => {
+  let app: PromptorApp;
+  let root: string;
+  let tabId: string;
+
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(os.tmpdir(), "promptor-e2ee-setup-"));
+    await mkdir(path.join(root, "dist", "client"), { recursive: true });
+    await writeFile(path.join(root, "dist", "client", "index.html"), "<!doctype html><title>t</title>", "utf8");
+    app = await createApp(root);
+    await app.ready();
+    tabId = (await app.promptor.storage.createTab("加密")).id;
+  });
+
+  afterEach(async () => {
+    await app.promptor.close();
+    await app.close();
+    await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 60 }).catch(() => undefined);
+  });
+
+  const open = (host: string, origin: string, payload: Record<string, unknown>) => app.inject({
+    method: "POST",
+    url: `/api/tabs/${tabId}/session`,
+    headers: { "x-codex-promptor-token": app.promptor.token, host, origin },
+    payload: { provider: "p2p", ...payload } as never,
+  });
+
+  it("is refused from anywhere but this machine", async () => {
+    // Letting the far end choose the key it will then be checked against is
+    // the same as having no key at all.
+    const remote = await open(REMOTE_HOST, `https://${REMOTE_HOST}`, { workingDirectory: PASSPHRASE });
+    expect(remote.statusCode).toBe(403);
+    expect(remote.json()).toMatchObject({ error: { code: "E2EE_LOCAL_ONLY" } });
+    expect((await app.promptor.storage.getTabMeta(tabId)).session.provider).not.toBe("p2p");
+  });
+
+  it("derives a salt and a fingerprint, and keeps the passphrase local", async () => {
+    const response = await open("127.0.0.1:4317", "http://127.0.0.1:4317", { workingDirectory: PASSPHRASE });
+    expect(response.statusCode).toBe(200);
+    const session = (await app.promptor.storage.getTabMeta(tabId)).session;
+    expect(session.provider).toBe("p2p");
+    expect(session.workingDirectory).toBe(PASSPHRASE);
+    expect(session.e2ee?.iterations).toBe(600000);
+    expect(session.e2ee?.fingerprint).toMatch(/^[A-Z2-7]{4}-[A-Z2-7]{4}$/);
+    // No conversation was started: it is a switch, not a session.
+    expect(session.threadId).toBeNull();
+  });
+
+  it("takes an empty box as keeping the key already set", async () => {
+    await open("127.0.0.1:4317", "http://127.0.0.1:4317", { workingDirectory: PASSPHRASE });
+    const before = (await app.promptor.storage.getTabMeta(tabId)).session.e2ee?.fingerprint;
+    const again = await open("127.0.0.1:4317", "http://127.0.0.1:4317", { workingDirectory: "" });
+    expect(again.statusCode).toBe(200);
+    const after = (await app.promptor.storage.getTabMeta(tabId)).session;
+    expect(after.workingDirectory).toBe(PASSPHRASE);
+    // A fresh salt each time, so the same passphrase does not derive the same
+    // key twice -- and the reader is told to re-pair by the fingerprint moving.
+    expect(after.e2ee?.fingerprint).not.toBe(before);
+  });
+
+  it("refuses to turn on with nothing to turn on with", async () => {
+    const empty = await open("127.0.0.1:4317", "http://127.0.0.1:4317", { workingDirectory: "   " });
+    expect(empty.statusCode).toBe(400);
+    expect(empty.json()).toMatchObject({ error: { code: "E2EE_PASSPHRASE_REQUIRED" } });
+  });
+});
