@@ -170,17 +170,19 @@ where.exe codex
 pm` 和 `npm prefix -g` 说的位置找，所以**先关掉重开应用试一次**，多半就好了。
 - **什么都没输出，也确实没装** —— 装上 `codex` 再重开应用；只想用 Claude Code 或终端对话的话，这个对话打不开，不影响其他对话。
 - **有输出，但应用仍然报错** —— 进程的 PATH 在启动那一刻就定死了，后装的东西它看不见。关掉重开应用即可。
-- **装在了 npm 之外的位置**（桌面版安装包自己的目录之类）—— 谁也猜不到，直接告诉它。先找出真实位置：
+- **装在了别处** —— 应用会自己找 npm 的全局目录和官方安装器的 `%LOCALAPPDATA%\OpenAI\Codexin\`，所以先**重开一次应用**。还不行再往下：先找出真实位置：
 
   ```powershell
   Get-ChildItem -Path $env:APPDATA, $env:LOCALAPPDATA -Recurse -Filter codex.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
   ```
 
-  把找到的路径写进 `promptor.cmd`（放在 `node` 那行之前）：
+  把找到的路径写进 `promptor.cmd`，放在 `node` 那行**之前**：
 
   ```bat
   set CODEX_PROMPTOR_CODEX_EXECUTABLE=C:\完整\路径\codex.exe
   ```
+
+  > **`set X=Y` 是 cmd 的写法，只在 `.cmd` 文件里有效。** 在 PowerShell 里敲它不会设置环境变量，也不会报错——`set` 在那里是 `Set-Variable` 的别名，做的是完全不同的事。PowerShell 里要写 `$env:CODEX_PROMPTOR_CODEX_EXECUTABLE = "C:\完整\路径\codex.exe"`，而且**只对当前这个窗口有效**，应用必须从同一个窗口启动。
 
 报错信息里会列出它**实际找过的位置**，对照一下就知道差在哪。
 

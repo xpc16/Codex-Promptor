@@ -691,6 +691,35 @@ async function npmGlobalDirectories(): Promise<string[]> {
 }
 
 /**
+ * Where the official Windows installer puts codex, which is not npm and not on
+ * PATH.
+ *
+ * `%LOCALAPPDATA%\OpenAI\Codex\bin\<build>\codex.exe` -- the build directory
+ * is opaque and changes with every upgrade, so this reads the directory rather
+ * than guessing a name, newest first because that is the install in use after
+ * an upgrade leaves the previous one behind.
+ */
+async function codexNativeDirectories(): Promise<string[]> {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData) return [];
+  const bin = path.join(localAppData, "OpenAI", "Codex", "bin");
+  const directories = [bin];
+  try {
+    const entries = await fs.readdir(bin, { withFileTypes: true });
+    const builds = await Promise.all(entries
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) => {
+        const full = path.join(bin, entry.name);
+        const at = await fs.stat(full).then((info) => info.mtimeMs).catch(() => 0);
+        return { full, at };
+      }));
+    builds.sort((left, right) => right.at - left.at);
+    directories.push(...builds.map((build) => build.full));
+  } catch { /* no such install; the bare directory above is still worth a try */ }
+  return directories;
+}
+
+/**
  * Finds the codex binary, or says so plainly.
  *
  * PATH first, because that is where it normally is. But "installed" and "on
@@ -710,9 +739,8 @@ export async function resolveCodexTuiLaunch(launch: AgentProcessLaunch): Promise
     const result = await execFileAsync("where.exe", ["codex"], { windowsHide: true });
     candidates.push(...String(result.stdout).split(/\r?\n/).map((value) => value.trim()).filter(Boolean));
   } catch { /* not on PATH; the npm directories below are the second question */ }
-  const onPath = candidates.length > 0;
-  if (!onPath) {
-    for (const directory of await npmGlobalDirectories()) {
+  if (candidates.length === 0) {
+    for (const directory of [...await codexNativeDirectories(), ...await npmGlobalDirectories()]) {
       candidates.push(path.join(directory, "codex.exe"), path.join(directory, "codex.cmd"));
     }
   }

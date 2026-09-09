@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -20,6 +20,7 @@ describe.skipIf(process.platform !== "win32")("finding the codex binary", () => 
   const previous = {
     path: process.env.PATH,
     appData: process.env.APPDATA,
+    localAppData: process.env.LOCALAPPDATA,
     configured: process.env.CODEX_PROMPTOR_CODEX_EXECUTABLE,
   };
 
@@ -31,11 +32,12 @@ describe.skipIf(process.platform !== "win32")("finding the codex binary", () => 
     // the machine this exists for.
     process.env.PATH = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32");
     process.env.APPDATA = root;
+    process.env.LOCALAPPDATA = path.join(root, "local");
     delete process.env.CODEX_PROMPTOR_CODEX_EXECUTABLE;
   });
 
   afterEach(async () => {
-    for (const [key, value] of [["PATH", previous.path], ["APPDATA", previous.appData], ["CODEX_PROMPTOR_CODEX_EXECUTABLE", previous.configured]] as const) {
+    for (const [key, value] of [["PATH", previous.path], ["APPDATA", previous.appData], ["LOCALAPPDATA", previous.localAppData], ["CODEX_PROMPTOR_CODEX_EXECUTABLE", previous.configured]] as const) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
@@ -58,6 +60,27 @@ describe.skipIf(process.platform !== "win32")("finding the codex binary", () => 
     expect(resolved.executable).toBe(process.execPath);
     expect(resolved.args[0]).toBe(path.join(npmDir, "node_modules", "@openai", "codex", "bin", "codex.js"));
     expect(resolved.args.slice(1)).toEqual(LAUNCH.args);
+  });
+
+  /** What the official Windows installer leaves: an opaque build directory. */
+  const installNative = async (build: string, at?: Date) => {
+    const dir = path.join(root, "local", "OpenAI", "Codex", "bin", build);
+    await mkdir(dir, { recursive: true });
+    const exe = path.join(dir, "codex.exe");
+    await writeFile(exe, "MZ", "utf8");
+    if (at) await utimes(dir, at, at);
+    return exe;
+  };
+
+  it("finds the official installer's build directory, which is neither npm nor PATH", async () => {
+    const exe = await installNative("fd4c151a749f3ab4");
+    expect((await resolveCodexTuiLaunch(LAUNCH)).executable).toBe(exe);
+  });
+
+  it("takes the newest build when an upgrade left the old one behind", async () => {
+    await installNative("older-build", new Date(Date.now() - 86_400_000));
+    const newest = await installNative("newer-build", new Date());
+    expect((await resolveCodexTuiLaunch(LAUNCH)).executable).toBe(newest);
   });
 
   it("prefers a real binary to a shim when both are there", async () => {
