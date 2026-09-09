@@ -933,6 +933,20 @@ function TabView({ tab, active, refreshNonce, theme, projectionSupported, encryp
     setLoadError(null);
     onBundleChanged(next);
   }, [keepBundle, onBundleChanged]);
+  /**
+   * A snapshot that carries only the sections that moved.
+   *
+   * Merged rather than replaced. A reconnect is answered with the parts that
+   * changed, and what changes on almost every event is `runtime` -- 455 bytes
+   * of a 24 kB bundle. A page holding nothing yet is sent every section, so
+   * the merge is a replacement in that case anyway.
+   */
+  const applySnapshot = useCallback((partial: Partial<TabBundle>) => {
+    const held = bundleRef.current;
+    const merged = held ? { ...held, ...partial } : partial;
+    if (!merged.tab || !merged.prompts || !merged.answers || !merged.runtime) return;
+    applyBundle(merged as TabBundle);
+  }, [applyBundle]);
   const load = useCallback(async () => {
     const sequence = ++loadSequence.current;
     const { promptLimit, answerLimit } = windowDepth.current;
@@ -1124,7 +1138,7 @@ function TabView({ tab, active, refreshNonce, theme, projectionSupported, encryp
   return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspaceRef}>
     <section className="conversation-pane" ref={conversation}>{active && <><SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} encryptionElsewhere={encryptionTabId !== null && encryptionTabId !== tab.id} onReopen={reopen} onSyncHistory={async () => { await api(`/api/tabs/${tab.id}/history/sync`, { method: "POST" }); await load(); }} onBundle={applyBundle} onError={onError} onNotice={onNotice} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
     <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) splitDrag.current = new PaneDrag(leftWidthRef.current, applyLeftWidth, (value) => writePaneSize(splitSpec, value)); }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
-    <section className="queue-pane" ref={queuePaneRef}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" ref={queueSplitterRef} role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} /><TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} projectionSupported={projectionSupported} onBundle={applyBundle} onMessage={applyRealtimeMessage} onError={onError} /></section>
+    <section className="queue-pane" ref={queuePaneRef}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" ref={queueSplitterRef} role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} /><TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} projectionSupported={projectionSupported} onBundle={applySnapshot} onMessage={applyRealtimeMessage} onError={onError} /></section>
   </div></div>;
 }
 
@@ -1595,7 +1609,7 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
   return <div ref={row} className={`prompt-row ${prompt.status} ${locked ? "locked" : ""} ${actionsBelow ? "actions-below" : "actions-inline"}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDragOver={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDrop={(event) => { if (!pending) return; event.preventDefault(); event.stopPropagation(); onNativeDrop(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div ref={actions} className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || executionDisabled || insertingNow} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked || executionDisabled} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked || executionDisabled} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
-function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, projectionSupported, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; projectionSupported: boolean; onBundle: (bundle: TabBundle) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {
+function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, projectionSupported, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; projectionSupported: boolean; onBundle: (partial: Partial<TabBundle>) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   const host = useRef<HTMLDivElement>(null);
@@ -1655,11 +1669,12 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     /** The last subscription this socket asked for, replayed once it is proved. */
     let lastSubscription: { includeTerminal: boolean; snapshots: boolean; boundedCatchUp: boolean } | null = null;
     /**
-     * Which bundle this socket already holds, so a reconnect does not fetch it
-     * again. A reconnect usually missed nothing, and the bundle is the largest
-     * thing on the link after the terminal itself.
+     * Which sections of the bundle this socket already holds, so a reconnect
+     * fetches only what moved. Four hashes rather than one over the whole
+     * bundle: the section that changes on almost every event is `runtime`, and
+     * it is 2% of the bytes.
      */
-    let heldSnapshotTag: string | null = null;
+    let heldSnapshotTags: Record<string, string> | null = null;
     // What was last asked for, so the wanted state can be reconciled against
     // it from whatever the page's visibility actually is. A latched transition
     // could not recover from an event that never arrived.
@@ -1899,7 +1914,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
         tabIds: [tabId],
         snapshots,
         details: true,
-        ...(snapshots && heldSnapshotTag ? { snapshotTags: { [tabId]: heldSnapshotTag } } : {}),
+        ...(snapshots && heldSnapshotTags ? { snapshotTags: { [tabId]: heldSnapshotTags } } : {}),
         terminals: includeTerminal ? { [tabId]: currentTerminalSubscription(boundedCatchUp) } : {},
       }));
     };
@@ -2055,8 +2070,10 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
           else if (projectionMode && message.type === "terminal.screen") handleScreen(message as TerminalScreenFrame);
           else if (!projectionMode && message.type === "terminal.lease" && message.tabId === tabId) rawLeaseWritable = message.writable === true;
           else if (message.type === "snapshot" && message.data) {
-            heldSnapshotTag = typeof message.snapshotTag === "string" ? message.snapshotTag : null;
-            callbacks.current.onBundle(message.data as TabBundle);
+            // Remembered only after the sections are handed over, so a tag
+            // never claims more than this page actually holds.
+            callbacks.current.onBundle(message.data as Partial<TabBundle>);
+            heldSnapshotTags = message.snapshotTags && typeof message.snapshotTags === "object" ? message.snapshotTags : null;
           }
           else if (["runner.changed", "runtime.changed", "prompts.changed", "answers.changed", "answer.added", "answer.changed", "tab.changed", "terminal.state"].includes(message.type)) {
             callbacks.current.onMessage(message);

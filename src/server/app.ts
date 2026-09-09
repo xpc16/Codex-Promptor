@@ -35,6 +35,7 @@ import { appendRestoreTimings, createPhaseRecorder, formatDuration, formatRestor
 import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js";
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
 import { entityTag, ifMatchSatisfied, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
+import { changedSnapshotSections, snapshotTags } from "./snapshot-sections.js";
 import { CLAUDE_EXIT_MARKER, CODEX_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
 import { isSlashCommandPrompt } from "./prompt-submit.js";
 import { RunnerManager } from "./queue.js";
@@ -2994,23 +2995,17 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           }
           if (message.snapshots !== false) {
             // A page asks for a snapshot when it reconnects, because it cannot
-            // know what it missed while it was away. Usually it missed nothing
-            // -- measured on the tunnel, these are 24 kB each and the single
-            // largest thing on the link after the terminal itself. So it says
-            // which bundle it already holds, and gets an answer only if that
-            // is no longer the one it would be sent.
-            //
-            // A content hash rather than the sequence counter: `sequences`
-            // lives in memory and restarts at zero, so a page that slept
-            // through a restart could hold a number the server had climbed
-            // back to with entirely different content behind it.
+            // know what it missed while it was away. It says which sections it
+            // already holds, and gets back only the ones that moved -- usually
+            // `runtime`, 455 bytes of a 24 kB bundle (see snapshot-sections).
             const held = (message as any).snapshotTags;
             for (const tabId of client.stateSubscriptions) {
               try {
                 const data = await readClientTab(tabId);
-                const snapshotTag = entityTag(JSON.stringify(data));
-                if (held && typeof held === "object" && held[tabId] === snapshotTag) continue;
-                sendClient(client, { type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, snapshotTag, data }, "snapshot");
+                const tags = snapshotTags(data);
+                const changed = changedSnapshotSections(data, tags, held && typeof held === "object" ? held[tabId] : null);
+                if (!changed) continue;
+                sendClient(client, { type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, snapshotTags: tags, data: changed }, "snapshot");
               } catch { /* tab may have been deleted */ }
             }
           }
