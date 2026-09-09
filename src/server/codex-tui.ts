@@ -16,6 +16,7 @@ import {
   type SubmitTimers,
 } from "./prompt-submit.js";
 import { inspectCodexSubmission, reconcileCodexTurn, transcriptCursor, type TranscriptCursor } from "./transcript-reconciliation.js";
+import { waitForNativeThreadIdle } from "./native-thread-idle.js";
 
 const COMPLETED_CACHE_LIMIT = 100;
 const execFileAsync = promisify(execFile);
@@ -355,8 +356,7 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
       ]);
       if (result) return result.value;
-      const recovered = await reconcileCodexTurn(active.recordCursor, active.threadId, active.turnId, active.prompt);
-      if (recovered) this.completeTurn(active, recovered.status, recovered.answer, "Codex turn ended without a completion hook.", recovered.completedAt);
+      await this.reconcileTurn(active);
     }
   }
 
@@ -365,18 +365,16 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
   }
 
   private async waitForThreadIdle(threadId: string, timeoutMs = 24 * 60 * 60 * 1000): Promise<void> {
-    if (!this.activeTurnIds(threadId).length) return;
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (!this.activeTurnIds(threadId).length) return;
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(done, Math.min(500, Math.max(1, deadline - Date.now())));
-        const manager = this;
-        function done() { clearTimeout(timer); manager.removeListener("turnCompleted", done); resolve(); }
-        this.once("turnCompleted", done);
-      });
-    }
-    throw new Error("THREAD_IDLE_TIMEOUT");
+    await waitForNativeThreadIdle(this, () => this.activeTurnIds(threadId).length > 0, async () => {
+      for (const turn of [...this.turns.values()]) {
+        if (turn.threadId === threadId) await this.reconcileTurn(turn);
+      }
+    }, timeoutMs);
+  }
+
+  private async reconcileTurn(active: TurnState): Promise<void> {
+    const recovered = await reconcileCodexTurn(active.recordCursor, active.threadId, active.turnId, active.prompt);
+    if (recovered) this.completeTurn(active, recovered.status, recovered.answer, "Codex turn ended without a completion hook.", recovered.completedAt);
   }
 
   private acceptPrompt(payload: any, sessionId: string): void {

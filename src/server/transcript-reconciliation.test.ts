@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { inspectCodexSubmission, inspectCursorSubmission, reconcileCodexTurn, transcriptCursor } from "./transcript-reconciliation.js";
+import { inspectCodexSubmission, inspectCursorSubmission, reconcileClaudeTurn, reconcileCodexTurn, transcriptCursor } from "./transcript-reconciliation.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -11,6 +11,25 @@ afterEach(async () => {
 });
 
 describe("provider transcript reconciliation", () => {
+  it("never uses an earlier or later Claude answer to declare the current prompt finished", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-claude-turn-boundary-"));
+    temporaryDirectories.push(directory);
+    const file = path.join(directory, "session.jsonl");
+    const user = (uuid: string, content: string) => ({ type: "user", uuid, message: { role: "user", content } });
+    const answer = (text: string) => ({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }], stop_reason: "end_turn" } });
+    const records: unknown[] = [user("old", "repeat"), answer("old answer"), user("current", "repeat")];
+    const write = () => fs.writeFile(file, records.map((record) => JSON.stringify(record)).join("\n") + "\n", "utf8");
+    await write();
+    const cursor = { path: file, offset: 0 };
+    expect(await reconcileClaudeTurn(cursor, "current", "repeat")).toBeNull();
+    records.push(user("later", "different"), answer("later answer"));
+    await write();
+    expect(await reconcileClaudeTurn(cursor, "current", "repeat")).toBeNull();
+    records.splice(3, 0, answer("current answer"));
+    await write();
+    expect(await reconcileClaudeTurn(cursor, "current", "repeat")).toMatchObject({ status: "completed", answer: "current answer" });
+  });
+
   it("uses Codex rollout boundaries to confirm and settle a lost hook", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-rollout-"));
     temporaryDirectories.push(directory);

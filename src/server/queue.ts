@@ -283,15 +283,38 @@ export class QueueRunner extends EventEmitter {
           await this.failRunner("SESSION_NOT_READY", "先连接或恢复一个编程代理对话。");
           return;
         }
-        await this.setRunnerState("waiting_for_thread");
+        // An empty queue has nothing to submit, even if a manual TUI turn is
+        // still busy. Settle before waiting and recheck under the arm lock.
+        const hasPending = bundle.prompts.prompts.some((item) => item.status === "pending"
+          && (!item.threadId || item.threadId === threadId)
+          && (bundle.runtime.runner.desiredState === "running" || this.oneShotPromptIds.has(item.id)));
+        if (!hasPending) {
+          if (this.oneShotPromptIds.size > 0) await this.discardUnavailableOneShots(threadId);
+          if (bundle.runtime.runner.desiredState !== "running") {
+            await this.settleAfterOneShot();
+            return;
+          }
+          if (await this.armIfEmpty(generation)) return;
+          continue;
+        }
+        if (bundle.runtime.runner.state !== "waiting_for_thread") await this.setRunnerState("waiting_for_thread");
         try { await this.agent().rpc.waitForThreadIdle(threadId, 120_000); } catch (error) {
-          if (generation !== this.loopGeneration) return;
+          if (this.stopping || generation !== this.loopGeneration) return;
+          const current = await this.storage.readTab(this.tabId);
+          if (!this.keepsRunning(current.runtime)) { await this.setRunnerState("paused"); return; }
+          if (current.tab.session.threadId !== threadId || current.tab.session.state !== "ready") continue;
+          // This is a bounded wait for a busy TUI, not a turn failure. Long
+          // manual/steered turns may cross any number of these windows. Keep
+          // queue intent and pending prompts intact, without emitting errors
+          // or rewriting the unchanged waiting state on every window.
+          if (error instanceof Error && error.message === "THREAD_IDLE_TIMEOUT") continue;
           await this.failRunner("THREAD_NOT_IDLE", error instanceof Error ? error.message : String(error));
           return;
         }
         if (generation !== this.loopGeneration) return;
         const fresh = await this.storage.readTab(this.tabId);
         if (!this.keepsRunning(fresh.runtime)) { await this.setRunnerState("paused"); return; }
+        if (fresh.tab.session.threadId !== threadId || fresh.tab.session.state !== "ready") continue;
         const prompt = fresh.runtime.runner.desiredState === "running"
           ? fresh.prompts.prompts.find((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId))
           : fresh.prompts.prompts.find((item) => this.oneShotPromptIds.has(item.id)

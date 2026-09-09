@@ -17,6 +17,7 @@ import {
   type SubmitTimers,
 } from "./prompt-submit.js";
 import { inspectCursorSubmission, reconcileCursorTurn, transcriptCursor, type TranscriptCursor } from "./transcript-reconciliation.js";
+import { waitForNativeThreadIdle } from "./native-thread-idle.js";
 import { writeFileAtomicWithRetry } from "./storage.js";
 
 const execFileAsync = promisify(execFile);
@@ -248,8 +249,7 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
       ]);
       if (result) return result.value;
-      const recovered = await reconcileCursorTurn(active.recordCursor, active.turnId);
-      if (recovered) this.completeTurn(active, recovered.status, recovered.answer, "Cursor turn ended without a completion hook.", recovered.completedAt);
+      await this.reconcileTurn(active);
     }
   }
 
@@ -258,16 +258,16 @@ export class CursorCliManager extends EventEmitter implements QueueBinding {
   }
 
   private async waitForThreadIdle(threadId: string, timeoutMs = 24 * 60 * 60 * 1000): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
-    while (this.activeTurnIds(threadId).length && Date.now() < deadline) {
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(done, Math.min(500, Math.max(1, deadline - Date.now())));
-        const manager = this;
-        function done() { clearTimeout(timer); manager.removeListener("turnCompleted", done); resolve(); }
-        this.once("turnCompleted", done);
-      });
-    }
-    if (this.activeTurnIds(threadId).length) throw new Error("THREAD_IDLE_TIMEOUT");
+    await waitForNativeThreadIdle(this, () => this.activeTurnIds(threadId).length > 0, async () => {
+      for (const turn of [...this.turns.values()]) {
+        if (turn.threadId === threadId) await this.reconcileTurn(turn);
+      }
+    }, timeoutMs);
+  }
+
+  private async reconcileTurn(active: CursorTurn): Promise<void> {
+    const recovered = await reconcileCursorTurn(active.recordCursor, active.turnId);
+    if (recovered) this.completeTurn(active, recovered.status, recovered.answer, "Cursor turn ended without a completion hook.", recovered.completedAt);
   }
 
   private acceptPrompt(payload: any, sessionId: string): void {

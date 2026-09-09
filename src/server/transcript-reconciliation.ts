@@ -164,18 +164,28 @@ export async function reconcileClaudeTurn(
   const answers: string[] = [];
   let completedAt: string | null = null;
   let ended = false;
+  let matched = false;
+  // Manual turns use the cursor saved at session start / the previous Stop.
+  // Never let an earlier answer in that slice declare the current turn idle.
+  const hasExactId = read.records.some((record) => claudeHumanPrompt(record)?.turnId === turnId);
   for (const record of read.records) {
     const candidate = claudeHumanPrompt(record);
-    if (candidate && (candidate.turnId === turnId || sameSubmittedPrompt(candidate.text, prompt))) {
-      startedAt = isoTime(record?.timestamp) ?? startedAt;
+    if (candidate) {
+      if (matched) break;
+      if (hasExactId ? candidate.turnId === turnId : sameSubmittedPrompt(candidate.text, prompt)) {
+        matched = true;
+        startedAt = isoTime(record?.timestamp);
+      }
       continue;
     }
+    if (!matched || record?.isSidechain) continue;
     if (record?.type !== "assistant" || String(record?.message?.role ?? "assistant") !== "assistant") continue;
     const text = contentText(record?.message?.content ?? record?.content).trim();
     if (text && !answers.includes(text)) answers.push(text);
     if (CLAUDE_END_REASONS.has(String(record?.message?.stop_reason ?? record?.stop_reason ?? ""))) {
       ended = true;
       completedAt = isoTime(record?.timestamp) ?? completedAt;
+      break;
     }
   }
   if (!ended) return null;

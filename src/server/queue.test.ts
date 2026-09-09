@@ -89,7 +89,7 @@ describe("queue pause boundary", () => {
       await waitUntil(async () => (await storage.readTab(tab.id)).runtime.runner.desiredState === "armed");
       const runtime = (await storage.readTab(tab.id)).runtime.runner;
       expect(runtime.state).toBe("paused");
-      expect(idleChecks).toBe(1);
+      expect(idleChecks).toBe(0);
       await runner.stop();
     } finally {
       await rm(root, { recursive: true, force: true });
