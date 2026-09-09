@@ -24,20 +24,6 @@ npm ci
 
 浏览器会打开 `http://127.0.0.1:4317/`，看到界面后 `Ctrl+C` 停掉。
 
-> **报「因为在此系统上禁止运行脚本」** —— Windows 默认不允许运行任何 `.ps1`。放开一次即可，不需要管理员：
->
-> ```powershell
-> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-> ```
->
-> 如果你是**下载 ZIP** 而不是 `git clone` 的，文件还带着「来自网络」标记，放开之后仍会报「未经数字签名」。再跑一次这个解掉：
->
-> ```powershell
-> Get-ChildItem -Recurse | Unblock-File
-> ```
->
-> 不想改系统设置也行，每次都写全：`powershell -ExecutionPolicy Bypass -File .\start.ps1`。
-
 ---
 
 ## 2. 装 cloudflared，接上隧道
@@ -147,46 +133,89 @@ node dist\server\main.js
 
 **先用本机 `http://127.0.0.1:4317/` 区分是应用的问题还是隧道的问题——它永远不受隧道影响。**
 
-| 现象 | 先查 |
+| 现象 | 看哪一节 |
 |---|---|
+| 跑 `.\start.ps1` 报「禁止运行脚本」 | 7.1 |
+| 打开 Codex 对话报 `CODEX_NATIVE_EXECUTABLE_NOT_FOUND` | 7.2 |
 | 域名转圈或 502 | `Get-Service cloudflared` 是否 Running；本机 4317 能否打开 |
 | 远端停在「未获 Promptor 授权」 | `data\private\remote-access.json` 里的域名对不对；改完重启了没 |
-| 打开 Codex 对话报 `CODEX_NATIVE_EXECUTABLE_NOT_FOUND` | `codex` 不在 PATH 上。见下方 |
 | 用着用着整个应用没了 | `CODEX_PROMPTOR_AUTO_EXIT` 没设成 `0` |
 | 提示要密钥但你没设过 | 本机看看是不是有个叫 `E2EE` 的标签，删掉即关闭加密 |
 | 本机 4317 也打不开 | `npm ci` 跑过没；Node 版本是不是 22～24 |
 
-### `CODEX_NATIVE_EXECUTABLE_NOT_FOUND`
+### 7.1 「因为在此系统上禁止运行脚本」
 
-打开一个 Codex 对话时报这个，意思只有一个：**应用没能在 PATH 上找到 `codex`**。它启动前会执行 `where.exe codex`，找不到就停在这里。
+Windows 默认的执行策略是 `Restricted`，不允许运行任何 `.ps1`。和这个项目无关，装过别的 PowerShell 工具的机器早就改过了。
 
-自己先跑一遍同一条命令，看它说什么：
+放开一次，**不需要管理员**：
 
 ```powershell
-where.exe codex
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 ```
 
-- **什么都没输出，但你确实装过** —— npm 的全局目录不在 PATH 上。应用会自己去 `%APPDATA%
-pm` 和 `npm prefix -g` 说的位置找，所以**先关掉重开应用试一次**，多半就好了。
-- **什么都没输出，也确实没装** —— 装上 `codex` 再重开应用；只想用 Claude Code 或终端对话的话，这个对话打不开，不影响其他对话。
-- **有输出，但应用仍然报错** —— 进程的 PATH 在启动那一刻就定死了，后装的东西它看不见。关掉重开应用即可。
-- **装在了别处** —— 应用会自己找 npm 的全局目录和官方安装器的 `%LOCALAPPDATA%\OpenAI\Codexin\`，所以先**重开一次应用**。还不行再往下：先找出真实位置：
+确认改到了：
+
+```powershell
+Get-ExecutionPolicy -List
+```
+
+`CurrentUser` 那行应该是 `RemoteSigned`。然后重新跑 `.\start.ps1`。
+
+**如果接着报「未经数字签名」**，说明你是下载 ZIP 解压的，文件带着「来自网络」的标记，`RemoteSigned` 拒绝这类未签名脚本。解掉标记：
+
+```powershell
+cd D:\codex_promptor
+Get-ChildItem -Recurse | Unblock-File
+```
+
+（`git clone` 下来的不会有这个问题。）
+
+**完全不想改系统设置**也行，每次都写全：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+### 7.2 `CODEX_NATIVE_EXECUTABLE_NOT_FOUND`
+
+打开 Codex 对话时报这个，意思是**应用没找到 `codex` 可执行文件**。只影响这一个对话，Claude Code 和终端对话不受影响。
+
+> 能看到历史记录是正常的——这些对话是应用第一次启动时从你自己的 `~/.codex` 里导入的。**看历史不需要装 codex，继续对话才需要。**
+
+**第一步：重开一次应用。** 进程的 PATH 在启动那一刻就定死了，后装的东西它看不见；而且应用会自动去这几个地方找，重开一次多半就好了：
+
+- PATH（`where.exe codex`）
+- 官方安装器的 `%LOCALAPPDATA%\OpenAI\Codex\bin\<最新构建>\`
+- npm 全局目录（`%APPDATA%\npm`、`npm prefix -g`）
+
+**还不行，先确认到底装没装、装在哪：**
+
+```powershell
+Get-ChildItem -Path $env:APPDATA, $env:LOCALAPPDATA -Recurse -Filter codex.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+```
+
+- **什么都没找到** —— 确实没装。装上再重开应用：
 
   ```powershell
-  Get-ChildItem -Path $env:APPDATA, $env:LOCALAPPDATA -Recurse -Filter codex.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+  npm i -g @openai/codex
   ```
 
-  把找到的路径写进 `promptor.cmd`，放在 `node` 那行**之前**：
+- **找到了路径** —— 直接告诉应用。写进 `promptor.cmd`，放在 `node` 那行**之前**：
 
   ```bat
   set CODEX_PROMPTOR_CODEX_EXECUTABLE=C:\完整\路径\codex.exe
   ```
 
-  > **`set X=Y` 是 cmd 的写法，只在 `.cmd` 文件里有效。** 在 PowerShell 里敲它不会设置环境变量，也不会报错——`set` 在那里是 `Set-Variable` 的别名，做的是完全不同的事。PowerShell 里要写 `$env:CODEX_PROMPTOR_CODEX_EXECUTABLE = "C:\完整\路径\codex.exe"`，而且**只对当前这个窗口有效**，应用必须从同一个窗口启动。
+  临时试一下（**不改文件**）用这两条，注意必须在同一个窗口里启动：
 
-报错信息里会列出它**实际找过的位置**，对照一下就知道差在哪。
+  ```powershell
+  $env:CODEX_PROMPTOR_CODEX_EXECUTABLE = "C:\完整\路径\codex.exe"
+  .\start.ps1
+  ```
 
-顺带一提：这些 Codex 对话是应用第一次启动时从你自己的 `~/.codex` 里自动导入的，所以能看到历史记录是正常的——**看历史不需要装 codex，继续对话才需要**。
+> **`set X=Y` 只在 `.cmd` 文件里有效。** 在 PowerShell 里敲它不设置环境变量，**也不报错**——`set` 在那里是 `Set-Variable` 的别名，做的是完全不同的事。PowerShell 里必须用 `$env:名字 = "值"`。
+
+报错信息里会列出它**实际找过的每一个路径**，和上面 `Get-ChildItem` 的结果一对照，就知道差在哪。
 
 ---
 
