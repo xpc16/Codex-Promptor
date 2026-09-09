@@ -69,7 +69,9 @@ cloudflared.exe service uninstall  # 彻底卸掉
 
 打开 `https://friend.example.com` → 跳到 Cloudflare 登录页 → 填你的邮箱 → 收 6 位验证码（10 分钟有效）→ 进入。
 
-收不到邮件：看垃圾箱；确认邮箱拼写和朋友放行的一致；企业邮箱把 `noreply@notify.cloudflare.com` 加白名单。
+- **提示「This One-Time PIN has already been used」（第一次填经常撞上）**：邮件里那个「登录」按钮和这 6 位码**是同一个凭证**，谁先用掉算谁的。邮箱的反钓鱼扫描、链接预览会替你先点开它，等你把码填进去时已经作废了。点 **Request new code** 拿一个新的，通常第二次就过。
+- **每请求一次新码，上一个立刻失效** —— 收件箱里堆了几封时，只有最新那封的码是有效的。
+- 老是撞上，或者根本收不到邮件：看垃圾箱；确认邮箱拼写和朋友放行的一致；把 `noreply@notify.cloudflare.com` 加进邮箱安全工具的白名单（企业邮箱尤其需要）。
 
 ---
 
