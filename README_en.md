@@ -21,7 +21,7 @@ Each Codex tab uses an independent App Server. When a new conversation is create
 Requirements: Windows, Node.js 22–24, npm. A **Terminal** conversation (a plain PowerShell with no agent attached) needs no CLI at all; agent conversations need at least one signed-in CLI on `PATH`: `codex` for Codex (protocol baseline: `codex-cli 0.147.0`), `claude` for Claude Code (locally verified with 2.1.228), or `agent` for Cursor CLI. Check with `codex --version`, `claude --version`, or `agent --version`. Selecting a provider whose executable is missing produces an explicit pre-launch error and does not affect the others.
 
 ```powershell
-.\setup.ps1
+npm ci
 .\start.ps1
 ```
 

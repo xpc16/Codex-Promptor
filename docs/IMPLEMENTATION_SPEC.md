@@ -567,7 +567,6 @@ codex-promptor:<tabId>:<promptId>:<attemptNo>
 codex_promptor/
 ├─ docs/
 │  └─ IMPLEMENTATION_SPEC.md
-├─ setup.ps1
 ├─ start.ps1
 ├─ package.json
 ├─ package-lock.json
@@ -1192,19 +1191,7 @@ Queue turn 成功时：
 
 ## 17. 启动脚本
 
-### 17.1 `setup.ps1`
-
-职责：
-
-1. 检查 Windows PowerShell 5.1 或更高。
-2. 检查 Node.js 24 和 npm。
-3. 检查 `codex` 位于 PATH。
-4. 检查 `codex --version` 精确为 `0.147.0`。
-5. 执行 `npm ci`。
-6. 执行类型检查、测试和生产构建。
-7. 创建初始 `data/` 结构，但不覆盖现有数据。
-
-脚本不得自动登录 Codex、修改用户 Codex 配置或安装不同 Codex 版本；只输出明确指引。
+安装不需要脚本：`npm ci` 之后 `start.ps1` 会自行构建，`data/` 结构由 `StorageService.ensure()` 在启动时创建。曾经存在的 `setup.ps1` 强制 `codex --version` 精确等于某个版本，这在只用 Claude、Cursor 或终端会话时是一道假门槛。
 
 ### 16.9 终端会话（provider `shell`）
 
@@ -1217,7 +1204,7 @@ Queue turn 成功时：
 - 参与重启恢复：`tabsToRestore` 以「有 threadId **或** 是终端」为条件，工作目录才是终端可恢复的依据。
 - 用户在终端里执行 `exit` 属于正常结束，不写入「代理 TUI 意外退出」错误。
 
-### 17.2 `start.ps1`
+### 17.1 `start.ps1`
 
 职责：
 
@@ -1344,7 +1331,7 @@ src/
 
 第一版只有在以下条件全部满足时才算完成：
 
-- [ ] `setup.ps1` 和 `start.ps1` 能在目标 Windows 环境完成安装与启动。
+- [ ] `npm ci` 与 `start.ps1` 能在目标 Windows 环境完成安装与启动。
 - [ ] 页面只通过 loopback 访问，并启用本地认证和 Origin 校验。
 - [ ] 左侧标签可分组、排序、重命名和恢复性删除。
 - [ ] 两级水平分栏和状态/终端垂直分栏均可调整并持久化。

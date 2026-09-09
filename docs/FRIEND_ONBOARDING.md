@@ -19,13 +19,10 @@ cd D:\
 git clone https://github.com/xpc16/Codex-Promptor.git codex_promptor
 cd codex_promptor
 npm ci
-npm run build
 .\start.ps1
 ```
 
-浏览器会打开 `http://127.0.0.1:4317/`。看到界面就成了，`Ctrl+C` 停掉继续。
-
-> 别用 `.\setup.ps1`——它强制检查 `codex` 存在且版本正好是 `codex-cli 0.147.0`，没装 codex 会直接报错退出。
+`start.ps1` 会自己构建再启动，浏览器打开 `http://127.0.0.1:4317/`。看到界面就成了，`Ctrl+C` 停掉继续。
 
 ---
 
@@ -54,9 +51,9 @@ cloudflared.exe service uninstall  # 彻底卸掉
 
 ---
 
-## 3. 让应用开机自启（顺便设两个必须的环境变量）
+## 3. 让应用一直跑着
 
-`Win+R` 输入 `shell:startup`，在打开的文件夹里新建 `promptor.cmd`：
+按 `Win+R`，输入 `shell:startup`，回车。在弹出的文件夹里新建一个文本文件，改名成 `promptor.cmd`，内容如下——**只需要改两处**：
 
 ```bat
 @echo off
@@ -67,14 +64,17 @@ cd /d D:\codex_promptor
 node dist\server\main.js
 ```
 
-这两个变量**不设会出事**：
+1. 第 2 行的 `friend.example.com` → 换成朋友给你的子域名（**不带 `https://`，一字不差**）
+2. 第 5 行的 `D:\codex_promptor` → 换成你上一步 clone 的实际路径
 
-- **`CODEX_PROMPTOR_TRUSTED_HOSTS`** —— 换成你的子域名，不带 `https://`，必须**完全一致**。应用默认只信任 `127.0.0.1`，不设的话页面能打开但**终端一直空白**。
-- **`CODEX_PROMPTOR_AUTO_EXIT=0`** —— 默认行为是最后一个页面关闭 30 秒后**退出整个进程**。远程时手机切后台、地铁断网、笔记本合盖都可能被判成「页面关了」，然后它会杀掉自己和所有正在跑的会话。
+保存后**双击它**，应用就跑起来了；以后每次开机自动跑。想停就关掉那个黑窗口。
 
-（`CODEX_PROMPTOR_OPEN=0` 只是让它别每次开机弹浏览器。）
+> 这三行 `set` 一行都不能省，因为它们的失败方式都不像报错：
+> 第一行不设 → 远程页面**能打开，但终端永远空白**；
+> 第二行不设 → 手机切后台或断网 30 秒，它会**杀掉自己和所有正在跑的会话**；
+> 第三行不设 → 每次开机弹一个浏览器窗口。
 
-**更新代码后**：`git pull; npm ci; npm run build`，然后关掉窗口重新跑一遍 `promptor.cmd`。
+**更新代码后**：`git pull` → `npm ci` → 关掉黑窗口 → 重新双击 `promptor.cmd`。
 
 ---
 
@@ -146,6 +146,6 @@ node dist\server\main.js
 | 页面出来了但终端一直空白 | 八成是 `CODEX_PROMPTOR_TRUSTED_HOSTS` 没设或拼错 |
 | 用着用着整个应用没了 | `CODEX_PROMPTOR_AUTO_EXIT` 没设成 `0` |
 | 提示要密钥但你没设过 | 本机看看是不是有个叫 `E2EE` 的标签，删掉即关闭加密 |
-| 本机 4317 也打不开 | `npm run build` 跑过没；Node 版本是不是 22～24 |
+| 本机 4317 也打不开 | `npm ci` 跑过没；Node 版本是不是 22～24 |
 
 想单方面切断远程访问：`net stop cloudflared`。反过来，域名所有者也能随时关掉你的访问——这是双向的。

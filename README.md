@@ -21,7 +21,7 @@ Codex 标签各自使用独立 App Server。新建时由真实远程 TUI 直接�
 环境要求：Windows、Node.js 22–24、npm。如果只用「终端」类型的对话（纯 PowerShell，不接代理），不需要安装任何 CLI；使用代理对话则需要至少一种已登录且位于 `PATH` 的 CLI：Codex 使用 `codex`（协议基准为 `codex-cli 0.147.0`）、Claude Code 使用 `claude`（本机验证版本 2.1.228）、Cursor CLI 使用 `agent`。可先分别运行 `codex --version`、`claude --version` 或 `agent --version` 检查；未安装的提供商会在连接前明确报错，不影响其他提供商。
 
 ```powershell
-.\setup.ps1
+npm ci
 .\start.ps1
 ```
 
