@@ -320,6 +320,37 @@ describe("answer WebSocket events", () => {
 });
 
 describe("launch restoration state", () => {
+  it("uses the same restore eligibility when saving shell and encryption tabs", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "promptor-threadless-restore-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      const ids = new Map<string, string>();
+      for (const name of ["shell", "e2ee", "missing-key", "missing-passphrase", "draft-agent"]) {
+        const tab = await storage.createTab(name);
+        ids.set(name, tab.id);
+        await storage.updateTab(tab.id, (current) => ({
+          ...current,
+          session: {
+            ...current.session,
+            provider: name === "shell" ? "shell" : name === "draft-agent" ? "claude" : "e2ee",
+            state: "ready",
+            workingDirectory: name === "missing-passphrase" ? null : root,
+            e2ee: ["e2ee", "missing-passphrase"].includes(name) ? { salt: "test-salt", iterations: 1, fingerprint: "test-fingerprint" } : null,
+          },
+        }));
+      }
+      const expected = [ids.get("shell")!, ids.get("e2ee")!];
+      expect(tabsToRestore(await storage.listTabMeta())).toEqual(expected);
+      expect(await recordOpenSessionsForNextLaunch(storage)).toEqual(expected);
+      for (const tab of await storage.listTabMeta()) {
+        expect(tab.session.reopenOnLaunch).toBe(expected.includes(tab.id));
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("restores marked tabs, supports legacy ready tabs, and records the final open set", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-open-state-"));
     try {

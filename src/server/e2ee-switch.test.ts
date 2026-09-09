@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { decodeBase64 } from "../shared/e2ee-keys.js";
+import { E2EE_BODY_HEADER } from "../shared/e2ee-http.js";
 import { createApp, type PromptorApp } from "./app.js";
 import { deriveMasterKey } from "./e2ee-key-material.js";
 import { openHttpBody } from "./e2ee-http-body.js";
@@ -56,6 +57,61 @@ describe("the encryption switch", () => {
     const tabId = (await app.promptor.storage.createTab("工作机加密")).id;
     await turnOn(tabId, "一句只有我知道的话");
     expect((await app.promptor.storage.getTabMeta(tabId)).name).toBe("工作机加密");
+  });
+
+  it.each(["normal", "marked-closed", "legacy-ready"] as const)("restores encryption before accepting requests after a %s restart", async (savedState) => {
+    const passphrase = "restart test passphrase";
+    const tabId = (await app.promptor.storage.createTab("E2EE")).id;
+    expect((await turnOn(tabId, passphrase)).statusCode).toBe(200);
+    const before = (await app.promptor.storage.getTabMeta(tabId)).session;
+    const material = before.e2ee!;
+    const master = await deriveMasterKey(passphrase, Buffer.from(decodeBase64(material.salt)), material.iterations);
+
+    await app.promptor.close();
+    expect((await app.promptor.storage.getTabMeta(tabId)).session.reopenOnLaunch).toBe(true);
+    await app.close();
+    if (savedState !== "normal") {
+      await app.promptor.storage.updateTab(tabId, (tab) => ({
+        ...tab,
+        session: { ...tab.session, state: savedState === "marked-closed" ? "closed" : "ready", reopenOnLaunch: savedState !== "legacy-ready" },
+      }));
+    }
+    app = await createApp(root);
+    await app.ready();
+
+    // The main entry point listens before starting CLI restoration. Even in
+    // that interval the first remote response must already use the old key.
+    const remote = { "x-codex-promptor-token": app.promptor.token, host: REMOTE_HOST };
+    const bootstrap = await app.inject({ method: "GET", url: "/api/bootstrap", headers: remote });
+    expect(bootstrap.json().data.e2ee).toMatchObject({ on: true, required: true, ...material });
+    const response = await app.inject({ method: "GET", url: `/api/tabs/${tabId}`, headers: remote });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers[E2EE_BODY_HEADER]).toBeTruthy();
+    expect(JSON.parse(openHttpBody(master, new Uint8Array(response.rawPayload))!).data.tab.id).toBe(tabId);
+
+    const restored = (await app.promptor.storage.getTabMeta(tabId)).session;
+    expect(restored).toMatchObject({ state: "ready", reopenOnLaunch: true, workingDirectory: passphrase, e2ee: material });
+    expect(app.promptor.pty.has(tabId)).toBe(false);
+    expect(await app.promptor.restoreOpenSessions()).toMatchObject({ restored: [tabId], failed: [] });
+    // The staggered restore must not toggle encryption a second time and
+    // disconnect devices that already completed their handshake.
+    expect((await app.promptor.storage.getTabMeta(tabId)).session.connectedAt).toBe(restored.connectedAt);
+  });
+
+  it("keeps encryption off across a restart when it was explicitly closed", async () => {
+    const tabId = (await app.promptor.storage.createTab("E2EE")).id;
+    await turnOn(tabId, "closed switch test passphrase");
+    const material = (await app.promptor.storage.getTabMeta(tabId)).session.e2ee;
+    const closed = await app.inject({ method: "POST", url: `/api/tabs/${tabId}/session/close`, headers: local });
+    expect(closed.statusCode).toBe(200);
+    await app.promptor.close();
+    await app.close();
+    app = await createApp(root);
+    await app.ready();
+    expect(await app.promptor.restoreOpenSessions()).toMatchObject({ restored: [], failed: [] });
+    expect((await app.promptor.storage.getTabMeta(tabId)).session).toMatchObject({ state: "closed", reopenOnLaunch: false, e2ee: material });
+    const bootstrap = await app.inject({ method: "GET", url: "/api/bootstrap", headers: { "x-codex-promptor-token": app.promptor.token, host: REMOTE_HOST } });
+    expect(bootstrap.json().data.e2ee).toEqual({ on: false, required: false });
   });
 
   it("refuses a second one, rather than letting tab order pick the winner", async () => {

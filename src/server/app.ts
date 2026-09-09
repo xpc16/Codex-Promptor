@@ -1378,6 +1378,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return task;
   };
 
+  // Encryption must be back before createApp returns and the HTTP listener
+  // opens. Restoring it with the staggered CLI launches would temporarily
+  // serve remote requests in the clear. Reuse the normal reopen path and
+  // remember its result so the later restore queue does not reopen it again.
+  const startupEncryptionRestores = new Map<string, TerminalReopenResult>();
+  for (const tabId of startupOpenTabIds) {
+    if ((await storage.getTabMeta(tabId)).session.provider !== "e2ee") continue;
+    startupEncryptionRestores.set(tabId, await reopenTerminal(tabId));
+  }
+
   let restoreOpenSessionsPromise: Promise<RestoreOpenSessionsSummary> | null = null;
   /**
    * Brings in every conversation this machine has had that is long enough to
@@ -1464,7 +1474,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const traces: RestoreTrace[] = [];
       const queue = runRestoreQueue(plan, RESTORE_STAGGER_MS, async (tabId) => {
         const recorder = createPhaseRecorder();
-        const result = await reopenTerminal(tabId, recorder);
+        const result = startupEncryptionRestores.get(tabId) ?? await reopenTerminal(tabId, recorder);
         if (result.ok) restored.push(tabId);
         else failed.push({ tabId, code: result.code, message: result.message });
         const tab = names.get(tabId);
@@ -3456,13 +3466,19 @@ async function clearSessionNotReadyError(storage: StorageService, tabId: string)
   });
 }
 
+function hasRestorableSession(tab: TabMeta): boolean {
+  const session = tab.session;
+  // Shell and E2EE tabs have no agent thread. E2EE reuses the saved passphrase
+  // and key material; an unfinished encryption setup is not restorable.
+  return Boolean(session.workingDirectory && (session.provider === "e2ee"
+    ? session.e2ee
+    : session.threadId || session.provider === "shell"));
+}
+
 export function tabsToRestore(tabs: TabMeta[]): string[] {
   return tabs
     .filter((tab) => Boolean(
-      // A terminal has no thread; its working directory is what makes it
-      // restorable, so requiring a threadId here would silently drop it.
-      (tab.session.threadId || tab.session.provider === "shell")
-      && tab.session.workingDirectory
+      hasRestorableSession(tab)
       && (tab.session.reopenOnLaunch || tab.session.state === "ready"),
     ))
     .map((tab) => tab.id);
@@ -3471,7 +3487,7 @@ export function tabsToRestore(tabs: TabMeta[]): string[] {
 export async function recordOpenSessionsForNextLaunch(storage: StorageService): Promise<string[]> {
   const tabs = await storage.listTabMeta();
   const openIds = tabs
-    .filter((tab) => tab.session.state === "ready" && tab.session.threadId && tab.session.workingDirectory)
+    .filter((tab) => tab.session.state === "ready" && hasRestorableSession(tab))
     .map((tab) => tab.id);
   const open = new Set(openIds);
   for (const tab of tabs) {
