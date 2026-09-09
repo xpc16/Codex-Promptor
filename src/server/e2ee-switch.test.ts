@@ -2,7 +2,10 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { decodeBase64 } from "../shared/e2ee-keys.js";
 import { createApp, type PromptorApp } from "./app.js";
+import { deriveMasterKey } from "./e2ee-key-material.js";
+import { openHttpBody } from "./e2ee-http-body.js";
 
 /**
  * The switch tab's own rules: what it is called, and that there is only one.
@@ -14,6 +17,7 @@ import { createApp, type PromptorApp } from "./app.js";
  */
 
 const LOCAL_HOST = "127.0.0.1:4317";
+const REMOTE_HOST = "promptor.example.com";
 
 describe("the encryption switch", () => {
   let app: PromptorApp;
@@ -70,7 +74,7 @@ describe("the encryption switch", () => {
     const bootstrap = await app.inject({
       method: "GET",
       url: "/api/bootstrap",
-      headers: { "x-codex-promptor-token": app.promptor.token, host: "promptor.example.com" },
+      headers: { "x-codex-promptor-token": app.promptor.token, host: REMOTE_HOST },
     });
     expect(bootstrap.json().data.e2ee.fingerprint).toBe(declared);
   });
@@ -84,6 +88,48 @@ describe("the encryption switch", () => {
 
     expect((await turnOn(tabId, "换了一句新的")).statusCode).toBe(200);
     expect((await app.promptor.storage.getTabMeta(tabId)).session.e2ee!.fingerprint).not.toBe(before);
+  });
+
+  it("cannot be turned off, reopened or deleted from anywhere but this machine", async () => {
+    // Turning it on is loopback-only because letting the far end choose the
+    // key is the same as having no key. Turning it *off* has to be, for a
+    // stronger reason: a remote page that can close or delete the switch takes
+    // encryption away from everyone, from the far side of the thing it
+    // protects.
+    const tabId = (await app.promptor.storage.createTab("新对话")).id;
+    await turnOn(tabId, "一句只有我知道的话");
+    const declared = (await app.promptor.storage.getTabMeta(tabId)).session.e2ee!.fingerprint;
+
+    // The refusal itself crosses the tunnel sealed, like every other body, so
+    // reading it back means holding the key -- which is the point.
+    const material = (await app.promptor.storage.getTabMeta(tabId)).session.e2ee!;
+    const master = await deriveMasterKey("一句只有我知道的话", Buffer.from(decodeBase64(material.salt)), material.iterations);
+
+    const remote = { "x-codex-promptor-token": app.promptor.token, host: REMOTE_HOST, origin: `https://${REMOTE_HOST}` };
+    for (const [method, url] of [
+      ["POST", `/api/tabs/${tabId}/session/close`],
+      ["POST", `/api/tabs/${tabId}/terminal/reopen`],
+      ["DELETE", `/api/tabs/${tabId}`],
+    ] as const) {
+      const refused = await app.inject({ method, url, headers: remote });
+      expect(refused.statusCode, `${method} ${url}`).toBe(403);
+      const opened = openHttpBody(master, new Uint8Array(refused.rawPayload));
+      expect(JSON.parse(opened!).error.code, `${method} ${url}`).toBe("E2EE_LOCAL_ONLY");
+    }
+
+    // And it is still on, with the same key.
+    const tab = await app.promptor.storage.getTabMeta(tabId);
+    expect(tab.session.state).toBe("ready");
+    expect(tab.session.e2ee!.fingerprint).toBe(declared);
+  });
+
+  it("still lets a remote page close and delete an ordinary conversation", async () => {
+    // The guard is about the switch, not about remote pages generally --
+    // remote has full parity everywhere else.
+    const tabId = (await app.promptor.storage.createTab("普通对话")).id;
+    const remote = { "x-codex-promptor-token": app.promptor.token, host: REMOTE_HOST, origin: `https://${REMOTE_HOST}` };
+    const deleted = await app.inject({ method: "DELETE", url: `/api/tabs/${tabId}`, headers: remote });
+    expect(deleted.statusCode).toBe(200);
   });
 
   it("frees the slot when the switch is closed, and refuses to reopen into a taken one", async () => {

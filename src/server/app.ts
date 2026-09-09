@@ -2222,6 +2222,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
 
   app.delete("/api/tabs/:tabId", async (request, reply) => {
     const tabId = String((request.params as any).tabId);
+    if (!await mayChangeEncryption(tabId, request.headers)) {
+      return apiError(reply, 403, "E2EE_LOCAL_ONLY", "Encryption can only be changed from this machine.");
+    }
     await awaitThreadSwitch(tabId);
     // The tab directory is moved immediately below; do not enqueue a terminal
     // runtime write that can race the directory rename on Windows.
@@ -2682,8 +2685,26 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     } catch (error) { return apiError(reply, 502, "HISTORY_SYNC_FAILED", error instanceof Error ? error.message : String(error), true); }
   });
 
+  /**
+   * Whether this request may change the encryption switch.
+   *
+   * Turning encryption on is loopback-only because letting the far end choose
+   * the key is the same as having no key. Turning it *off* has to be loopback
+   * too, and for a stronger reason: a remote page that can close or delete the
+   * switch can take encryption away from everyone, which is the whole
+   * protection, undone by whoever is already on the other side of it.
+   */
+  const mayChangeEncryption = async (tabId: string, headers: FastifyRequest["headers"]): Promise<boolean> => {
+    if (isLocalBrowserRequest(headers)) return true;
+    const tab = await storage.getTabMeta(tabId).catch(() => null);
+    return tab?.session.provider !== "e2ee";
+  };
+
   app.post("/api/tabs/:tabId/terminal/reopen", async (request, reply) => {
     const tabId = String((request.params as any).tabId);
+    if (!await mayChangeEncryption(tabId, request.headers)) {
+      return apiError(reply, 403, "E2EE_LOCAL_ONLY", "Encryption can only be changed from this machine.");
+    }
     const result = await reopenTerminal(tabId);
     if (!result.ok) return apiError(reply, result.statusCode, result.code, result.message, true);
     return reply.send({ data: result.bundle });
@@ -2691,6 +2712,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
 
   app.post("/api/tabs/:tabId/session/close", async (request, reply) => {
     const tabId = String((request.params as any).tabId);
+    if (!await mayChangeEncryption(tabId, request.headers)) {
+      return apiError(reply, 403, "E2EE_LOCAL_ONLY", "Encryption can only be changed from this machine.");
+    }
     try {
       await awaitThreadSwitch(tabId);
       const bundle = await storage.readTab(tabId);
