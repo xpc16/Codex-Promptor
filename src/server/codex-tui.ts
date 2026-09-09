@@ -650,23 +650,80 @@ export function buildCodexTuiLaunch(
   return { executable: "codex", args };
 }
 
-/** Resolve the npm `.cmd` shim to Node + codex.js before the exact-argv launch. */
+/**
+ * Turns one candidate path into a launch, or null when it cannot be used.
+ *
+ * A `.exe` is launched directly. An npm `.cmd` shim is not: it is a batch
+ * file, and handing it to the exact-argv launch would put a shell in the
+ * middle of the arguments. The package it points at sits beside it, so this
+ * resolves to Node plus the CLI's own entry point instead.
+ */
+async function codexLaunchFrom(candidate: string, launch: AgentProcessLaunch): Promise<AgentProcessLaunch | null> {
+  if (/\.exe$/i.test(candidate)) {
+    try { await fs.access(candidate); } catch { return null; }
+    return { ...launch, executable: candidate };
+  }
+  if (!/\.cmd$/i.test(candidate)) return null;
+  const cli = path.join(path.dirname(candidate), "node_modules", "@openai", "codex", "bin", "codex.js");
+  try { await fs.access(cli); } catch { return null; }
+  return { executable: process.execPath, args: [cli, ...launch.args] };
+}
+
+/**
+ * Where npm puts a global install, for when nothing on PATH says where codex
+ * is.
+ *
+ * `%APPDATA%\npm` is npm's default global prefix on Windows and costs nothing
+ * to check. `npm prefix -g` covers a prefix somebody changed, and is asked
+ * only once the free guess has already missed -- it spawns npm, which is not
+ * something to do on a launch path that normally succeeds at `where.exe`.
+ */
+async function npmGlobalDirectories(): Promise<string[]> {
+  const directories: string[] = [];
+  const appData = process.env.APPDATA;
+  if (appData) directories.push(path.join(appData, "npm"));
+  try {
+    const result = await execFileAsync("npm.cmd", ["prefix", "-g"], { windowsHide: true });
+    const prefix = String(result.stdout).trim();
+    if (prefix && !directories.includes(prefix)) directories.push(prefix);
+  } catch { /* npm is not reachable either; the guess above is all there is */ }
+  return directories;
+}
+
+/**
+ * Finds the codex binary, or says so plainly.
+ *
+ * PATH first, because that is where it normally is. But "installed" and "on
+ * this process's PATH" are different questions: npm's global bin directory is
+ * not always on PATH, and a process keeps whatever PATH it launched with, so a
+ * codex installed after the app started is invisible to `where.exe`. Telling
+ * somebody who has plainly installed it that it cannot be found is a bad
+ * answer when the place npm would have put it is one `access` away.
+ */
 export async function resolveCodexTuiLaunch(launch: AgentProcessLaunch): Promise<AgentProcessLaunch> {
   const configured = String(process.env.CODEX_PROMPTOR_CODEX_EXECUTABLE ?? "").trim();
   if (configured) return { ...launch, executable: configured };
   if (process.platform !== "win32") return launch;
+
+  const candidates: string[] = [];
   try {
     const result = await execFileAsync("where.exe", ["codex"], { windowsHide: true });
-    const candidates = String(result.stdout).split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
-    const executable = candidates.find((value) => /\.exe$/i.test(value));
-    if (executable) return { ...launch, executable };
-    const shim = candidates.find((value) => /\.cmd$/i.test(value));
-    if (shim) {
-      const cli = path.join(path.dirname(shim), "node_modules", "@openai", "codex", "bin", "codex.js");
-      await fs.access(cli);
-      return { executable: process.execPath, args: [cli, ...launch.args] };
+    candidates.push(...String(result.stdout).split(/\r?\n/).map((value) => value.trim()).filter(Boolean));
+  } catch { /* not on PATH; the npm directories below are the second question */ }
+  const onPath = candidates.length > 0;
+  if (!onPath) {
+    for (const directory of await npmGlobalDirectories()) {
+      candidates.push(path.join(directory, "codex.exe"), path.join(directory, "codex.cmd"));
     }
-  } catch { /* report the stable adapter error below */ }
+  }
+
+  // A real binary beats a shim wherever both turn up, so every `.exe` is tried
+  // before any `.cmd`.
+  const ordered = [...candidates.filter((value) => /\.exe$/i.test(value)), ...candidates];
+  for (const candidate of ordered) {
+    const resolved = await codexLaunchFrom(candidate, launch);
+    if (resolved) return resolved;
+  }
   throw new Error("CODEX_NATIVE_EXECUTABLE_NOT_FOUND");
 }
 
