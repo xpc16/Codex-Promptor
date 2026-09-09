@@ -74,10 +74,18 @@ export function attachSocket(socket: GateSocket, onReady: () => void): void {
  * on. That boundary has to be exactly here: a frame sealed before the server
  * installed its own keys would be dropped, and a dropped frame is a counter
  * the two ends no longer agree on.
+ *
+ * And nothing at all in between. A connection that has not proved itself is
+ * answered with silence -- the far end refuses every message but the proof --
+ * so a frame sent in that window is bytes paid for and thrown away. Measured
+ * on the tunnel over 38 minutes: 55 of 75 subscribes, about 38 kB, every one
+ * of them re-sent as soon as the handshake landed. Dropping them here changes
+ * nothing about what arrives, only about what is paid for.
  */
 export function gateSend(socket: GateSocket, text: string): void {
   const wire = sockets.get(socket as object)?.wire;
   if (wire) { wire.send(text); return; }
+  if (state.required) return;
   try { socket.send(text); } catch { /* closed under us */ }
 }
 

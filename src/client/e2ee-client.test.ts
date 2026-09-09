@@ -5,7 +5,7 @@ import { HANDSHAKE_READY, handshakeAad } from "../shared/e2ee-handshake.js";
 import { deriveMasterKey, fingerprintOf, subKey } from "../server/e2ee-key-material.js";
 import { handshakeAnswered, open, seal, startHandshake } from "../server/e2ee-session.js";
 import { answerChallenge, deriveSessionKey } from "./e2ee-client.js";
-import { applyRequirement, e2eeState, handleGateMessage, useKey } from "./e2ee-gate.js";
+import { applyRequirement, attachSocket, e2eeState, gateSend, handleGateMessage, useKey } from "./e2ee-gate.js";
 
 /**
  * The two halves are written against different crypto libraries -- WebCrypto in
@@ -183,6 +183,43 @@ describe("the gate, on a list of sockets that is not tidy", () => {
     expect(open.sent, "the socket that is still open was answered").toHaveLength(1);
     expect(handshakeAnswered(second, open.sent[0].proof)).toBe(true);
     expect(e2eeState().rejected, "and nothing was mistaken for a wrong key").toBe(false);
+  });
+
+  it("does not pay for frames the far end is going to refuse", async () => {
+    // Until the handshake lands, the server answers everything but the proof
+    // with silence -- so a subscribe sent on open is bytes on the tunnel that
+    // are thrown away and then sent again. Measured over 38 minutes on the
+    // real link: 55 of 75 subscribes were exactly that, about 38 kB.
+    await applyRequirement({ required: true, fingerprint: "AAAA-BBBB" });
+    const open = live();
+    gateSend(open, JSON.stringify({ type: "subscribe" }));
+    expect(open.sent).toHaveLength(0);
+  });
+
+  it("still sends in the clear when there is nothing to prove", async () => {
+    // Loopback is told `required: false`, and holding its frames would leave
+    // the local page waiting on a handshake that is never going to happen.
+    await applyRequirement({ required: false });
+    const open = live();
+    gateSend(open, JSON.stringify({ type: "subscribe" }));
+    expect(open.sent).toHaveLength(1);
+  });
+
+  it("sends what was held back once the connection is proved", async () => {
+    // Nothing is queued -- the socket asks again on its own -- so what makes
+    // this safe is that the far end's "ready" is what triggers the re-ask.
+    const master = await deriveMasterKey(passphrase, Buffer.from(salt, "base64"), iterations);
+    const current = startHandshake(master, fingerprintOf(master));
+    const open = live();
+    let asked = 0;
+
+    attachSocket(open, () => { asked += 1; });
+    await applyRequirement({ required: true, fingerprint: current.message.fingerprint });
+    await handleGateMessage(open, current.message);
+    await useKey(await deriveSessionKey(passphrase, salt, iterations), false);
+    await handleGateMessage(open, { type: HANDSHAKE_READY });
+
+    expect(asked, "the socket is told to ask for its stream again").toBe(1);
   });
 
   it("takes the corrected key without waiting for a reconnect", async () => {
