@@ -55,11 +55,12 @@ import { createTrafficLedger, rollupBuckets, type TrafficLedger } from "./traffi
 import { newKeyMaterial } from "./e2ee-key-material.js";
 import { openHttpBody, sealHttpBody } from "./e2ee-http-body.js";
 import { E2EE_BODY_CONTENT_TYPE, E2EE_BODY_HEADER, bodyMustStayReadable, bodyNeedsEncryption } from "../shared/e2ee-http.js";
-import { handshakeAnswered, masterKeyFor, startHandshake, type PendingHandshake } from "./e2ee-session.js";
+import { handshakeAnswered, isEncryptionSwitch, masterKeyFor, startHandshake, type PendingHandshake } from "./e2ee-session.js";
 import { ServerWire } from "./e2ee-wire.js";
 import { HANDSHAKE_PROOF, HANDSHAKE_READY, KEY_CHANGED_CLOSE_CODE, allowedBeforeHandshake } from "../shared/e2ee-handshake.js";
 import { redactForScope } from "./e2ee-redaction.js";
 import { normalizePassphrase } from "../shared/e2ee-keys.js";
+import { nameForSession } from "../shared/session-tab-name.js";
 import { classifyNetworkScope, type NetworkScope } from "./traffic-scope.js";
 import { buildIndexDelta, indexDeltaIsEmpty } from "../shared/index-delta.js";
 import { createTrafficLog } from "./traffic-log.js";
@@ -241,7 +242,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     // Closed means off. The passphrase stays on the tab so it can be switched
     // back on without being carried to every device again, but a closed switch
     // is a switch that is not switching anything.
-    const switchTab = tabs.find((tab) => tab.session.provider === "e2ee" && tab.session.state === "ready" && tab.session.e2ee);
+    const switchTab = tabs.find((tab) => isEncryptionSwitch(tab.session));
     if (!switchTab) { cachedKey = null; return null; }
     const declared = switchTab.session.e2ee!.fingerprint;
     if (cachedKey?.fingerprint === declared) return cachedKey;
@@ -264,6 +265,19 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
    *
    * Loopback is left alone. It is where the change was just made.
    */
+  /**
+   * The other tab already acting as the switch, if there is one.
+   *
+   * Two switches would mean two passphrases and one winner decided by tab
+   * order -- and the loser's owner would be typing a key that opens nothing,
+   * with nothing on screen to say why. Refusing the second is the only version
+   * of this a reader can reason about.
+   */
+  const conflictingEncryptionTab = async (tabId: string) => {
+    const tabs = await storage.listTabMeta().catch(() => []);
+    return tabs.find((tab) => tab.id !== tabId && isEncryptionSwitch(tab.session)) ?? null;
+  };
+
   const revokeEncryptedConnections = (): void => {
     cachedKey = null;
     for (const client of [...clients]) {
@@ -1243,6 +1257,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (tab.session.provider === "e2ee") {
         if (!tab.session.e2ee) {
           return { ok: false, statusCode: 400, code: "E2EE_PASSPHRASE_REQUIRED", message: "Enter a passphrase to turn encryption on." };
+        }
+        // The same rule as setting a key: reopening a second switch would put
+        // two of them on at once just as effectively as creating one.
+        const conflict = await conflictingEncryptionTab(tabId);
+        if (conflict) {
+          return { ok: false, statusCode: 409, code: "E2EE_ALREADY_ON", message: `Encryption is already on, in "${conflict.name}". Close that one first.` };
         }
         await storage.updateTab(tabId, (current) => ({
           ...current,
@@ -2233,6 +2253,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (!isLocalBrowserRequest(request.headers)) {
         return apiError(reply, 403, "E2EE_LOCAL_ONLY", "Encryption can only be set up from this machine.");
       }
+      const conflict = await conflictingEncryptionTab(tabId);
+      if (conflict) {
+        return apiError(reply, 409, "E2EE_ALREADY_ON", `Encryption is already on, in "${conflict.name}". Close that one before setting a key here.`);
+      }
       const previous = await storage.getTabMeta(tabId).catch(() => null);
       const typed = normalizePassphrase(String(body.workingDirectory ?? body.passphrase ?? ""));
       // An empty box means "keep what is already set", which is what makes
@@ -2241,8 +2265,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (!passphrase) return apiError(reply, 400, "E2EE_PASSPHRASE_REQUIRED", "Enter a passphrase to turn encryption on.");
       const { material } = await newKeyMaterial(passphrase);
       const now = isoNow();
+      const locale = (await storage.readIndex()).ui.locale;
       await storage.updateTab(tabId, (current) => ({
         ...current,
+        name: nameForSession(current.name, "e2ee", locale),
         session: {
           ...current.session,
           provider: "e2ee",
@@ -2315,9 +2341,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         const now = isoNow();
         await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null, appServer: null });
         await restoreTerminalSize(storage, pty, tabId);
-        await pty.startShell(tabId, cwd, (await storage.readIndex()).ui.theme);
+        const index = await storage.readIndex();
+        await pty.startShell(tabId, cwd, index.ui.theme);
         await storage.updateTab(tabId, (current) => ({
           ...current,
+          name: nameForSession(current.name, "shell", index.ui.locale),
           session: {
             ...current.session,
             provider: "shell",

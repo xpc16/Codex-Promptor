@@ -101,6 +101,20 @@ describe("terminal-only conversations", () => {
     expect(directory).toBe(path.resolve(process.env.USERPROFILE ?? process.cwd()));
   });
 
+  it("names an unnamed tab after what was opened on it, and leaves a chosen name alone", async () => {
+    // A terminal is not a conversation, and a sidebar full of "新对话" hides
+    // the one thing that is different about it.
+    fakePty();
+    const unnamed = await app!.promptor.storage.createTab("新对话");
+    const named = await post(`/api/tabs/${unnamed.id}/session`, { provider: "shell", workingDirectory: root });
+    expect(named.json().data.bundle.tab.name).toBe("终端");
+
+    fakePty();
+    const chosen = await app!.promptor.storage.createTab("构建日志");
+    await post(`/api/tabs/${chosen.id}/session`, { provider: "shell", workingDirectory: root });
+    expect((await app!.promptor.storage.getTabMeta(chosen.id)).name).toBe("构建日志");
+  });
+
   it("still demands a real directory from an agent conversation", async () => {
     const tab = await app!.promptor.storage.createTab("Codex");
 

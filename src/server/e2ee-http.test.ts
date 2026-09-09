@@ -45,6 +45,7 @@ describe("what actually crosses the tunnel", () => {
   let app: PromptorApp;
   let root: string;
   let tabId: string;
+  let switchTabId: string;
   let master: Buffer;
 
   beforeEach(async () => {
@@ -53,14 +54,14 @@ describe("what actually crosses the tunnel", () => {
     await writeFile(path.join(root, "dist", "client", "index.html"), "<!doctype html><title>t</title>", "utf8");
     app = await createApp(root);
     await app.ready();
-    const switchTab = (await app.promptor.storage.createTab("加密")).id;
+    switchTabId = (await app.promptor.storage.createTab("加密")).id;
     await app.inject({
       method: "POST",
-      url: `/api/tabs/${switchTab}/session`,
+      url: `/api/tabs/${switchTabId}/session`,
       headers: { "x-codex-promptor-token": app.promptor.token, host: LOCAL_HOST, origin: `http://${LOCAL_HOST}` },
       payload: { provider: "e2ee", workingDirectory: PASSPHRASE } as never,
     });
-    const e2ee = (await app.promptor.storage.getTabMeta(switchTab)).session.e2ee!;
+    const e2ee = (await app.promptor.storage.getTabMeta(switchTabId)).session.e2ee!;
     master = await deriveMasterKey(PASSPHRASE, Buffer.from(decodeBase64(e2ee.salt)), e2ee.iterations);
     tabId = (await app.promptor.storage.createTab("对话")).id;
   });

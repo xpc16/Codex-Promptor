@@ -102,6 +102,20 @@ export function handshakeAnswered(pending: PendingHandshake, proof: unknown): bo
   return timingSafeEqual(Buffer.from(received), pending.expected);
 }
 
+/**
+ * Whether this session is the encryption switch that is currently on.
+ *
+ * One predicate rather than the same three conditions written out wherever
+ * they are needed: it is what decides that encryption is on, and it is what
+ * the "only one at a time" rule is checked against, and those two must never
+ * be allowed to drift apart.
+ */
+export function isEncryptionSwitch(
+  session: { provider: string; state: string; e2ee: unknown },
+): boolean {
+  return session.provider === "e2ee" && session.state === "ready" && Boolean(session.e2ee);
+}
+
 /** Derives the master key the encryption tab describes, or null when no tab describes one. */
 export async function masterKeyFor(
   session: { provider: string; workingDirectory: string | null; e2ee: { salt: string; iterations: number; fingerprint: string } | null },
