@@ -9,13 +9,12 @@ import { entityTag } from "./http-cache.js";
  * was the largest thing crossing it after the terminal itself: 33% of
  * everything sent outbound in a measured 38-minute window.
  *
- * One hash over the whole bundle only helps when *nothing* moved. Measured
- * across 29 real conversations at the window the server sends (24 prompts,
- * 3 answers): prompts are 72% of a bundle, answers 23%, tab 3%, and runtime
- * 2% -- 455 bytes. Runtime is the section that moves on almost every event and
- * the smallest one there is, so a whole-bundle hash spends 24 kB to deliver
- * half a kilobyte of runner state. Per section, that case costs what it is
- * worth.
+ * One hash over the whole bundle only helps when *nothing* moved. At the
+ * window the server sends (24 prompts, 3 answers), prompts are around 72% of a
+ * bundle, answers 23%, tab 3%, and runtime 2% -- a few hundred bytes. Runtime
+ * is the section that moves on almost every event and the smallest one there
+ * is, so a whole-bundle hash spends 24 kB to deliver half a kilobyte of runner
+ * state. Per section, that case costs what it is worth.
  *
  * This is deliberately not a delta: one prompt queued still re-sends all 24 of
  * them. A record-level delta is a larger piece of work, and it would be

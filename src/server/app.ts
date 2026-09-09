@@ -20,13 +20,13 @@ import {
 import { AppServerPool, type AppServerManager, type CodexRpcClient, terminateStaleAppServer, waitForThreadLoaded } from "./codex.js";
 import { CodexTuiPool, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, codexTuiReady, resolveCodexTuiLaunch, type CodexTuiManager } from "./codex-tui.js";
 import { ClaudeCodePool, type ClaudeCodeManager, probeClaudeVersion } from "./claude.js";
-import { syncClaudeHistory } from "./claude-history.js";
+import { readClaudeHistoryThread, syncClaudeHistory } from "./claude-history.js";
 import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorHookBridge, probeCursorVersion } from "./cursor.js";
 import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
 import { buildConversationMarkdown, conversationExportFilename } from "./conversation-export.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
-import { continuesThread, locateCodexRollout, readCodexRolloutThread, readCodexThreadForHistory, readRolloutHistoryBase, repointThread } from "./codex-history.js";
+import { continuesThread, locateCodexRollout, readCodexRollout, readCodexRolloutThread, readCodexThreadForHistory, readRolloutHistoryBase, repointThread } from "./codex-history.js";
 import { decideStall, noteRolloutSize, TURN_STALL_POLL_MS, type RolloutProgress } from "./turn-stall.js";
 import { appendBoundedLines } from "./log-file.js";
 import { readCodexRolloutCached } from "./codex-rollout-cache.js";
@@ -36,6 +36,7 @@ import { historyThreadFromResponse, recordTurn, syncHistory } from "./history.js
 import { applyNavigationOrder, deleteGroupAndUngroupTabs } from "./navigation.js";
 import { entityTag, ifMatchSatisfied, ifNoneMatchSatisfied, REVALIDATE_CACHE_CONTROL, REVALIDATE_VARY } from "./http-cache.js";
 import { changedSnapshotSections, snapshotTags } from "./snapshot-sections.js";
+import { discoverSessions, importedSessionIds, importedTabName } from "./session-import.js";
 import { CLAUDE_EXIT_MARKER, CODEX_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
 import { isSlashCommandPrompt } from "./prompt-submit.js";
 import { RunnerManager } from "./queue.js";
@@ -136,6 +137,9 @@ type Client = {
   wire: ServerWire | null;
 };
 
+/** What one auto-import pass did, for the launch log. */
+export type ImportSummary = { imported: number; failed: number };
+
 export type RestoreOpenSessionsSummary = {
   restored: string[];
   failed: Array<{ tabId: string; code: string; message: string }>;
@@ -167,6 +171,7 @@ export type PromptorApp = FastifyInstance & {
     documents: DocumentService;
     token: string;
     restoreOpenSessions: () => Promise<RestoreOpenSessionsSummary>;
+    importDiscoveredSessions: () => Promise<ImportSummary>;
     close: () => Promise<void>;
   };
 };
@@ -1374,6 +1379,79 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   };
 
   let restoreOpenSessionsPromise: Promise<RestoreOpenSessionsSummary> | null = null;
+  /**
+   * Brings in every conversation this machine has had that is long enough to
+   * be worth keeping and does not already have a tab.
+   *
+   * Imported closed, never opened: a first run can bring in dozens at once,
+   * and opening them would mean that many PowerShells and that many agents. A
+   * closed tab shows its prompts and answers, and "重新打开" starts the session
+   * when it is actually wanted.
+   *
+   * They land in one collapsed group for the same reason -- a sidebar that
+   * suddenly triples in length is not a feature.
+   *
+   * `CODEX_PROMPTOR_AUTO_IMPORT=0` turns it off.
+   */
+  const importDiscoveredSessions = async (): Promise<ImportSummary> => {
+    const summary: ImportSummary = { imported: 0, failed: 0 };
+    if (process.env.CODEX_PROMPTOR_AUTO_IMPORT === "0") return summary;
+    const home = process.env.USERPROFILE ?? process.env.HOME ?? "";
+    if (!home) return summary;
+    const found = await discoverSessions(
+      { codex: path.join(home, ".codex"), claude: path.join(home, ".claude") },
+      importedSessionIds(await storage.listTabMeta()),
+    ).catch(() => []);
+    if (!found.length) return summary;
+
+    const index = await storage.readIndex();
+    const groupName = index.ui.locale === "en" ? "Imported" : "已导入";
+    let group = index.groups.find((item) => item.name === groupName) ?? null;
+    if (!group) {
+      const created: Group = { id: randomUUID(), name: groupName, order: index.groups.length, collapsed: true };
+      await storage.updateIndex((current) => ({ ...current, groups: [...current.groups, created] }));
+      group = created;
+    }
+
+    for (const session of found) {
+      try {
+        const tab = await storage.createTab(importedTabName(session));
+        const now = isoNow();
+        await storage.updateTab(tab.id, (current) => ({
+          ...current,
+          groupId: group.id,
+          session: {
+            ...current.session,
+            provider: session.provider,
+            state: "closed",
+            reopenOnLaunch: false,
+            workingDirectory: session.workingDirectory,
+            threadId: session.sessionId,
+            sessionId: session.sessionId,
+            createdAt: current.session.createdAt ?? now,
+            connectedAt: now,
+            lastError: null,
+            lastThreadSwitch: null,
+            e2ee: null,
+          },
+          updatedAt: now,
+        }));
+        // The file is already known, so neither reader has to go looking for
+        // it -- which matters for Codex, where locating a rollout means
+        // walking a directory of gigabytes.
+        const thread = session.provider === "codex"
+          ? await readCodexRollout(session.file, session.sessionId)
+          : await readClaudeHistoryThread(session.sessionId, session.file);
+        await syncHistory(storage, tab.id, thread);
+        summary.imported += 1;
+      } catch {
+        summary.failed += 1;
+      }
+    }
+    if (summary.imported) broadcastIndex(await storage.readIndex());
+    return summary;
+  };
+
   const restoreOpenSessions = (): Promise<RestoreOpenSessionsSummary> => {
     if (restoreOpenSessionsPromise) return restoreOpenSessionsPromise;
     restoreOpenSessionsPromise = (async (): Promise<RestoreOpenSessionsSummary> => {
@@ -1554,7 +1632,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   trafficPruneTimer?.unref?.();
   if (trafficLoggingEnabled) void trafficLog.prune();
 
-  app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, token, restoreOpenSessions, close: async () => {
+  app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, token, restoreOpenSessions, importDiscoveredSessions, close: async () => {
     clearInterval(stallTimer);
     if (trafficFlushTimer) clearInterval(trafficFlushTimer);
     if (trafficPruneTimer) clearInterval(trafficPruneTimer);

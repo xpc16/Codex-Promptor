@@ -14,8 +14,8 @@
   Windows PowerShell 5.1 and nothing else: no modules, no npm, no Python.
 
   What counts as a prompt is not guessed. The wrapper markers filtered below
-  were counted across this machine's own corpus (86 Codex rollouts, 28 Claude
-  session files); each one is listed with what it turned out to be.
+  were found by counting them across a real corpus; each one is listed with
+  what it turned out to be.
 
 .PARAMETER PromptCount
   How many opening prompts to show per conversation. Default 3.
@@ -53,9 +53,8 @@ if (-not $OutputDirectory) {
 
 # Codex writes some of its own turns with role "user": the sandbox
 # description, the environment block, an aborted-turn notice, the plugin and
-# skill catalogues. Counted across this machine's rollouts, these accounted for
-# 371 of 1,920 user-role records -- enough to fill the first three columns of a
-# table with text nobody typed.
+# skill catalogues. They are a large enough share of all user-role records to
+# fill the first three columns of a table with text nobody typed.
 $codexNoise = @(
   "<environment_context>",
   "<turn_aborted>",
@@ -67,8 +66,8 @@ $codexNoise = @(
 )
 
 # Claude Code stores slash commands, their local output, the caveat that
-# precedes them, and background task notifications as user records. 326 of
-# 1,088 on this machine.
+# precedes them, and background task notifications as user records -- roughly a
+# third of everything it files under "user".
 $claudeNoise = @(
   "<command-name>",
   "<command-message>",

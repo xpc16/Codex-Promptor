@@ -32,6 +32,11 @@ void restorePromise.then(async ({ restored, failed, timings }) => {
   for (const line of timings) console.log(line);
   for (const item of failed) console.error(`Failed to restore tab ${item.tabId} [${item.code}]: ${item.message}`);
   await appendRestoreTimings(path.join(app.promptor.storage.dataDir, "restore-timings.log"), timings);
+  // After the restore, never alongside it: both walk the same rollout
+  // directory, and the conversations somebody actually has open come first.
+  const summary = await app.promptor.importDiscoveredSessions();
+  if (summary.imported) console.log(`Imported ${summary.imported} past conversation(s) into the "Imported" group; open one to start its session.`);
+  if (summary.failed) console.error(`${summary.failed} past conversation(s) could not be read and were left alone.`);
 });
 if (process.platform === "win32" && process.env.CODEX_PROMPTOR_OPEN !== "0") {
   spawn("cmd.exe", ["/d", "/c", "start", "", url], { windowsHide: true, stdio: "ignore" });
