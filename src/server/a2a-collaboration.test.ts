@@ -172,6 +172,14 @@ describe("agent to agent", () => {
     // Both conversations now show the same unfinished root.
     expect((await app.promptor.a2a.summaryForTab(to))!.active).toBe(true);
     expect((await app.promptor.a2a.summaryForTab(from))!.roots[0].participants).toBe(2);
+
+    // And a page that simply opens the tab sees it, without waiting for a push.
+    const fetched = await app.inject({ method: "GET", url: `/api/tabs/${to}`, headers: local() });
+    expect(fetched.json().data.a2a).toMatchObject({ active: true });
+    expect(fetched.json().data.a2a.roots[0]).toMatchObject({ skill: "central", role: "worker", level: 1, permissionMode: "soft" });
+    // The projection carries the summary and nothing frozen or secret.
+    expect(JSON.stringify(fetched.json().data.a2a)).not.toContain("allowedOps");
+    expect(JSON.stringify(fetched.json().data)).not.toContain("submittedText");
   });
 
   it("treats a repeated requestId as the same request, and a changed one as a conflict", async () => {

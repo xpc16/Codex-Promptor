@@ -243,11 +243,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
    * than stored per tab: its authority is the root records, and a participant
    * has to keep showing the light even when its own queue has nothing left.
    */
-  const readClientTab = async (tabId: string): Promise<TabBundle> => {
-    const bundle = await storage.readTabWindow(tabId, INITIAL_PROMPT_WINDOW, INITIAL_ANSWER_WINDOW);
-    const summary = await a2a.summaryForTab(tabId, bundle.tab.session.state).catch(() => undefined);
+  const withA2aSummary = async (bundle: TabBundle): Promise<TabBundle> => {
+    const summary = await a2a.summaryForTab(bundle.tab.id, bundle.tab.session.state).catch(() => undefined);
     return summary ? { ...bundle, a2a: summary } : bundle;
   };
+  const readClientTab = async (tabId: string): Promise<TabBundle> =>
+    withA2aSummary(await storage.readTabWindow(tabId, INITIAL_PROMPT_WINDOW, INITIAL_ANSWER_WINDOW));
 
   /**
    * The key this machine is currently using, or null when encryption is off.
@@ -2395,7 +2396,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const query = (request.query ?? {}) as any;
     const promptLimit = boundedInteger(query.promptLimit, 1, MAX_WINDOW_RECORDS, INITIAL_PROMPT_WINDOW);
     const answerLimit = boundedInteger(query.answerLimit, 1, MAX_WINDOW_RECORDS, INITIAL_ANSWER_WINDOW);
-    try { return sendRevalidatable(request, reply, await storage.readTabWindow(tabId, promptLimit, answerLimit)); }
+    // Through the same projection as a snapshot: a page that opens a tab must
+    // see an unfinished collaboration immediately, not on the next push.
+    try { return sendRevalidatable(request, reply, await withA2aSummary(await storage.readTabWindow(tabId, promptLimit, answerLimit))); }
     catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const missing = (error as NodeJS.ErrnoException)?.code === "ENOENT";
