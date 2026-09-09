@@ -1654,6 +1654,12 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     let rawOneShotAttempts = 0;
     /** The last subscription this socket asked for, replayed once it is proved. */
     let lastSubscription: { includeTerminal: boolean; snapshots: boolean; boundedCatchUp: boolean } | null = null;
+    /**
+     * Which bundle this socket already holds, so a reconnect does not fetch it
+     * again. A reconnect usually missed nothing, and the bundle is the largest
+     * thing on the link after the terminal itself.
+     */
+    let heldSnapshotTag: string | null = null;
     // What was last asked for, so the wanted state can be reconciled against
     // it from whatever the page's visibility actually is. A latched transition
     // could not recover from an event that never arrived.
@@ -1893,6 +1899,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
         tabIds: [tabId],
         snapshots,
         details: true,
+        ...(snapshots && heldSnapshotTag ? { snapshotTags: { [tabId]: heldSnapshotTag } } : {}),
         terminals: includeTerminal ? { [tabId]: currentTerminalSubscription(boundedCatchUp) } : {},
       }));
     };
@@ -2047,7 +2054,10 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
           else if (!projectionMode && message.type === "terminal.screen" && message.oneShot === true) handleRawOneShot(message as TerminalScreenFrame);
           else if (projectionMode && message.type === "terminal.screen") handleScreen(message as TerminalScreenFrame);
           else if (!projectionMode && message.type === "terminal.lease" && message.tabId === tabId) rawLeaseWritable = message.writable === true;
-          else if (message.type === "snapshot" && message.data) callbacks.current.onBundle(message.data as TabBundle);
+          else if (message.type === "snapshot" && message.data) {
+            heldSnapshotTag = typeof message.snapshotTag === "string" ? message.snapshotTag : null;
+            callbacks.current.onBundle(message.data as TabBundle);
+          }
           else if (["runner.changed", "runtime.changed", "prompts.changed", "answers.changed", "answer.added", "answer.changed", "tab.changed", "terminal.state"].includes(message.type)) {
             callbacks.current.onMessage(message);
             if (message.type === "terminal.state") {

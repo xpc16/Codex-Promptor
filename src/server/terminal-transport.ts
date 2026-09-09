@@ -22,6 +22,12 @@ export type TerminalTransportConfig = {
   rawBatchMaxBytes: number;
   projectionBytesPerSecond: number;
   projectionMaxBurstBytes: number;
+  /**
+   * How often a non-loopback connection is pinged so a relay does not mistake
+   * silence for death. Measured against a link that was closing idle sockets
+   * at about two minutes; 45 s leaves room for one ping to be lost.
+   */
+  websocketKeepaliveMs: number;
 };
 
 export const defaultTerminalTransportConfig: TerminalTransportConfig = {
@@ -35,6 +41,7 @@ export const defaultTerminalTransportConfig: TerminalTransportConfig = {
   rawBatchMaxBytes: 64 * 1024,
   projectionBytesPerSecond: 2 * 1024,
   projectionMaxBurstBytes: 8 * 1024,
+  websocketKeepaliveMs: 45_000,
 };
 
 export function terminalTransportConfigFromEnv(
@@ -51,6 +58,9 @@ export function terminalTransportConfigFromEnv(
     rawBatchMaxBytes: integerEnv(env.CODEX_PROMPTOR_RAW_BATCH_MAX_BYTES, 1024, 1024 * 1024, defaultTerminalTransportConfig.rawBatchMaxBytes),
     projectionBytesPerSecond: integerEnv(env.CODEX_PROMPTOR_PROJECTION_BYTES_PER_SECOND, 256, 1024 * 1024, defaultTerminalTransportConfig.projectionBytesPerSecond),
     projectionMaxBurstBytes: integerEnv(env.CODEX_PROMPTOR_PROJECTION_MAX_BURST_BYTES, 1024, 1024 * 1024, defaultTerminalTransportConfig.projectionMaxBurstBytes),
+    // 0 turns it off, for a link that does not need it or a test that would
+    // rather not have a timer running.
+    websocketKeepaliveMs: integerEnv(env.CODEX_PROMPTOR_WS_KEEPALIVE_MS, 0, 600_000, defaultTerminalTransportConfig.websocketKeepaliveMs),
   };
 }
 

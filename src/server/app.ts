@@ -1533,6 +1533,35 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const stallTimer = setInterval(() => { void sweepStalledTurns().catch(() => undefined); }, TURN_STALL_POLL_MS);
   stallTimer.unref?.();
 
+  /**
+   * A ping on every link that is not this machine, so a quiet connection is
+   * not mistaken for a dead one.
+   *
+   * The navigation socket carries nothing at all while nobody is renaming or
+   * reordering anything, and a relay in front of it closes what has been
+   * silent for a while. Measured on the tunnel: one reconnect every two
+   * minutes, hour after hour, at a cadence far too regular to be the network.
+   * Each one cost a handshake, a subscribe and -- on the terminal socket -- a
+   * fresh 24 kB bundle, to carry nothing that had changed.
+   *
+   * A ping frame is a few bytes and resets that timer. Loopback is skipped
+   * because nothing there is counting the silence.
+   *
+   * Deliberately no pong tracking: a missed pong would have to mean "hang up",
+   * and whether every relay in the path forwards pong frames is not something
+   * this end can find out. Guessing wrong there breaks a working link, which
+   * is worse than the reconnect it would be trying to prevent.
+   */
+  const keepaliveTimer = transportConfig.websocketKeepaliveMs > 0
+    ? setInterval(() => {
+      for (const client of clients) {
+        if (client.scope === "local" || client.socket.readyState !== 1) continue;
+        try { client.socket.ping(); } catch { /* closing under us */ }
+      }
+    }, transportConfig.websocketKeepaliveMs)
+    : null;
+  keepaliveTimer?.unref?.();
+
   // Sealed buckets are appended once a minute, off the hot path. `unref` so a
   // measurement timer never keeps the process alive on its own.
   const flushTraffic = async (): Promise<void> => {
@@ -1554,6 +1583,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
 
   app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, token, restoreOpenSessions, close: async () => {
     clearInterval(stallTimer);
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
     if (trafficFlushTimer) clearInterval(trafficFlushTimer);
     if (trafficPruneTimer) clearInterval(trafficPruneTimer);
     // Seal the minute in progress so a restart does not lose it.
@@ -2992,10 +3022,24 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             }
           }
           if (message.snapshots !== false) {
+            // A page asks for a snapshot when it reconnects, because it cannot
+            // know what it missed while it was away. Usually it missed nothing
+            // -- measured on the tunnel, these are 24 kB each and the single
+            // largest thing on the link after the terminal itself. So it says
+            // which bundle it already holds, and gets an answer only if that
+            // is no longer the one it would be sent.
+            //
+            // A content hash rather than the sequence counter: `sequences`
+            // lives in memory and restarts at zero, so a page that slept
+            // through a restart could hold a number the server had climbed
+            // back to with entirely different content behind it.
+            const held = (message as any).snapshotTags;
             for (const tabId of client.stateSubscriptions) {
               try {
                 const data = await readClientTab(tabId);
-                sendClient(client, { type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, data }, "snapshot");
+                const snapshotTag = entityTag(JSON.stringify(data));
+                if (held && typeof held === "object" && held[tabId] === snapshotTag) continue;
+                sendClient(client, { type: "snapshot", tabId, sequence: sequences.get(tabId) ?? 0, snapshotTag, data }, "snapshot");
               } catch { /* tab may have been deleted */ }
             }
           }
