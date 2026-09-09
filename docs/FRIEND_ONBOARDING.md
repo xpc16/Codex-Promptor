@@ -24,6 +24,20 @@ npm ci
 
 浏览器会打开 `http://127.0.0.1:4317/`，看到界面后 `Ctrl+C` 停掉。
 
+> **报「因为在此系统上禁止运行脚本」** —— Windows 默认不允许运行任何 `.ps1`。放开一次即可，不需要管理员：
+>
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+> ```
+>
+> 如果你是**下载 ZIP** 而不是 `git clone` 的，文件还带着「来自网络」标记，放开之后仍会报「未经数字签名」。再跑一次这个解掉：
+>
+> ```powershell
+> Get-ChildItem -Recurse | Unblock-File
+> ```
+>
+> 不想改系统设置也行，每次都写全：`powershell -ExecutionPolicy Bypass -File .\start.ps1`。
+
 ---
 
 ## 2. 装 cloudflared，接上隧道
