@@ -51,16 +51,31 @@ cloudflared.exe service uninstall  # 彻底卸掉
 
 ## 3. 第一次远程登录
 
+### 3.1 先授权你的域名
+
+应用默认只信任 `127.0.0.1`。第 1 步跑过一次之后 `data\private\` 已经建好了，在里面新建 `remote-access.json`：
+
+```json
+{
+  "trustedHosts": ["friend.example.com"]
+}
+```
+
+换成朋友给你的子域名，**不带 `https://`，一字不差**。改完要重启应用才生效。
+
+不配的话，远端页面会停在一个「!」的错误屏：**当前访问地址未获 Promptor 授权**。本机 `127.0.0.1` 不受影响，照常能用。
+
+### 3.2 登录
+
 打开 `https://friend.example.com` → 跳到 Cloudflare 登录页 → 填你的邮箱 → 收 6 位验证码（10 分钟有效）→ 进入。
 
-- 收不到邮件：看垃圾箱；确认邮箱拼写和朋友放行的一致；企业邮箱把 `noreply@notify.cloudflare.com` 加白名单。
-- **页面停在一个「!」错误屏，写着「当前访问地址未获 Promptor 授权」**：域名还没授权，见第 6.1 节。
+收不到邮件：看垃圾箱；确认邮箱拼写和朋友放行的一致；企业邮箱把 `noreply@notify.cloudflare.com` 加白名单。
 
 ---
 
 ## 4. 找回旧对话：导出会话清单
 
-想 `/resume` 一个几周前的对话，但不记得 session id 时：
+想 `/resume` 一个几周前的对话，但不记得 session id 时。**第一次跑 `.\start.ps1` 时已经自动生成过一份**，之后想刷新就手动跑：
 
 ```powershell
 .\scripts\export-agent-sessions.ps1
@@ -94,22 +109,6 @@ cloudflared.exe service uninstall  # 彻底卸掉
 
 ## 6. 让应用一直跑着
 
-### 6.1 授权你的域名（必须，只做一次）
-
-应用默认只信任 `127.0.0.1`。第 1 步跑过一次之后，`data\private\` 目录已经建好了，在里面新建 `remote-access.json`：
-
-```json
-{
-  "trustedHosts": ["friend.example.com"]
-}
-```
-
-换成朋友给你的子域名，**不带 `https://`，一字不差**。改完要重启应用才生效。
-
-不配的话，远端页面会停在一个「!」的错误屏：**当前访问地址未获 Promptor 授权**。本机 `127.0.0.1` 不受影响，照常能用。
-
-### 6.2 开机自启
-
 按 `Win+R`，输入 `shell:startup`，回车。在弹出的文件夹里新建一个文本文件，改名成 `promptor.cmd`：
 
 ```bat
@@ -135,7 +134,8 @@ node dist\server\main.js
 | 现象 | 先查 |
 |---|---|
 | 域名转圈或 502 | `Get-Service cloudflared` 是否 Running；本机 4317 能否打开 |
-| 远端停在「未获 Promptor 授权」 | `data\privateemote-access.json` 里的域名对不对；改完重启了没 |
+| 远端停在「未获 Promptor 授权」 | `data\private
+emote-access.json` 里的域名对不对；改完重启了没 |
 | 用着用着整个应用没了 | `CODEX_PROMPTOR_AUTO_EXIT` 没设成 `0` |
 | 提示要密钥但你没设过 | 本机看看是不是有个叫 `E2EE` 的标签，删掉即关闭加密 |
 | 本机 4317 也打不开 | `npm ci` 跑过没；Node 版本是不是 22～24 |

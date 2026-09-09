@@ -1,4 +1,4 @@
-param(
+﻿param(
   # Rebuild even when the existing output already looks current.
   [switch]$Force,
   # Launch whatever is in dist\ without checking whether sources moved on.
@@ -58,6 +58,30 @@ if ($NoBuild) {
   npm run build
 } else {
   Write-Host "Build output is current; skipping rebuild." -ForegroundColor DarkGray
+}
+
+# The session tables under docs/ are generated, not tracked, so a fresh clone
+# has none of them -- and nobody discovers a script they were never told about.
+# Built once, when neither file is there yet; after that they are the reader's
+# to refresh (or delete, which asks for them again).
+$exportScript = Join-Path $toolRoot "scripts\export-agent-sessions.ps1"
+$exportTargets = @(
+  (Join-Path $toolRoot "docs\codex_sessions_exports.md"),
+  (Join-Path $toolRoot "docs\claude_code_sessions_exports.md")
+)
+$haveExports = @($exportTargets | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
+if ((Test-Path -LiteralPath $exportScript) -and -not $haveExports) {
+  Write-Host "First run: listing your Codex and Claude Code conversations in the background..." -ForegroundColor Cyan
+  # Detached rather than awaited: reading every rollout takes about ten seconds
+  # on a machine with real history, and the app should not wait on a
+  # convenience. Never fatal either -- a missing CLI history, a locked file or
+  # an unreadable rollout is a reason to start without the tables, not a reason
+  # not to start.
+  try {
+    Start-Process -FilePath "powershell.exe" -WindowStyle Hidden -ArgumentList @(
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$exportScript`""
+    ) | Out-Null
+  } catch { Write-Warning "Session export skipped: $($_.Exception.Message)" }
 }
 
 $env:CODEX_PROMPTOR_ROOT = $toolRoot
