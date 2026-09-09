@@ -150,10 +150,32 @@ node dist\server\main.js
 | 现象 | 先查 |
 |---|---|
 | 域名转圈或 502 | `Get-Service cloudflared` 是否 Running；本机 4317 能否打开 |
-| 远端停在「未获 Promptor 授权」 | `data\private
-emote-access.json` 里的域名对不对；改完重启了没 |
+| 远端停在「未获 Promptor 授权」 | `data\private\remote-access.json` 里的域名对不对；改完重启了没 |
+| 打开 Codex 对话报 `CODEX_NATIVE_EXECUTABLE_NOT_FOUND` | `codex` 不在 PATH 上。见下方 |
 | 用着用着整个应用没了 | `CODEX_PROMPTOR_AUTO_EXIT` 没设成 `0` |
 | 提示要密钥但你没设过 | 本机看看是不是有个叫 `E2EE` 的标签，删掉即关闭加密 |
 | 本机 4317 也打不开 | `npm ci` 跑过没；Node 版本是不是 22～24 |
+
+### `CODEX_NATIVE_EXECUTABLE_NOT_FOUND`
+
+打开一个 Codex 对话时报这个，意思只有一个：**应用没能在 PATH 上找到 `codex`**。它启动前会执行 `where.exe codex`，找不到就停在这里。
+
+自己先跑一遍同一条命令，看它说什么：
+
+```powershell
+where.exe codex
+```
+
+- **什么都没输出** —— codex 没装，或者没进 PATH。装上 `codex` 再试；只想用 Claude Code 或终端对话的话，这个对话就打不开，跟其他对话无关。
+- **有输出，但应用仍然报错** —— 十有八九是**应用启动的时候 codex 还不在 PATH 上**。进程的 PATH 在启动那一刻就定死了，后装的东西它看不见。关掉重开应用即可。
+- **装在了奇怪的位置** —— 直接把完整路径告诉它，加进 `promptor.cmd`：
+
+  ```bat
+  set CODEX_PROMPTOR_CODEX_EXECUTABLE=C:\完整\路径\codex.exe
+  ```
+
+顺带一提：这些 Codex 对话是应用第一次启动时从你自己的 `~/.codex` 里自动导入的，所以能看到历史记录是正常的——**看历史不需要装 codex，继续对话才需要**。
+
+---
 
 想单方面切断远程访问：`net stop cloudflared`。域名所有者也能随时关掉你的访问。
