@@ -4,7 +4,7 @@
 
 它用标签页管理 **Codex / Claude Code / Cursor CLI** 的对话，也可以只开一个干净的 PowerShell。核心是**排队**：把要做的事一条条写进队列，它按顺序喂给同一个会话，人不用守着。
 
-> **它能在你的电脑上执行任意命令。** 这是它的工作方式，不是漏洞。装之前想清楚。
+> **它能在你的电脑上执行任意命令。** 这是它的工作方式，不是漏洞。
 
 不需要公网 IP，不需要在路由器开端口——隧道是你的电脑主动拨出去的。
 
@@ -36,9 +36,7 @@ npm ci
 cloudflared.exe service install eyJhIjoiXXXX....
 ```
 
-一条命令做完三件事：注册成 Windows 服务、开机自启、立刻连上。你不需要 Cloudflare 账号。
-
-> **`eyJ...` 那串是凭证**，别外传、别截图发群里。
+`eyJ...` 那串是这条隧道的凭证。一条命令做完三件事：注册成 Windows 服务、开机自启、立刻连上。你不需要 Cloudflare 账号。
 
 常用命令：
 
@@ -51,38 +49,26 @@ cloudflared.exe service uninstall  # 彻底卸掉
 
 ---
 
-## 3. 让应用一直跑着
+## 3. 第一次远程登录
 
-按 `Win+R`，输入 `shell:startup`，回车。在弹出的文件夹里新建一个文本文件，改名成 `promptor.cmd`，内容如下——**只需要改两处**：
+打开 `https://friend.example.com` → 跳到 Cloudflare 登录页 → 填你的邮箱 → 收 6 位验证码（10 分钟有效）→ 进入。
 
-```bat
-@echo off
-set CODEX_PROMPTOR_TRUSTED_HOSTS=friend.example.com
-set CODEX_PROMPTOR_AUTO_EXIT=0
-set CODEX_PROMPTOR_OPEN=0
-cd /d D:\codex_promptor
-node dist\server\main.js
-```
-
-1. 第 2 行的 `friend.example.com` → 换成朋友给你的子域名（**不带 `https://`，一字不差**）
-2. 第 5 行的 `D:\codex_promptor` → 换成你上一步 clone 的实际路径
-
-保存后**双击它**，应用就跑起来了；以后每次开机自动跑。想停就关掉那个黑窗口。
-
-> 这三行 `set` 一行都不能省，因为它们的失败方式都不像报错：
-> 第一行不设 → 远程页面**能打开，但终端永远空白**；
-> 第二行不设 → 手机切后台或断网 30 秒，它会**杀掉自己和所有正在跑的会话**；
-> 第三行不设 → 每次开机弹一个浏览器窗口。
-
-**更新代码后**：`git pull` → `npm ci` → 关掉黑窗口 → 重新双击 `promptor.cmd`。
+- 收不到邮件：看垃圾箱；确认邮箱拼写和朋友放行的一致；企业邮箱把 `noreply@notify.cloudflare.com` 加白名单。
+- **页面打开了但终端一直空白**：环境变量还没设，跳到第 6 节。
 
 ---
 
-## 4. 第一次远程登录
+## 4. 找回旧对话：导出会话清单
 
-打开 `https://friend.example.com` → 跳到 Cloudflare 登录页 → 填**你的邮箱**（朋友放行的那一个）→ 收 6 位验证码（10 分钟有效）→ 进入。
+想 `/resume` 一个几周前的对话，但不记得 session id 时：
 
-收不到邮件：看垃圾箱；确认邮箱拼写和朋友放行的一致；企业邮箱把 `noreply@notify.cloudflare.com` 加白名单。
+```powershell
+.\scripts\export-agent-sessions.ps1
+```
+
+在 `docs/` 下生成两份表格（Codex 一份、Claude Code 一份），每行是：**最近活动日期 · 对话所在路径 · Session ID · 开头 3 条 prompt**。靠前 3 条 prompt 认出是哪个对话，再把 Session ID 填进「继续旧对话」。
+
+纯 PowerShell，无依赖。可选参数：`-PromptCount 5`（多显示几条）、`-MaxLength 0`（不截断长 prompt）。
 
 ---
 
@@ -97,7 +83,7 @@ node dist\server\main.js
 
 第 2 条是这套架构的必然结果，不是猜测。**开了 E2EE、用一句他不知道的口令，这件事就做不到**——他仍能打开页面，但只会看到一个要密钥的框，服务端发过去的是密文。
 
-代价：他没法再帮你远程排查问题。自己权衡。
+代价：他没法再帮你远程排查问题。
 
 ### 怎么开（只能在本机操作）
 
@@ -122,17 +108,30 @@ node dist\server\main.js
 
 ---
 
-## 6. 找回旧对话：导出会话清单
+## 6. 让应用一直跑着
 
-想 `/resume` 一个几周前的对话，但不记得 session id 时：
+按 `Win+R`，输入 `shell:startup`，回车。在弹出的文件夹里新建一个文本文件，改名成 `promptor.cmd`，内容如下——**只需要改两处**：
 
-```powershell
-.\scripts\export-agent-sessions.ps1
+```bat
+@echo off
+set CODEX_PROMPTOR_TRUSTED_HOSTS=friend.example.com
+set CODEX_PROMPTOR_AUTO_EXIT=0
+set CODEX_PROMPTOR_OPEN=0
+cd /d D:\codex_promptor
+node dist\server\main.js
 ```
 
-在 `docs/` 下生成两份表格（Codex 一份、Claude Code 一份），每行是：**最近活动日期 · 对话所在路径 · Session ID · 开头 3 条 prompt**。靠前 3 条 prompt 认出是哪个对话，再把 Session ID 填进「继续旧对话」。
+1. 第 2 行的 `friend.example.com` → 换成朋友给你的子域名（**不带 `https://`，一字不差**）
+2. 第 5 行的 `D:\codex_promptor` → 换成你 clone 的实际路径
 
-纯 PowerShell，无依赖。可选参数：`-PromptCount 5`（多显示几条）、`-MaxLength 0`（不截断长 prompt）。
+保存后**双击它**，应用就跑起来了；以后每次开机自动跑。想停就关掉那个黑窗口。
+
+> 这三行 `set` 一行都不能省，因为它们的失败方式都不像报错：
+> 第一行不设 → 远程页面**能打开，但终端永远空白**；
+> 第二行不设 → 手机切后台或断网 30 秒，它会**杀掉自己和所有正在跑的会话**；
+> 第三行不设 → 每次开机弹一个浏览器窗口。
+
+**更新代码后**：`git pull` → `npm ci` → 关掉黑窗口 → 重新双击 `promptor.cmd`。
 
 ---
 
