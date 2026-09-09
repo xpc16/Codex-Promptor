@@ -54,7 +54,7 @@ cloudflared.exe service uninstall  # 彻底卸掉
 打开 `https://friend.example.com` → 跳到 Cloudflare 登录页 → 填你的邮箱 → 收 6 位验证码（10 分钟有效）→ 进入。
 
 - 收不到邮件：看垃圾箱；确认邮箱拼写和朋友放行的一致；企业邮箱把 `noreply@notify.cloudflare.com` 加白名单。
-- **页面打开了但终端一直空白**：环境变量还没设，跳到第 6 节。
+- **页面停在一个「!」错误屏，写着「当前访问地址未获 Promptor 授权」**：域名还没授权，见第 6.1 节。
 
 ---
 
@@ -94,26 +94,35 @@ cloudflared.exe service uninstall  # 彻底卸掉
 
 ## 6. 让应用一直跑着
 
-按 `Win+R`，输入 `shell:startup`，回车。在弹出的文件夹里新建一个文本文件，改名成 `promptor.cmd`，内容如下——**只需要改两处**：
+### 6.1 授权你的域名（必须，只做一次）
+
+应用默认只信任 `127.0.0.1`。第 1 步跑过一次之后，`data\private\` 目录已经建好了，在里面新建 `remote-access.json`：
+
+```json
+{
+  "trustedHosts": ["friend.example.com"]
+}
+```
+
+换成朋友给你的子域名，**不带 `https://`，一字不差**。改完要重启应用才生效。
+
+不配的话，远端页面会停在一个「!」的错误屏：**当前访问地址未获 Promptor 授权**。本机 `127.0.0.1` 不受影响，照常能用。
+
+### 6.2 开机自启
+
+按 `Win+R`，输入 `shell:startup`，回车。在弹出的文件夹里新建一个文本文件，改名成 `promptor.cmd`：
 
 ```bat
 @echo off
-set CODEX_PROMPTOR_TRUSTED_HOSTS=friend.example.com
 set CODEX_PROMPTOR_AUTO_EXIT=0
 set CODEX_PROMPTOR_OPEN=0
 cd /d D:\codex_promptor
 node dist\server\main.js
 ```
 
-1. 第 2 行的 `friend.example.com` → 换成朋友给你的子域名（**不带 `https://`，一字不差**）
-2. 第 5 行的 `D:\codex_promptor` → 换成你 clone 的实际路径
+把 `D:\codex_promptor` 换成你 clone 的实际路径。保存后**双击它**，应用就跑起来了；以后每次开机自动跑。想停就关掉那个黑窗口。
 
-保存后**双击它**，应用就跑起来了；以后每次开机自动跑。想停就关掉那个黑窗口。
-
-> 这三行 `set` 一行都不能省，因为它们的失败方式都不像报错：
-> 第一行不设 → 远程页面**能打开，但终端永远空白**；
-> 第二行不设 → 手机切后台或断网 30 秒，它会**杀掉自己和所有正在跑的会话**；
-> 第三行不设 → 每次开机弹一个浏览器窗口。
+> `CODEX_PROMPTOR_AUTO_EXIT=0` 不能省：默认最后一个页面关闭 30 秒后会退出整个进程，远程时手机切后台或断网就会被判成「页面关了」，然后**杀掉自己和所有正在跑的会话**。`OPEN=0` 只是让它别每次开机弹浏览器。
 
 **更新代码后**：`git pull` → `npm ci` → 关掉黑窗口 → 重新双击 `promptor.cmd`。
 
@@ -126,7 +135,7 @@ node dist\server\main.js
 | 现象 | 先查 |
 |---|---|
 | 域名转圈或 502 | `Get-Service cloudflared` 是否 Running；本机 4317 能否打开 |
-| 页面出来了但终端一直空白 | 八成是 `CODEX_PROMPTOR_TRUSTED_HOSTS` 没设或拼错 |
+| 远端停在「未获 Promptor 授权」 | `data\privateemote-access.json` 里的域名对不对；改完重启了没 |
 | 用着用着整个应用没了 | `CODEX_PROMPTOR_AUTO_EXIT` 没设成 `0` |
 | 提示要密钥但你没设过 | 本机看看是不是有个叫 `E2EE` 的标签，删掉即关闭加密 |
 | 本机 4317 也打不开 | `npm ci` 跑过没；Node 版本是不是 22～24 |
