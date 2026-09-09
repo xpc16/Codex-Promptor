@@ -1,11 +1,33 @@
-# Codex Promptor 实施设计说明
+# Codex Promptor 多提供商实施设计说明
 
-> 状态：可实施设计稿
+> 状态：已实现基线
 >
 > 目标平台：Windows 10/11、本机单用户
 >
-> 基准环境：Node.js 24、Windows PowerShell 5.1、`codex-cli 0.147.0`
-> 最后更新：2026-08-21
+> 基准环境：Node.js 24、Windows PowerShell 5.1；Codex 协议基准 `codex-cli 0.147.0`；Claude Code 本机验证 2.1.228
+> 最后更新：2026-08-25
+
+## 0. 当前多提供商实现（优先级最高）
+
+本节记录当前实现，覆盖本文后续仍以 Codex 为中心的早期设计描述。后续章节中的数据、布局、安全、生命周期和队列规则仍适用于所有提供商；“只支持 Codex”“队列绝不向 PTY 提交文本”等旧限制仅适用于 Codex 适配器，不再是整个应用的限制。
+
+新标签在“确定并打开”旁显示提供商下拉框，支持 `Codex`、`Claude Code`、`Cursor CLI`。选择写入 `tab.session.provider`，旧标签缺少该字段时按 `codex` 读取；标签一旦绑定 session/thread，提供商不可修改，避免把一个提供商的历史误交给另一个提供商解析。
+
+| 提供商 | 启动命令 | 真实 TUI | 自动队列控制 | 生命周期事实源 | 历史同步 |
+| --- | --- | --- | --- | --- | --- |
+| Codex | `codex` / `codex resume <id>` | `--remote` 连接每标签 App Server | App Server `turn/start`、`turn/steer`、`turn/interrupt` | App Server JSON-RPC 事件 | `thread/read(includeTurns=true)` |
+| Claude Code | `claude` / `claude --resume <id>` | 原生 Claude Code TUI | PTY bracketed paste；不覆盖模型或审批配置 | 静默 command hook → 标签私有 HTTP 回调：`SessionStart`、`UserPromptSubmit`、`Stop`、`StopFailure`、`SessionEnd` | hook 提供的路径或 `~/.claude/projects/**/<session-id>.jsonl` |
+| Cursor CLI | `agent` / `agent --resume=<id>` | 原生 Cursor Agent TUI | PTY bracketed paste；完成前可发送 Escape 中断 | Cursor hooks：`sessionStart`、`beforeSubmitPrompt`、`afterAgentResponse`、`stop`、`sessionEnd` | hook 的 `transcript_path`，必要时在 `~/.cursor/` 查找 transcript |
+
+Codex 继续使用官方 App Server 的结构化控制面，避免改变已经稳定的远程 TUI 行为。[OpenAI App Server 文档](https://developers.openai.com/codex/app-server/) Claude Code 和 Cursor CLI 没有复用 Codex 私有协议；它们各自运行真实 TUI，自动队列仅用终端支持的 bracketed paste 发送完整 prompt，再由 hook 事件确认真正接收、生成 final answer、完成、失败或中断。用户直接在 TUI 中输入的 prompt 也由同一事件适配器记录为 `origin: manual`。Claude 的 `SessionStart` 按官方能力只使用 command hook，因此 `scripts/claude-hook.mjs` 静默转发到本机回调；它不会向 `SessionStart` 或 `UserPromptSubmit` 的 stdout 写内容，避免把观察数据注入模型上下文。[Claude Code Hooks 文档](https://code.claude.com/docs/en/hooks) 由于自动输入和人工草稿共用输入框，运行 Claude/Cursor 自动队列时不应保留未提交草稿；hook 只观察事件，不能把两个同时存在的草稿安全合并。
+
+Cursor 使用用户要求的 `agent` 命令。首次启动 Cursor 标签前，服务把 Promptor 的命令 hook 合并到 `%CURSOR_CONFIG_DIR%/hooks.json` 或 `~/.cursor/hooks.json`，保留已有配置并在变更前备份到 `data/backups/`。桥接进程只有在父 `agent` 带有 `CODEX_PROMPTOR_CURSOR_HOOK_URL` 时才回传事件；用户在外部启动的 Cursor 会话中它返回空对象，不改变或阻塞会话。Cursor CLI 未安装时会在写入 hook 配置前返回 `CURSOR_CLI_NOT_FOUND`。实现依据 Cursor 的 [CLI 参数文档](https://docs.cursor.com/en/cli/reference/parameters)、[Hooks 文档](https://prod.cursor.com/docs/hooks)；若未来需要完全脱离 TUI 的结构化控制，可另行评估官方 [ACP 接口](https://prod.cursor.com/docs/cli/acp)，本版本没有用 ACP 替换真实终端。
+
+三个提供商都实现统一的内部 `QueueRpc` 边界：`activeTurnIds`、`waitForThreadIdle`、`startTurn`、`steerTurn`、`interruptTurn`、`waitForTurn`。因此队列的顺序、暂停边界、立即插入、失败策略、运行中 Final Answers 卡片、完成提示和 JSON 写入不含提供商分支。每个 provider manager 只负责把原生事件归一化为 `{ turn, items }`。Claude/Cursor 在已连接状态收到不同 session/conversation id 的 `SessionStart` 时，会把旧活动轮次收尾为 interrupted、暂停 runner、更新标签绑定并同步新 transcript；`lastThreadSwitch.method` 记为 `session/start`。
+
+历史同步统一复用 `syncHistory`：只导入有用户文本和 final answer 的完成轮次，按 `(threadId, turnId)` 幂等，对当前会话完成历史执行全量替换，并把本地未绑定的 pending prompt 依次保留在完成历史后。Claude 解析器按 transcript 的 active lineage 处理 rewind/branch，并去重同一 prompt 的内部副本；Cursor 解析器兼容 hook 风格 JSON/JSONL 和常见 role/content 记录。提供商 transcript 无法定位或格式无法识别时必须显式失败，不得从终端画面猜测回答。
+
+验证状态：Codex 的既有回归测试保留；Claude 已通过 hook 生命周期测试、命令测试、历史分支/去重测试，并对本机真实长 transcript 做过只读结构校验；Cursor 已通过命令、hook 合并/备份、队列生命周期和 transcript 解析测试。当前开发机没有可执行的 `agent`，所以 Cursor 的本机真实登录与 TUI 启动仍需在安装 Cursor CLI 后做一次人工冒烟测试；`/api/health` 和 `/api/bootstrap` 会报告该可用性，而不会把协议测试表述为真实启动成功。
 
 ## 1. 文档目的
 
@@ -67,7 +89,7 @@ codex app-server --listen ws://127.0.0.1:<random-port>
 
 ### 3.2 自动队列不向 PowerShell 注入按键
 
-自动队列直接调用 App Server 的 `turn/start`。PowerShell/xterm.js 只传递用户真实键盘输入并显示真实 Codex TUI。
+自动队列通常调用 App Server 的 `turn/start`；对待执行条目选择“立即插入”且当前已有活跃 turn 时，调用 `turn/steer` 将该输入追加到同一 turn。PowerShell/xterm.js 只传递用户真实键盘输入并显示真实 Codex TUI。
 
 这样可以保证：
 
@@ -78,7 +100,7 @@ codex app-server --listen ws://127.0.0.1:<random-port>
 
 转发层不改写任何终端输入。App Server JSON-RPC 通常逐字节双向转发，唯一的兼容性规范化是把 TUI 发出的 `thread/start.params.historyMode: paginated` 改为 `legacy`：本工具的全量对账依赖 `thread/read(includeTurns=true)`，而官方协议对 paginated rollout 的完整历史读取仍会返回不支持。除此之外，转发层只关联 `thread/start`、`thread/resume`、`thread/fork` 请求与成功响应，用于识别 `/new`、`/resume`、`/fork` 后真正被 TUI 选中的 thread。不能仅凭 `thread/started` 自动换绑，因为 detached review 等辅助流程也可能发出该事件。
 
-队列发起 `turn/start` 时只发送 `threadId`、`clientUserMessageId` 和 `input`，不发送 `model`、`effort`、`sandboxPolicy`、`approvalPolicy` 等覆盖项，从而沿用用户在该 thread 中设置的当前选项。
+队列发起 `turn/start` 时只发送 `threadId`、`clientUserMessageId`、`cwd` 和 `input`；`turn/steer` 只发送 `threadId`、`expectedTurnId`、`clientUserMessageId` 和 `input`。两者均不发送 `model`、`effort`、`sandboxPolicy`、`approvalPolicy` 等覆盖项，从而沿用用户在该 thread 中设置的当前选项。
 
 ### 3.3 不使用旧脚本的 `codex exec` 轮询模型
 
@@ -235,6 +257,8 @@ Codex: 已连接 | Terminal: 运行中 | Queue: 已暂停
 - 展示当前 turn 来源、prompt 摘要、开始时间、耗时和 waiting-on-approval 等状态。
 - 下方是可滚动的回答历史，最新记录默认展开，旧记录可折叠。
 - 每条记录展示来源徽标：`队列`、`人工`、`导入`。
+- 队列 turn 被 Codex 接受时立即创建 `running` 记录，开始时间与状态位于顶部同一行右侧。
+- turn 结束时就地更新同一记录：`completed` 填入 final answer，`interrupted/failed` 保留空回复并记录错误；结束时间显示在卡片底部右侧。
 - final answer 以安全 Markdown 渲染，提供“复制原文”。
 - 导入历史时显示导入数量、跳过数量及警告。
 
@@ -256,7 +280,9 @@ codex resume <thread-id> --remote ws://127.0.0.1:<tui-proxy-port> --no-alt-scree
 - Codex CLI 0.147.0 的 `--remote` 只接受 `ws://host:port`，不能使用带路径或 query 的网页 WebSocket URL；因此每个标签使用独立随机转发端口。
 - 浏览器只要仍连接后端，用户即可正常使用 Codex TUI，包括模型选择、模式切换、审批、人工提问和 steering。
 - 浏览器首次附着时接收一次有限 snapshot；WebSocket 重连携带 `generation + nextOffset`，只补发缺失字节。缓存代次变化或游标过旧时才明确 reset。
-- `ResizeObserver` 只在 xterm 行列数实际变化时调整 PTY；连接建立不强制抢占焦点。TUI 的 DECSET 12 光标闪烁请求由前端消费，以保持稳定光标。
+- `ResizeObserver` 允许 xterm 在浏览器中立即适配，但对真实 PTY 的 resize 使用 trailing debounce，只在行列数短暂稳定后发送最后一个值。后端缓存终端启动前收到的尺寸并以该尺寸创建 ConPTY，同时忽略相同行列数的重复请求；最后确认的 `cols/rows` 写入该标签 `runtime.json`，使整个工具重启后的自动恢复也直接使用正确尺寸。这可避免拖动分栏、窗口缩放或长历史加载期间触发 Codex TUI 的整屏重绘风暴。连接建立不强制抢占焦点。TUI 的 DECSET 12 光标闪烁请求由前端消费，以保持稳定光标。
+- 恢复长对话的大终端快照或 PTY resize 后，TUI 即使只收到一次 resize 也可能耗时数秒逐帧重排历史。前端只对超过阈值的长终端在快照 reset 和真实 resize 开始时显示稳定遮罩；解除遮罩同时要求最后一批 xterm 写入已进入 quiet window，且末尾画面已经出现 Codex 输入提示和模型状态栏。历史帧之间即使短暂安静也不会提前显示，并设最大超时兜底。中间帧仍由真实 xterm 完整消费，但不会反复暴露给用户；短对话、新会话选择界面和审批界面不受遮罩规则影响。
+- TUI 成功完成初始 `thread/start` 或 `thread/resume` 后，`PtyManager` 向该 PTY 写入一次未提交的空格，使 Codex 的输入草稿保持非空，规避空输入状态下的光标重绘跳动。同一 PTY generation 只执行一次；浏览器刷新、WebSocket 重连和 snapshot 重放均不得触发。该空格只存在于真实 TUI 草稿，自动队列仍仅通过 `turn/start` / `turn/steer` 提交。
 - 终端输出默认不写入磁盘，避免保存 token、路径、命令输出或其他敏感内容。
 - Codex TUI 退出后 PowerShell 保持打开，标签标记为“Codex 已退出”，自动队列软暂停。用户可点击“重新打开 Codex”。
 
@@ -277,7 +303,7 @@ codex resume <thread-id> --remote ws://127.0.0.1:<tui-proxy-port> --no-alt-scree
 
 | 状态 | 样式 | 可编辑 | 可拖动 | 可删除 | 其他操作 |
 | --- | --- | --- | --- | --- | --- |
-| `pending` | 正常 | 是 | 是，仅在 pending 间 | 是 | 插入前/后 |
+| `pending` | 正常 | 是（铅笔按钮） | 是，仅在 pending 间 | 是 | 立即插入 |
 | `dispatching` | 蓝色 | 否 | 否 | 否 | 无 |
 | `running` | 高亮/动画 | 否 | 否 | 否 | 可从 TUI 人工 steering |
 | `completed` | 灰色 | 否 | 否 | 否 | 查看回答 |
@@ -289,6 +315,13 @@ codex resume <thread-id> --remote ws://127.0.0.1:<tui-proxy-port> --no-alt-scree
 
 “重试”会增加一次 attempt，将条目设回 `pending` 并放到 pending 区首位；“跳过”把条目设为 `skipped` 并移入历史区。
 
+“立即插入”的语义：
+
+- thread 正在运行 turn：调用 `turn/steer`，把该 pending prompt 追加到当前轮，不调用 `turn/interrupt`，也不另起 turn；条目保存相同的 `codexTurnId`，attempt 记录 `delivery: steer`。
+- thread 空闲：把选中项移到当前 thread 的 pending 区首位并按普通 `turn/start` 立即执行。若队列原本正在运行，完成后继续后续队列；若原本暂停，只执行这一项，完成后恢复暂停，其他 pending 保持排队。
+- 活跃 turn 在检测与 `turn/steer` 之间恰好结束时，回退到上述空闲执行语义，确保点击不会丢失。
+- 同一 turn 中由 `turn/start` 和一个或多个 `turn/steer` 送入的队列条目分别保留在 prompt list；turn 结束时它们同时完成并共享完成时间，但 `final-answers.json` 按 turn 只写一条回答，并在 metadata 中记录全部 `promptIds` 与 `steeredPromptIds`。
+
 ## 6. 应用生命周期
 
 ### 6.1 启动流程
@@ -297,7 +330,7 @@ codex resume <thread-id> --remote ws://127.0.0.1:<tui-proxy-port> --no-alt-scree
 2. 服务获得数据目录的独占进程锁。
 3. 读取并校验 `data/index.json` 与各标签文件。
 4. 在清理进程残留前读取 `session.reopenOnLaunch`；兼容旧数据时，带有效路径与 thread ID 的 `ready` 标签也视为待恢复。
-5. 将进程重启前遗留的 `ready/connecting` 标签临时恢复为 `closed`，终端设为 stopped，队列设为 paused，并清理过期的 App Server 归属信息。
+5. 将进程重启前遗留的 `ready/connecting` 标签临时恢复为 `closed`，终端设为 stopped，队列设为 paused；所有失去存活运行器的 `running/dispatching` prompt 及 attempt 设为 `interrupted`，写入恢复时间，并将同 turn 的 answer 记录原位收尾为 `interrupted`，再清理过期的 App Server 归属信息。自动恢复或手工同步历史时，以 Codex 返回的 failed/interrupted/canceled 状态再次校准，不把过程性 agent message 当作 final answer。
 6. 启动 Fastify，只监听 `127.0.0.1` 随机端口。
 7. 对所有待恢复标签并行执行与“重新打开终端”相同的恢复流程；单个标签失败只写入该标签错误，不阻塞其他标签和 HTTP 服务。
 8. 生成一次性浏览器令牌，打开默认浏览器；自动恢复中的标签显示 `connecting`，恢复完成后通过 snapshot 更新为 `ready`。
@@ -313,7 +346,7 @@ sequenceDiagram
 
     UI->>API: POST /tabs/:id/session {mode:new,cwd}
     API->>API: 校验路径与标签状态
-    API->>PTY: 在 cwd 启动 PowerShell 和 codex --remote --no-alt-screen
+API->>PTY: 在 cwd 启动 PowerShell 和 codex --remote --no-alt-screen
     PTY->>AS: TUI 发起 thread/start
     AS-->>PTY: thread {id, sessionId, cwd}
     API->>API: 代理规范化 legacy history 并捕获 thread id
@@ -336,7 +369,7 @@ sequenceDiagram
 
     UI->>API: POST /tabs/:id/session {mode:resume,cwd,resumeId}
     API->>AS: thread/read 预检 thread 是否存在
-    API->>PTY: 启动 PowerShell 和 codex --remote resume id --no-alt-screen
+API->>PTY: 启动 PowerShell 和 codex --remote resume id --no-alt-screen
     API->>AS: thread/read 轮询至 idle/active
     API->>AS: controller thread/resume {threadId,cwd}
     AS-->>API: controller 已订阅
@@ -414,7 +447,7 @@ codex-promptor:<tabId>:<promptId>:<attemptNo>
 
 - 每轮完成后重新读取列表；没有 pending 项时自动把 `desiredState` 和状态持久化为 paused。
 - 在最后一轮执行期间新增的 pending 项仍会被下一轮读取并执行，直至真正清空后才暂停。
-- 在 ready 对话中添加第一条 pending prompt 会自动启动队列。
+- 在 ready 对话中添加第一条 pending prompt 会自动启动队列；如果队列已暂停且当前 thread 已有 pending 项，继续添加 prompt 只追加到队列，不把 `desiredState` 改为 running。
 
 ### 6.9 人工输入与自动队列共存
 
@@ -422,10 +455,9 @@ codex-promptor:<tabId>:<promptId>:<attemptNo>
 - `clientUserMessageId` 匹配本工具格式的 turn 归类为 queue；其他 turn 归类为 manual。
 - 如果用户在队列准备提交前先发起 manual turn，thread 会变为 active，runner 等待其结束。
 - 如果用户在 queue turn 运行中 steering，追加输入属于同一个 turn：
-  - 不新建 prompt list 条目；
-  - 保留原队列 prompt；
-  - 在 answer 的 `promptSnapshot.steeringInputs` 中记录追加输入；
-  - final answer 仍关联原 queue prompt。
+  - 用户直接在 TUI 输入的 steering 不新建 prompt list 条目；
+  - 通过 pending 条目“立即插入”的 steering 保留为独立 prompt list 条目，并记录 `delivery: steer`；
+  - 所有输入仍属于同一个 `codexTurnId`，final answer 按 turn 只保存一次，并在 metadata 关联全部本地 prompt ID。
 - 独立 manual turn 完成后，会生成一条 `origin: manual` 的灰色完成 prompt 和对应 answer。
 
 ### 6.10 多标签并行
@@ -478,6 +510,7 @@ codex-promptor:<tabId>:<promptId>:<attemptNo>
 | `thread/loaded/list` | 重连时辅助检查已加载 thread。 |
 | `thread/unsubscribe` | 仅用于普通取消订阅；不能代替关闭，因为最后一个订阅者离开后仍有保留期。 |
 | `turn/start` | 自动提交 prompt。 |
+| `turn/steer` | 将“立即插入”的 pending prompt 追加到当前活跃 turn，且不打断。 |
 | `turn/interrupt` | 关闭对话时中断队列或人工活动 turn；普通队列不提供手动中断按钮。 |
 
 ### 7.3 关键事件
@@ -513,6 +546,8 @@ codex-promptor:<tabId>:<promptId>:<attemptNo>
    - manual/imported turn 不生成 answer，仅计入导入/同步警告。
 
 保存的是 `item/completed` 中的完整文本，不是 delta 拼接文本。
+
+队列 turn 创建成功后，不等待 `turn/completed` 即按 `(threadId, turnId)` 幂等写入 `status: running`、prompt 快照及 `startedAt`。后续完成、中断或失败只更新这一条记录，并写入 `completedAt`；中断/失败的 `finalAnswer` 保持空字符串，`captureMode` 为 `null`，原因写入 `error`。
 
 ### 7.5 审批与用户输入请求
 
@@ -769,12 +804,14 @@ Attempt 示例：
         ],
         "steeringInputs": []
       },
+      "status": "completed",
       "finalAnswer": "项目包含……",
       "answerItemId": "0198dabe-3456-7cde-8fab-23456789abcd",
       "captureMode": "phase_final_answer",
       "startedAt": "2026-08-20T06:00:00.000Z",
       "completedAt": "2026-08-20T06:04:00.000Z",
-      "recordedAt": "2026-08-21T09:01:01.000Z"
+      "recordedAt": "2026-08-21T09:01:01.000Z",
+      "error": null
     }
   ]
 }
@@ -784,6 +821,7 @@ Attempt 示例：
 
 - `(codexThreadId, codexTurnId)` 在文件内唯一。
 - `promptId` 必须引用 `prompt-list.json` 中的一条记录。
+- `status` 为 `running | completed | interrupted | failed`；`running` 时 `completedAt` 为 `null`，其他状态应写入收尾时间。
 - 保存 prompt 快照，确保即使未来新增迁移逻辑，也不会改变历史回答对应的原输入。
 - `captureMode` 为：
   - `phase_final_answer`；
@@ -993,6 +1031,7 @@ stateDiagram-v2
 | `PATCH` | `/api/tabs/:tabId/runner/config` | 设置 `onFailure`。 |
 | `POST` | `/api/tabs/:tabId/prompts/:promptId/retry` | 失败项重试。 |
 | `POST` | `/api/tabs/:tabId/prompts/:promptId/skip` | 失败项跳过。 |
+| `POST` | `/api/tabs/:tabId/prompts/:promptId/insert-now` | 活跃时 steering；空闲时立即执行该项。 |
 
 `PUT .../order` 必须提交当前所有 pending ID，不能包含非 pending、重复或未知 ID。否则整个请求失败，不做部分排序。
 
@@ -1167,16 +1206,27 @@ Queue turn 成功时：
 
 脚本不得自动登录 Codex、修改用户 Codex 配置或安装不同 Codex 版本；只输出明确指引。
 
+### 16.9 终端会话（provider `shell`）
+
+不连接任何编程代理的对话类型：只在工作目录下启动一个 PowerShell（`pty.startShell` → 复用 `startCommand`），不启动 App Server、TUI 转发或 hook 适配器。
+
+- `threadId` 与 `sessionId` 恒为 `null`，不造假 id。凡以它们为前提的能力自动失效：队列的 `runnable` 判定、控制台栏的「同步历史」按钮。
+- 工作路径允许留空，回落顺序为 `请求值 → %USERPROFILE% → process.cwd()`；代理会话仍必须给出有效目录。
+- 队列与 runner 路由由 `assertQueueUsable` 统一拒绝。**这一层不可省略**：RunnerManager 的 binder 末尾是 `codex.get(tabId)`，会为没有代理的标签创建 App Server 实例，因此拒绝必须发生在路由碰到 runner 之前，仅靠前端禁用按钮不够。
+- `POST /history/sync` 对终端返回 `SHELL_HAS_NO_HISTORY`。
+- 参与重启恢复：`tabsToRestore` 以「有 threadId **或** 是终端」为条件，工作目录才是终端可恢复的依据。
+- 用户在终端里执行 `exit` 属于正常结束，不写入「代理 TUI 意外退出」错误。
+
 ### 17.2 `start.ps1`
 
 职责：
 
 1. 解析脚本所在目录作为工具根目录。
-2. 检查生产构建是否存在。
+2. 检查生产构建是否存在且是否落后于源码：比较 `src/`、`config/`、`package.json`、`package-lock.json` 的最新修改时间与 `dist/` 的最新修改时间，缺失或落后时执行 `npm run build`。`-Force` 无条件重建，`-NoBuild` 跳过检查（此时缺少构建产物必须报错而不是静默启动）。
 3. 如果已有实例，读取受保护的本地实例信息并打开其 URL。
 4. 否则启动 Node 服务。
 5. 等待服务 ready 后打开默认浏览器，地址固定为 `http://127.0.0.1:4317/`。
-6. 页面建立独立生命周期 WebSocket；最后一个页面断开 5 秒且未重连时自动退出，普通刷新会在宽限期内取消退出。
+6. 页面建立独立生命周期 WebSocket；最后一个页面断开 30 秒且未重连时自动退出，普通刷新或重新打开页面会在宽限期内取消退出。自动退出前必须中断活跃 turn 并持久化中断记录。
 7. 用户 Ctrl+C、最后页面关闭或服务退出时，按顺序关闭 PTY、controller、App Server 和 HTTP 服务。
 
 后台进程使用 Windows Job Object 或等价的父子进程管理，避免关闭服务后遗留 Codex/PowerShell 子进程。
@@ -1302,7 +1352,7 @@ src/
 - [ ] 页面中显示真实 PowerShell 和真实 Codex TUI。
 - [ ] 自动队列不写 PTY 输入，只通过 App Server 提交。
 - [ ] 用户可在 TUI 中选择模型、人工提问和 steering，工具不阻止这些行为。
-- [ ] Prompt list 支持新增、编辑、插入、删除和 pending 拖动。
+- [ ] Prompt list 支持新增、铅笔编辑、立即插入、删除和 pending 拖动。
 - [ ] 当前执行结束后按照最新 pending 顺序选择下一项。
 - [ ] 完成项灰色、不可编辑并记录开始/完成时间。
 - [ ] 软暂停不打断当前 turn。
