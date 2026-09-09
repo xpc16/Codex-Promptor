@@ -24,6 +24,7 @@
   --provider-cursor: #596ed0;
   --provider-shell: #768398;
   --provider-e2ee: #c76e12;
+  --a2a: #7c4dd0;
   --shadow: 0 8px 26px rgba(42, 55, 80, .09);
   background: var(--page);
   color: var(--text);
@@ -52,6 +53,7 @@
   --provider-cursor: #92a3ff;
   --provider-shell: #9aa8bd;
   --provider-e2ee: #f3a94a;
+  --a2a: #b18cf0;
   --shadow: 0 9px 30px rgba(0, 0, 0, .2);
 }
 
@@ -291,6 +293,17 @@ input, textarea, select { color: var(--text); }
 .interrupt-button:hover:not(:disabled) { filter: brightness(.94); }
 .queue-card > .runner-error { flex: none; margin: 8px 0 0; overflow-wrap: anywhere; }
 .status-dot.running { background: var(--primary); box-shadow: 0 0 8px color-mix(in srgb, var(--primary) 55%, transparent); }
+/* A collaboration light: steady while any root this conversation joined is
+   unfinished, including while it is only waiting for someone else. No
+   animation -- it is a lifecycle, not a heartbeat. */
+.status-dot.a2a { background: var(--a2a); box-shadow: 0 0 8px color-mix(in srgb, var(--a2a) 58%, transparent); }
+.queue-state.a2a { color: var(--a2a); }
+.a2a-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 0; padding: 6px 10px; border: 1px solid color-mix(in srgb, var(--a2a) 34%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--a2a) 8%, var(--panel-soft)); color: var(--muted); font-size: 12px; }
+.a2a-bar strong { color: var(--a2a); font-weight: 600; }
+.a2a-bar .a2a-note { color: var(--notice); }
+.a2a-bar .a2a-soft { padding: 0 6px; border: 1px solid var(--border); border-radius: 999px; }
+.a2a-bar .a2a-actions { margin-left: auto; display: flex; gap: 10px; }
+.a2a-badge { padding: 0 6px; border-radius: 999px; background: color-mix(in srgb, var(--a2a) 16%, transparent); color: var(--a2a); font-size: 11px; }
 .prompt-list { flex: 1; min-height: 0; overflow-y: auto; display: grid; align-content: start; gap: 8px; margin-top: 10px; padding-right: 3px; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .prompt-row { position: relative; display: grid; grid-template-columns: 24px 18px minmax(0, 1fr) auto; column-gap: 7px; row-gap: 0; align-items: start; padding: 10px 9px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel-soft); transition: .14s; }
 .prompt-row > textarea { grid-column: 3; grid-row: 1; }

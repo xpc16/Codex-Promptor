@@ -40,6 +40,9 @@ import { discoverSessions, importedSessionIds, importedTabName } from "./session
 import { CLAUDE_EXIT_MARKER, CODEX_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
 import { isSlashCommandPrompt } from "./prompt-submit.js";
 import { RunnerManager } from "./queue.js";
+import { A2aError, A2aService } from "./a2a-service.js";
+import { A2aPrefixError, parsePromptPrefix, restorePromptPrefix } from "./a2a-preamble.js";
+import type { A2aPromptMeta } from "../shared/a2a.js";
 import { recordsForCurrentThread, StorageService } from "./storage.js";
 import { TimerService, TimerServiceError } from "./timer-service.js";
 import {
@@ -63,7 +66,7 @@ import { HANDSHAKE_PROOF, HANDSHAKE_READY, KEY_CHANGED_CLOSE_CODE, allowedBefore
 import { redactForScope } from "./e2ee-redaction.js";
 import { normalizePassphrase } from "../shared/e2ee-keys.js";
 import { nameForSession } from "../shared/session-tab-name.js";
-import { classifyNetworkScope, type NetworkScope } from "./traffic-scope.js";
+import { classifyNetworkScope, isLoopbackAddress, type NetworkScope } from "./traffic-scope.js";
 import { buildIndexDelta, indexDeltaIsEmpty } from "../shared/index-delta.js";
 import { createTrafficLog } from "./traffic-log.js";
 import { chooseResumeThread } from "./codex-thread-fallback.js";
@@ -169,6 +172,9 @@ export type PromptorApp = FastifyInstance & {
     ui: UiLifecycle;
     traffic: TerminalTrafficMeter;
     documents: DocumentService;
+    a2a: A2aService;
+    /** The per-conversation credential a launched CLI is given. Exposed so A2A can be exercised without one. */
+    issueHookLease: (provider: "codex" | "claude" | "cursor", tabId: string) => { nonce: string; secret: string };
     token: string;
     restoreOpenSessions: () => Promise<RestoreOpenSessionsSummary>;
     importDiscoveredSessions: () => Promise<ImportSummary>;
@@ -232,7 +238,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   await storage.ensure();
   const trustedHosts = await loadTrustedBrowserHosts(rootDir, process.env.CODEX_PROMPTOR_TRUSTED_HOSTS);
   const documents = await DocumentService.create(rootDir, storage);
-  const readClientTab = (tabId: string): Promise<TabBundle> => storage.readTabWindow(tabId, INITIAL_PROMPT_WINDOW, INITIAL_ANSWER_WINDOW);
+  /**
+   * The bundle a page gets. The collaboration summary is projected here rather
+   * than stored per tab: its authority is the root records, and a participant
+   * has to keep showing the light even when its own queue has nothing left.
+   */
+  const readClientTab = async (tabId: string): Promise<TabBundle> => {
+    const bundle = await storage.readTabWindow(tabId, INITIAL_PROMPT_WINDOW, INITIAL_ANSWER_WINDOW);
+    const summary = await a2a.summaryForTab(tabId, bundle.tab.session.state).catch(() => undefined);
+    return summary ? { ...bundle, a2a: summary } : bundle;
+  };
 
   /**
    * The key this machine is currently using, or null when encryption is off.
@@ -402,6 +417,64 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
   };
 
+  /**
+   * Agent to Agent, off unless asked for.
+   *
+   * Every message it carries is a real model turn on this machine, so the
+   * default has to be the one a reader would not mind discovering after the
+   * fact (docs/AGENT_TO_AGENT.md 5.2).
+   */
+  const a2aEnabled = process.env.CODEX_PROMPTOR_A2A === "1";
+  const a2a = new A2aService({
+    storage,
+    rootDir,
+    enabled: () => a2aEnabled,
+    notifyTab: (tabId) => { void emitSnapshot(tabId); },
+    enqueue: (targetTabId, text, meta) => enqueueA2aPrompt(targetTabId, text, meta),
+  });
+
+  /**
+   * One inbound message becomes one ordinary queue prompt, with the target's
+   * own rules deciding whether it waits or runs. It is never inserted into a
+   * running turn and never wakes a queue the user paused.
+   */
+  const enqueueA2aPrompt = async (targetTabId: string, text: string, meta: A2aPromptMeta): Promise<{ promptId: string; delivery: "queued" | "waitingForStart"; threadId: string }> => {
+    let armed = false;
+    let delta: PromptDelta | null = null;
+    const result = await storage.withTabLock(targetTabId, async () => {
+      const bundle = await storage.readTab(targetTabId);
+      const session = bundle.tab.session;
+      if (session.provider === "shell" || session.provider === "e2ee") {
+        throw new A2aError("A2A_TARGET_NOT_AGENT", 400, "终端和加密开关不是 agent 对话，不能作为协作对象。");
+      }
+      if (session.state === "closed") throw new A2aError("A2A_TARGET_CLOSED", 423, "目标对话已关闭，不会自动重新打开。");
+      if (session.state !== "ready" || !session.threadId) {
+        throw new A2aError("A2A_TARGET_NOT_READY", 409, "目标对话还没有连接，请先让用户打开它。");
+      }
+      armed = bundle.runtime.runner.desiredState === "armed";
+      const prompt = newPrompt(text, "queue");
+      prompt.a2a = meta;
+      // Bound to the thread it was addressed to: if the conversation is later
+      // switched to another one, the queue will not deliver it there.
+      prompt.threadId = session.threadId;
+      bundle.prompts.prompts.push(prompt);
+      bundle.prompts.revision += 1;
+      bundle.prompts.updatedAt = isoNow();
+      delta = await storage.writePrompts(targetTabId, bundle.prompts);
+      return {
+        promptId: prompt.id,
+        threadId: session.threadId,
+        delivery: (bundle.runtime.runner.desiredState === "paused" ? "waitingForStart" : "queued") as "queued" | "waitingForStart",
+      };
+    });
+    // storage.onPromptsChanged already pushed the queue delta to subscribers;
+    // the snapshot follows so the collaboration summary moves with it.
+    void delta;
+    if (armed) await runners.get(targetTabId).start().catch(() => undefined);
+    void emitSnapshot(targetTabId);
+    return result;
+  };
+
   const sendRawTerminal = (
     client: Client,
     tabId: string,
@@ -525,6 +598,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const runners = new RunnerManager(storage, (tabId) => cursor.existing(tabId)
     ?? claude.existing(tabId)
     ?? (codexConnectionMode === "pty-hooks" ? codexTui.get(tabId) : codex.get(tabId)), (event) => {
+    // Queue activity is the only signal a collaboration needs: a pending end
+    // is confirmed when the turn that requested it actually lands, so nothing
+    // has to poll for it.
+    if (a2aEnabled && (event.type === "runtime" || event.type === "answer")) void a2a.onQueueEvent(event.tabId).catch(() => undefined);
     if (event.type === "error") emit(event.tabId, { type: "error", error: event.data });
     if (event.type === "answer") {
       const answer = event.data as AnswerRecord | undefined;
@@ -538,6 +615,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         });
       }
     }
+  }, async ({ tabId, prompt, attemptId, threadId }) => {
+    if (!a2aEnabled || !prompt.a2a) return null;
+    const tab = await storage.getTabMeta(tabId).catch(() => null);
+    if (!tab) return null;
+    return a2a.prepareDispatch({ tab, prompt, attemptId, threadId });
   });
   const timers = new TimerService(storage, (tabId) => runners.get(tabId), (key, active) => ui.setBackgroundHold(key, active));
 
@@ -1642,7 +1724,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   trafficPruneTimer?.unref?.();
   if (trafficLoggingEnabled) void trafficLog.prune();
 
-  app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, token, restoreOpenSessions, importDiscoveredSessions, close: async () => {
+  app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, a2a, issueHookLease, token, restoreOpenSessions, importDiscoveredSessions, close: async () => {
     clearInterval(stallTimer);
     if (trafficFlushTimer) clearInterval(trafficFlushTimer);
     if (trafficPruneTimer) clearInterval(trafficPruneTimer);
@@ -1883,6 +1965,52 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   app.addHook("onSend", async (request, reply, payload) => {
     if (request.url.startsWith("/api/documents/") && reply.statusCode >= 400) reply.header("Cache-Control", "no-store");
     return payload;
+  });
+
+  /**
+   * The one A2A endpoint.
+   *
+   * The lease in the URL is what says who is calling -- an agent cannot claim
+   * an identity, and is never handed the app token, which would let it turn
+   * encryption off. Local only, and never through a proxy: a tunnel must not
+   * be able to reach this even though it connects from the loopback address
+   * (docs/AGENT_TO_AGENT.md §2.2, §2.3).
+   */
+  app.post("/a2a/:provider/:tabId/:nonce", { bodyLimit: 64 * 1024 }, async (request, reply) => {
+    const provider = String((request.params as any).provider);
+    const tabId = String((request.params as any).tabId);
+    if (provider !== "codex" && provider !== "claude" && provider !== "cursor") return reply.code(404).send();
+    if (!hookAuthorized(provider, tabId, String((request.params as any).nonce), request.headers.authorization)) return reply.code(401).send();
+    if (!isLocalA2aRequest(request.headers, request.raw.socket?.remoteAddress)) {
+      return reply.code(403).send({ error: { code: "A2A_LOCAL_ONLY", message: "A2A 只接受本机 CLI 调用，不经过隧道或反向代理。", details: {}, retryable: false } });
+    }
+    try {
+      const data = await a2a.handle({ provider, tabId }, (request.body ?? {}) as Record<string, unknown>);
+      return reply.send({ data });
+    } catch (error) {
+      if (error instanceof A2aError) {
+        return reply.code(error.statusCode).send({
+          error: { code: error.code, message: error.message, details: error.details, retryable: error.retryable },
+        });
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      return reply.code(500).send({ error: { code: "A2A_FAILED", message, details: {}, retryable: false } });
+    }
+  });
+
+  /** The page's own end of a collaboration. Same lock and the same settle as the agent's `finish`. */
+  app.post("/api/a2a/roots/:rootId/:action", async (request, reply) => {
+    const rootId = String((request.params as any).rootId);
+    const action = String((request.params as any).action);
+    if (action !== "finish" && action !== "stop") return apiError(reply, 404, "A2A_ACTION_UNKNOWN", "只支持 finish 和 stop。");
+    try {
+      const root = await a2a.endRootFromUser(rootId, action === "stop" ? "stop" : "complete");
+      for (const member of root.members) void emitSnapshot(member.tabId);
+      return reply.send({ data: { rootId: root.rootId, status: root.status, endedAt: root.endedAt, endReason: root.endReason } });
+    } catch (error) {
+      if (error instanceof A2aError) return apiError(reply, error.statusCode, error.code, error.message);
+      return apiError(reply, 500, "A2A_END_FAILED", error instanceof Error ? error.message : String(error));
+    }
   });
 
   app.get("/api/health", async (_request, reply) => reply.send({ data: { ok: true, codex: codex.status, codexConnectionMode, claude: await claudeVersion, cursor: await cursorVersion } }));
@@ -2785,8 +2913,31 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   app.post("/api/tabs/:tabId/prompts", async (request, reply) => {
     const tabId = String((request.params as any).tabId);
     const body = (request.body ?? {}) as any;
-    const text = String(body.text ?? "").trim();
-    if (!text) return apiError(reply, 400, "PROMPT_EMPTY", "Prompt text cannot be empty.");
+    const raw = String(body.text ?? "").trim();
+    if (!raw) return apiError(reply, 400, "PROMPT_EMPTY", "Prompt text cannot be empty.");
+    // `@@` is recognised here, at the queue entry point, because this is the
+    // one place every provider's user text passes through and the server can
+    // see all of it (docs/AGENT_TO_AGENT.md §4.1).
+    let prefix;
+    try { prefix = parsePromptPrefix(raw); }
+    catch (error) {
+      if (error instanceof A2aPrefixError) return apiError(reply, 400, error.code, error.message);
+      throw error;
+    }
+    if (prefix.kind === "a2a" && !a2aEnabled) {
+      return apiError(reply, 400, "A2A_DISABLED", "A2A 协作未启用。设置 CODEX_PROMPTOR_A2A=1 后重启即可使用 @@。");
+    }
+    if (prefix.kind === "a2a") {
+      // A skill that does not exist, or does not parse, is refused before the
+      // prompt is stored: a collaboration must never silently start without
+      // the permissions its author wrote.
+      try { await a2a.loadSkill(prefix.skill); }
+      catch (error) {
+        if (error instanceof A2aError) return apiError(reply, error.statusCode, error.code, error.message);
+        throw error;
+      }
+    }
+    const text = prefix.text;
     try {
       let armed = false;
       let delta: PromptDelta | null = null;
@@ -2797,6 +2948,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           && Boolean(bundle.tab.session.threadId)
           && bundle.runtime.runner.desiredState === "armed";
         const next = newPrompt(text, "queue");
+        if (prefix.kind === "a2a") next.a2a = { rootId: next.id, skill: prefix.skill, depth: 0, fromTabId: null, fromPromptId: null };
         const beforeId = body.beforeId ? String(body.beforeId) : null;
         const afterId = body.afterId ? String(body.afterId) : null;
         const before = beforeId ? bundle.prompts.prompts.findIndex((item) => item.id === beforeId) : -1;
@@ -2811,6 +2963,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       // An armed queue is idle but waiting to be fed: adding a prompt is the
       // start signal, so the user does not have to add and then press start.
       // A paused queue was stopped deliberately and must stay stopped.
+      // The root exists before the queue can dispatch it, and starts `pending`:
+      // a collaboration sitting in a paused queue has not begun.
+      if (prefix.kind === "a2a") {
+        await a2a.beginRoot({ originTabId: tabId, originPromptId: prompt.id, skillName: prefix.skill });
+        void emitSnapshot(tabId);
+      }
       if (armed) await runners.get(tabId).start().catch(() => undefined);
       return reply.send({ data: { prompt, delta } });
     } catch (error) {
@@ -2825,6 +2983,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const tabId = String((request.params as any).tabId);
     const promptId = String((request.params as any).promptId);
     const body = (request.body ?? {}) as any;
+    // A holder, not a `let`: the assignment happens inside the tab lock's
+    // closure, which TypeScript cannot narrow through.
+    const created: { root: { promptId: string; skill: string } | null } = { root: null };
     try {
       const { prompt, delta } = await storage.withTabLock(tabId, async () => {
         const bundle = await storage.readTab(tabId);
@@ -2833,17 +2994,40 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         if (!prompt) throw new Error("PROMPT_NOT_FOUND");
         if (["completed", "running", "dispatching"].includes(prompt.status)) throw new Error("PROMPT_READ_ONLY");
         if (body.text !== undefined) {
-          const text = String(body.text).trim();
-          if (!text) throw new Error("PROMPT_EMPTY");
-          prompt.text = text;
+          // The composer round-trips the prefix, so editing goes through the
+          // same parser: the stored text stays clean, and an existing root
+          // keeps its identity and its spent budget.
+          const edited = parsePromptPrefix(String(body.text).trim());
+          if (!edited.text) throw new Error("PROMPT_EMPTY");
+          prompt.text = edited.text;
+          if (edited.kind === "a2a" && a2aEnabled) {
+            const rootId = prompt.a2a?.rootId ?? prompt.id;
+            const started = prompt.a2a ? await a2a.readRoot(rootId) : null;
+            // A running collaboration executes the version it froze at start.
+            const skill = started && started.status !== "pending" ? started.skill : edited.skill;
+            if (!prompt.a2a) await a2a.loadSkill(skill);
+            prompt.a2a = { ...(prompt.a2a ?? { depth: 0, fromTabId: null, fromPromptId: null }), rootId, skill };
+            created.root = prompt.a2a.depth === 0 && !started ? { promptId: prompt.id, skill } : null;
+          } else if (edited.kind !== "a2a" && prompt.a2a) {
+            throw new Error("A2A_PREFIX_REQUIRED");
+          }
         }
         prompt.updatedAt = isoNow();
         bundle.prompts.revision += 1;
         bundle.prompts.updatedAt = isoNow();
         return { prompt, delta: await storage.writePrompts(tabId, bundle.prompts) };
       });
+      if (created.root) {
+        await a2a.beginRoot({ originTabId: tabId, originPromptId: created.root.promptId, skillName: created.root.skill });
+        void emitSnapshot(tabId);
+      }
       return reply.send({ data: { prompt, delta } });
-    } catch (error) { const message = error instanceof Error ? error.message : String(error); return apiError(reply, message.includes("对话已关闭") ? 423 : 400, message.includes("对话已关闭") ? "CONVERSATION_CLOSED" : "PROMPT_UPDATE_FAILED", message); }
+    } catch (error) {
+      if (error instanceof A2aPrefixError) return apiError(reply, 400, error.code, error.message);
+      if (error instanceof A2aError) return apiError(reply, error.statusCode, error.code, error.message);
+      const message = error instanceof Error ? error.message : String(error);
+      return apiError(reply, message.includes("对话已关闭") ? 423 : 400, message.includes("对话已关闭") ? "CONVERSATION_CLOSED" : "PROMPT_UPDATE_FAILED", message);
+    }
   });
 
   app.delete("/api/tabs/:tabId/prompts/:promptId", async (request, reply) => {
@@ -2912,10 +3096,18 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   app.post("/api/tabs/:tabId/prompts/:promptId/insert-now", async (request, reply) => {
     try {
       const tabId = String((request.params as any).tabId);
-      assertQueueUsable(await storage.readTab(tabId));
+      const bundle = await storage.readTab(tabId);
+      assertQueueUsable(bundle);
+      const promptId = String((request.params as any).promptId);
+      // A collaboration message runs as its own turn. Steering it into the
+      // turn already in flight would mix two collaboration contexts into one
+      // (docs/AGENT_TO_AGENT.md §4.1).
+      if (bundle.prompts.prompts.find((item) => item.id === promptId)?.a2a) {
+        return apiError(reply, 400, "A2A_INSERT_NOW_UNSUPPORTED", "协作消息按独立轮次执行，不能插入当前轮，请等待排队执行。");
+      }
       const body = (request.body ?? {}) as any;
       const result = await runners.get(tabId).insertNow(
-        String((request.params as any).promptId),
+        promptId,
         body.text === undefined ? undefined : String(body.text),
       );
       return reply.send({ data: { ...result, runtime: await storage.readRuntime(tabId) } });
@@ -3717,6 +3909,25 @@ function assertQueueUsable(bundle: TabBundle): void {
 
 function isActiveWriterError(message: string): boolean {
   return /active writer|already has an active writer|thread\/resume failed.*writer/i.test(message);
+}
+
+/**
+ * A2A is for CLIs running on this machine, and a tunnel connects from
+ * loopback too -- so listening on 127.0.0.1 proves nothing on its own. The
+ * Host has to be loopback as well, and any proxy marker at all is a refusal
+ * (docs/AGENT_TO_AGENT.md §2.3).
+ */
+export function isLocalA2aRequest(
+  headers: { host?: string; "x-forwarded-for"?: unknown; "x-forwarded-host"?: unknown; "x-forwarded-proto"?: unknown; forwarded?: unknown; "cf-connecting-ip"?: unknown; "cf-ray"?: unknown },
+  remoteAddress?: string | null,
+): boolean {
+  // An injected request has no socket. Absent is unknown, not remote.
+  if (remoteAddress !== undefined && remoteAddress !== null && !isLoopbackAddress(remoteAddress)) return false;
+  if (!isLocalHost(headers.host)) return false;
+  for (const marker of ["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded", "cf-connecting-ip", "cf-ray"] as const) {
+    if (headers[marker] !== undefined) return false;
+  }
+  return true;
 }
 
 export function isLocalHost(host: string | undefined): boolean {

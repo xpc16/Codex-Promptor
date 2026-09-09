@@ -21,7 +21,7 @@ import { entityTag } from "./http-cache.js";
  * chasing the case this one already makes cheap.
  */
 
-export const SNAPSHOT_SECTIONS = ["tab", "prompts", "answers", "runtime"] as const;
+export const SNAPSHOT_SECTIONS = ["tab", "prompts", "answers", "runtime", "a2a"] as const;
 
 export type SnapshotSection = (typeof SNAPSHOT_SECTIONS)[number];
 export type SnapshotTags = Record<SnapshotSection, string>;
@@ -39,6 +39,9 @@ export function snapshotTags(bundle: TabBundle): SnapshotTags {
     prompts: entityTag(JSON.stringify(bundle.prompts)),
     answers: entityTag(JSON.stringify(bundle.answers)),
     runtime: entityTag(JSON.stringify(bundle.runtime)),
+    // Undefined and "no roots" have to hash the same, or a page that holds
+    // neither would be re-sent the section forever.
+    a2a: entityTag(JSON.stringify(bundle.a2a ?? null)),
   };
 }
 
@@ -63,8 +66,12 @@ export function changedSnapshotSections(
   let moved = false;
   for (const section of SNAPSHOT_SECTIONS) {
     if (claimed[section] === tags[section]) continue;
-    (changed as Record<string, unknown>)[section] = bundle[section];
     moved = true;
+    // An optional section that is absent has nothing to send. Its tag still
+    // moved, and the page holds the new tag either way, so writing an explicit
+    // `undefined` here would only add a key that JSON drops on the way out.
+    if (bundle[section] === undefined) continue;
+    (changed as Record<string, unknown>)[section] = bundle[section];
   }
   if (!moved) return null;
   if (bundle.window) changed.window = bundle.window;

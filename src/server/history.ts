@@ -108,6 +108,17 @@ type RecoverableSubmission = {
  * have no provider turn (or only the synthetic interrupted-submission id), and
  * its start must be close to the provider turn. Ambiguity fails closed.
  */
+/**
+ * A transcript records what was typed, which is not always `prompt.text`: an
+ * A2A dispatch prepends its preamble. Matching on the attempt's own submitted
+ * text is what keeps the clean prompt from looking like a different one and
+ * being imported a second time.
+ */
+function promptWasSubmittedAs(prompt: PromptRecord, inputText: string): boolean {
+  if (sameSubmittedPrompt(prompt.text, inputText)) return true;
+  return prompt.attempts.some((attempt) => attempt.submittedText && sameSubmittedPrompt(attempt.submittedText, inputText));
+}
+
 function recoverableSubmissionForTurn(
   prompts: PromptRecord[],
   threadId: string,
@@ -122,7 +133,7 @@ function recoverableSubmissionForTurn(
     if ((prompt.origin !== "queue" && prompt.origin !== "timer")
       || (prompt.threadId && prompt.threadId !== threadId)
       || !["dispatching", "running", "interrupted"].includes(prompt.status)
-      || !sameSubmittedPrompt(prompt.text, inputText)) continue;
+      || !promptWasSubmittedAs(prompt, inputText)) continue;
     const previousTurnId = prompt.codexTurnId;
     if (previousTurnId && !previousTurnId.startsWith(INTERRUPTED_SUBMISSION_PREFIX)) continue;
     const attempt = [...prompt.attempts].reverse().find((item) => item.delivery === "turn"

@@ -379,6 +379,14 @@ export class StorageService {
     return this.mutex.run(`tab:${tabId}`, task);
   }
 
+  /**
+   * A collaboration root is serialised on the same mutex as tab writes, so
+   * there is one lock order in the process: root first, then target tab.
+   */
+  async withA2aRootLock<T>(rootId: string, task: () => Promise<T>): Promise<T> {
+    return this.mutex.run(`a2a:${rootId}`, task);
+  }
+
   async writeTab(tab: TabMeta): Promise<void> {
     const value = TabMetaSchema.parse(tab);
     await this.writeFile(this.tabPath(tab.id), value);

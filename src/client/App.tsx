@@ -15,6 +15,8 @@ import {
   type WheelEvent as ReactWheelEvent,
 } from "react";
 import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta, TabRecordPage } from "../shared/schemas.js";
+import type { A2aRootSummary } from "../shared/a2a.js";
+import { restorePromptPrefix } from "../shared/a2a-prefix.js";
 import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-link.js";
 import { randomPassphrase } from "../shared/e2ee-keys.js";
 import { deriveSessionKey } from "./e2ee-client.js";
@@ -1340,6 +1342,10 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   // are already off (runnable needs a threadId); this closes the composer too
   // so nothing can be queued that could never run.
   const isShell = bundle.tab.session.provider === "shell";
+  // The purple light belongs to the set of unfinished roots this conversation
+  // joined, not to its queue: waiting for someone else is still collaborating.
+  const a2aRoots = bundle.a2a?.roots ?? [];
+  const activeRoots = a2aRoots.filter((root) => root.status === "running" || root.status === "ending");
   const notebookOnly = !disabled && !isShell && !runnable;
   const runnerControlsDisabled = disabled || !runnable;
   const changeRunner = async (action: "start" | "pause" | "interrupt") => {
@@ -1423,13 +1429,58 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     if (!box || disabled || isShell) return;
     box.style.height = `${clampPromptComposerHeight(box.getBoundingClientRect().height + delta, window.innerHeight)}px`;
   };
-  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : runnerIsWorking(runtime.runner.state) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span>{stalledFor !== null && <span className="queue-state stalled" title={t("queue.stalledHelp", { minutes: stalledFor })}><i className="status-dot" /><span>{t("queue.stalled", { minutes: stalledFor })}</span></span>}</>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={showStartPending || undefined} onClick={() => void changeRunner("start")}>{t(showStartPending ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
+  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : runnerIsWorking(runtime.runner.state) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span>{stalledFor !== null && <span className="queue-state stalled" title={t("queue.stalledHelp", { minutes: stalledFor })}><i className="status-dot" /><span>{t("queue.stalled", { minutes: stalledFor })}</span></span>}</>}{activeRoots.length > 0 && <span className="queue-state a2a" title={t("a2a.runningHelp", { count: activeRoots.length })}><i className="status-dot a2a" /><span>{t("a2a.running")}</span></span>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={showStartPending || undefined} onClick={() => void changeRunner("start")}>{t(showStartPending ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
+    {activeRoots.map((root) => <A2aRootBar key={root.rootId} root={root} onError={onError} />)}
     <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t(notebookOnly ? "queue.notebookEmpty" : "queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} executionDisabled={!runnable} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; if (!sourceId) nativeDragTarget.current = null; }} onNativeDragTarget={(targetId) => { if (nativeDragSource.current) nativeDragTarget.current = targetId; }} onNativeDrop={() => { const sourceId = nativeDragSource.current; const targetId = nativeDragTarget.current; nativeDragSource.current = null; nativeDragTarget.current = null; if (sourceId && targetId) void reorder(sourceId, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}
     <div className="add-prompt"><div className="prompt-composer" ref={composerBox}><textarea ref={composer} disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><div className="prompt-composer-resizer" role="separator" aria-orientation="horizontal" aria-label={t("queue.resizeInput")} title={t("queue.resizeInput")} tabIndex={disabled || isShell ? -1 : 0} onPointerDown={beginComposerResize} onPointerMove={moveComposerResize} onPointerUp={endComposerResize} onPointerCancel={endComposerResize} onLostPointerCapture={() => { composerResize.current = null; }} onKeyDown={(event) => { if (event.key === "ArrowUp" || event.key === "ArrowDown") { event.preventDefault(); nudgeComposerHeight(event.key === "ArrowUp" ? 20 : -20); } }} /></div><div className="compose-tools"><button className="compose-tool" disabled={!runnable} title={t(runnable ? "queue.timers" : "queue.connectForTimers")} aria-label={t("queue.timers")} onClick={() => { if (!runnable) return; setTimerMounted(true); setTimerOpen(true); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3 4 6M17 3l3 3M5.5 11a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm6.5-3v3.5l2.2 1.4M8 19l-1.5 2M16 19l1.5 2" /></svg></button><button className="compose-tool" title={t("queue.commonPrompts")} aria-label={t("queue.commonPrompts")} onClick={openCommonPrompts}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></svg></button></div><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
     {timerMounted && <LazyDialogBoundary open={timerOpen} label={t("queue.timers")} onClose={() => setTimerOpen(false)}><Suspense fallback={timerOpen ? <LazyDialogFallback label={t("queue.timers")} /> : null}><TimerDialog open={timerOpen} tabId={tabId} sessionReady={runnable && !isShell} currentThreadId={bundle.tab.session.threadId} provider={bundle.tab.session.provider} onClose={() => setTimerOpen(false)} onError={onError} /></Suspense></LazyDialogBoundary>}
     {commonMounted && <LazyDialogBoundary open={commonOpen} label={t("queue.commonPrompts")} onClose={() => setCommonOpen(false)}><Suspense fallback={commonOpen ? <LazyDialogFallback label={t("queue.commonPrompts")} /> : null}><CommonPromptDialog open={commonOpen} canInsert={!disabled && !isShell} onClose={() => setCommonOpen(false)} onInsert={insertFromLibrary} onError={onError} /></Suspense></LazyDialogBoundary>}
+  </div>;
+}
+
+/**
+ * One unfinished collaboration, on the conversation that is in it.
+ *
+ * It shows what the root has spent and how long it has been going, and it
+ * carries the only two controls a person needs: finish and stop. Elapsed time
+ * counts wall clock -- waiting for a reply and a pause are part of it -- so it
+ * ticks locally instead of asking the server.
+ */
+function A2aRootBar({ root, onError }: { root: A2aRootSummary; onError: (error: unknown) => void }) {
+  const { t } = useI18n();
+  const [busy, setBusy] = useState<"finish" | "stop" | null>(null);
+  const [, tick] = useReducer((count: number) => count + 1, 0);
+  useEffect(() => {
+    const timer = window.setInterval(tick, 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const act = async (action: "finish" | "stop") => {
+    if (busy) return;
+    setBusy(action);
+    try { await api(`/api/a2a/roots/${root.rootId}/${action}`, jsonBody({})); }
+    catch (reason) { onError(reason); }
+    finally { setBusy(null); }
+  };
+  const started = root.startedAt ? Date.parse(root.startedAt) : Number.NaN;
+  const minutes = Number.isFinite(started) ? Math.max(0, Math.round((Date.now() - started) / 60_000)) : null;
+  const duration = minutes === null ? "-" : minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h${minutes % 60}m`;
+  return <div className="a2a-bar" role="status">
+    <i className="status-dot a2a" />
+    <strong>{t("a2a.root", { skill: root.skill })}</strong>
+    <span>{t("a2a.role", { role: root.role, level: root.level })}</span>
+    <span className="a2a-soft">{t("a2a.soft")}</span>
+    <span>{t("a2a.participants", { count: root.participants })}</span>
+    <span>{t("a2a.budget", { used: root.usedMessages, total: root.limits.messages })}</span>
+    <span>{t("a2a.elapsed", { duration })}</span>
+    {root.status === "ending" && <span className="a2a-note">{t("a2a.ending")}</span>}
+    {root.sessionClosed && <span className="a2a-note">{t("a2a.sessionClosed")}</span>}
+    {root.advice !== "continue" && <span className="a2a-note">{t(`a2a.advice.${root.advice}` as "a2a.advice.wrap_up")}</span>}
+    <span className="a2a-actions">
+      <button className="link-button" disabled={busy !== null} onClick={() => void act("finish")}>{t(busy === "finish" ? "a2a.finishing" : "a2a.finish")}</button>
+      <button className="link-button" disabled={busy !== null} onClick={() => void act("stop")}>{t(busy === "stop" ? "a2a.finishing" : "a2a.stop")}</button>
+    </span>
   </div>;
 }
 
@@ -1583,7 +1634,9 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
     if (!editable) return;
     if (!text.trim()) { onError(new PromptorApiError("PROMPT_EMPTY", t("queue.promptEmpty"), 400, false)); return; }
     if (text.trim() === prompt.text) { setEditing(false); return; }
-    try { const echo = await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "PATCH", body: JSON.stringify({ text }) }); setEditing(false); onChanged(echo); }
+    // The row shows the clean prompt, so the prefix is rebuilt from the
+    // metadata on the way back -- the server parses the same string it wrote.
+    try { const echo = await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "PATCH", body: JSON.stringify({ text: restorePromptPrefix(text.trim(), prompt.a2a) }) }); setEditing(false); onChanged(echo); }
     catch (reason) { onError(reason); }
   };
   const remove = async () => { try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "DELETE" })); } catch (reason) { onError(reason); } };
@@ -1595,7 +1648,7 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
     if (editing && !replacementText) { onError(new PromptorApiError("PROMPT_EMPTY", t("queue.promptEmpty"), 400, false)); return; }
     setInsertingNow(true);
     try {
-      onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/insert-now`, jsonBody(replacementText === undefined ? {} : { text: replacementText })));
+      onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/insert-now`, jsonBody(replacementText === undefined ? {} : { text: restorePromptPrefix(replacementText, prompt.a2a) })));
       setEditing(false);
     }
     catch (reason) { onError(reason); }
@@ -1612,7 +1665,7 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
     window.addEventListener("mouseup", release, { once: true });
   };
   const nativeDragStart = (event: DragEvent<HTMLDivElement>) => { if ((event.target as HTMLElement).closest("textarea, button")) { event.preventDefault(); return; } event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", prompt.id); onNativeDragStart(prompt.id); };
-  return <div ref={row} className={`prompt-row ${prompt.status} ${locked ? "locked" : ""} ${actionsBelow ? "actions-below" : "actions-inline"}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDragOver={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDrop={(event) => { if (!pending) return; event.preventDefault(); event.stopPropagation(); onNativeDrop(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div ref={actions} className="prompt-side"><span className="prompt-status">{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || executionDisabled || insertingNow} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked || executionDisabled} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked || executionDisabled} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
+  return <div ref={row} className={`prompt-row ${prompt.status} ${locked ? "locked" : ""} ${actionsBelow ? "actions-below" : "actions-inline"}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDragOver={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDrop={(event) => { if (!pending) return; event.preventDefault(); event.stopPropagation(); onNativeDrop(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div ref={actions} className="prompt-side"><span className="prompt-status">{prompt.a2a && <span className="a2a-badge" title={prompt.a2a.fromTabId ? `rootId ${prompt.a2a.rootId}` : t("a2a.root", { skill: prompt.a2a.skill })}>{t("a2a.badge", { skill: prompt.a2a.skill })}</span>}{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || executionDisabled || insertingNow} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked || executionDisabled} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked || executionDisabled} onClick={() => void skip()}>{t("queue.skip")}</button></> : editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
 function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, projectionSupported, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; projectionSupported: boolean; onBundle: (partial: Partial<TabBundle>) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {

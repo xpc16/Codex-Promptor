@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { A2aPromptMetaSchema, type A2aTabSummary } from "./a2a.js";
 
 export const isoNow = () => new Date().toISOString();
 const makeId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -38,6 +39,12 @@ export const AttemptSchema = z.object({
   codexTurnId: z.string().nullable(),
   clientUserMessageId: z.string().nullable(),
   error: z.object({ code: z.string(), message: z.string() }).nullable(),
+  // The text actually handed to the CLI, when it differs from prompt.text --
+  // today only an A2A dispatch, which prepends its collaboration preamble.
+  // Frozen on first dispatch so a network retry re-sends the same bytes, and
+  // kept server-side: submit confirmation and history reconciliation match on
+  // it, while every page keeps showing the clean prompt.
+  submittedText: z.string().optional(),
 });
 export type PromptAttempt = z.infer<typeof AttemptSchema>;
 
@@ -58,6 +65,8 @@ export const PromptSchema = z.object({
   timerId: z.string().optional(),
   timerOccurrenceId: z.string().optional(),
   timerAutoRun: z.boolean().optional(),
+  /** Set when this prompt belongs to a collaboration. Absent on ordinary prompts. */
+  a2a: A2aPromptMetaSchema.optional(),
   error: z.object({ code: z.string(), message: z.string() }).nullable(),
 });
 export type PromptRecord = z.infer<typeof PromptSchema>;
@@ -333,6 +342,8 @@ export type TabBundle = {
   prompts: PromptFile;
   answers: AnswerFile;
   runtime: RuntimeFile;
+  /** Collaboration roots this conversation participates in. Projected at read time, never stored per tab. */
+  a2a?: A2aTabSummary;
   /** Present on bandwidth-bounded reads; omitted by internal full-file reads. */
   window?: {
     prompts: { start: number; total: number; completed: number };

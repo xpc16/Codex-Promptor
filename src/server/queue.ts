@@ -20,6 +20,12 @@ export type QueueRpc = {
   waitForTurn(turnId: string): Promise<{ turn: any; items: any[] }>;
 };
 export type QueueBinding = { rpc: QueueRpc };
+/**
+ * Returns the text to actually submit for this attempt, or null to submit the
+ * prompt unchanged. Called once per attempt while the tab lock is held, so the
+ * text it returns can be frozen onto the attempt before anything is sent.
+ */
+export type SubmissionPreparer = (input: { tabId: string; prompt: PromptRecord; attemptId: string; threadId: string }) => Promise<string | null>;
 type QueueResolver = QueueBinding | (() => QueueBinding);
 export const QUEUE_INTER_PROMPT_DELAY_MS = 5_000;
 
@@ -44,6 +50,7 @@ export class QueueRunner extends EventEmitter {
     private readonly queueBinding: QueueResolver,
     private readonly freezeTimeoutMs = 5_000,
     private readonly interPromptDelayMs = QUEUE_INTER_PROMPT_DELAY_MS,
+    private readonly prepareSubmission: SubmissionPreparer | null = null,
   ) {
     super();
     // EventEmitter treats an unobserved `error` event as an exception. QueueRunner
@@ -389,7 +396,7 @@ export class QueueRunner extends EventEmitter {
     if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay));
   }
 
-  private async prepareDispatch(promptId: string, generation: number): Promise<{ prompt: PromptRecord; clientUserMessageId: string } | null> {
+  private async prepareDispatch(promptId: string, generation: number): Promise<{ prompt: PromptRecord; clientUserMessageId: string; submittedText: string } | null> {
     if (generation !== this.loopGeneration) return null;
     return this.storage.withTabLock(this.tabId, async () => {
       if (generation !== this.loopGeneration) return null;
@@ -406,6 +413,13 @@ export class QueueRunner extends EventEmitter {
       attempt.status = "dispatching";
       attempt.startedAt = isoNow();
       attempt.clientUserMessageId = clientUserMessageId;
+      // Frozen here, before the prompt file is written: what the CLI receives,
+      // what a submit confirmation matches, and what a retry re-sends are then
+      // one string, while prompt.text stays the reader's own words.
+      const prepared = this.prepareSubmission
+        ? await this.prepareSubmission({ tabId: this.tabId, prompt, attemptId: attempt.attemptId, threadId }).catch(() => null)
+        : null;
+      if (prepared && prepared !== prompt.text) attempt.submittedText = prepared;
       prompt.attempts.push(attempt);
       prompt.threadId = threadId;
       prompt.status = "dispatching";
@@ -418,7 +432,7 @@ export class QueueRunner extends EventEmitter {
       bundle.prompts.updatedAt = isoNow();
       await this.storage.writePrompts(this.tabId, bundle.prompts);
       this.oneShotPromptIds.delete(prompt.id);
-      return { prompt, clientUserMessageId };
+      return { prompt, clientUserMessageId, submittedText: attempt.submittedText ?? prompt.text };
     });
   }
 
@@ -551,11 +565,12 @@ export class QueueRunner extends EventEmitter {
     if (answer) this.emit("answer", answer);
   }
 
-  private async dispatch(threadId: string, cwd: string, dispatched: { prompt: PromptRecord; clientUserMessageId: string }, generation: number): Promise<boolean> {
+  private async dispatch(threadId: string, cwd: string, dispatched: { prompt: PromptRecord; clientUserMessageId: string; submittedText: string }, generation: number): Promise<boolean> {
     await this.setRunnerState("dispatching", dispatched.prompt.id, null);
     let turnId = "";
     try {
-      const result = await this.agent().rpc.startTurn(threadId, dispatched.prompt.text, dispatched.clientUserMessageId, cwd);
+      // The CLI gets submittedText; every record below keeps prompt.text.
+      const result = await this.agent().rpc.startTurn(threadId, dispatched.submittedText, dispatched.clientUserMessageId, cwd);
       turnId = result.turnId;
       await this.updateAttempt(dispatched.prompt.id, dispatched.clientUserMessageId, (prompt, attempt) => {
         prompt.status = "running";
@@ -1039,12 +1054,17 @@ export class QueueRunner extends EventEmitter {
 
 export class RunnerManager {
   private readonly runners = new Map<string, QueueRunner>();
-  constructor(private readonly storage: StorageService, private readonly resolveAgent: (tabId: string) => QueueBinding, private readonly onEvent: (event: RunnerEvent) => void) {}
+  constructor(
+    private readonly storage: StorageService,
+    private readonly resolveAgent: (tabId: string) => QueueBinding,
+    private readonly onEvent: (event: RunnerEvent) => void,
+    private readonly prepareSubmission: SubmissionPreparer | null = null,
+  ) {}
 
   get(tabId: string): QueueRunner {
     let runner = this.runners.get(tabId);
     if (!runner) {
-      runner = new QueueRunner(tabId, this.storage, () => this.resolveAgent(tabId));
+      runner = new QueueRunner(tabId, this.storage, () => this.resolveAgent(tabId), undefined, undefined, this.prepareSubmission);
       runner.on("runtime", (runtime) => this.onEvent({ tabId, type: "runtime", data: runtime }));
       runner.on("answer", (answer) => this.onEvent({ tabId, type: "answer", data: answer }));
       runner.on("error", (error) => this.onEvent({ tabId, type: "error", data: error }));

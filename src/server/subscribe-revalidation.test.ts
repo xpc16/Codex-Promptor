@@ -80,7 +80,7 @@ describe("a reconnect that missed nothing", () => {
     subscribe(peer.socket);
     await settle(() => peer.snapshots.length >= 1);
     const tags = peer.snapshots[0].snapshotTags;
-    expect(Object.keys(tags).sort()).toEqual(["answers", "prompts", "runtime", "tab"]);
+    expect(Object.keys(tags).sort()).toEqual(["a2a", "answers", "prompts", "runtime", "tab"]);
 
     await app.promptor.storage.updateTab(tabId, (current) => ({ ...current, name: "改过名的对话" }));
     subscribe(peer.socket, { [tabId]: tags });
