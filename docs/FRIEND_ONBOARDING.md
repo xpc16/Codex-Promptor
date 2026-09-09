@@ -73,21 +73,7 @@ cloudflared.exe service uninstall  # 彻底卸掉
 
 ---
 
-## 4. 找回旧对话：导出会话清单
-
-想 `/resume` 一个几周前的对话，但不记得 session id 时。**第一次跑 `.\start.ps1` 时已经自动生成过一份**，之后想刷新就手动跑：
-
-```powershell
-.\scripts\export-agent-sessions.ps1
-```
-
-在 `docs/` 下生成两份表格（Codex 一份、Claude Code 一份），每行是：**最近活动日期 · 对话所在路径 · Session ID · 开头 3 条 prompt**。靠前 3 条 prompt 认出是哪个对话，再把 Session ID 填进「继续旧对话」。
-
-纯 PowerShell，无依赖。可选参数：`-PromptCount 5`（多显示几条）、`-MaxLength 0`（不截断长 prompt）。
-
----
-
-## 5. 端到端加密
+## 4. 端到端加密
 
 **只能在本机设置，远端改不了。** 本机打开 `http://127.0.0.1:4317/` → 新建对话 → 右下角下拉框选**「端到端加密」** → 「加密密钥」框里打一句只有你知道的话（**中文可以**，或点「生成」拿随机的）→ 「确定并打开」。
 
@@ -104,6 +90,20 @@ cloudflared.exe service uninstall  # 彻底卸掉
 | 以上任一操作 | 已连接的远端**立刻断开** |
 
 走子域名（https）才有效；用局域网 IP（`http://192.168.x.x`）直连时加密不工作。
+
+---
+
+## 5. 找回旧对话：导出会话清单
+
+想 `/resume` 一个几周前的对话，但不记得 session id 时。**第一次跑 `.\start.ps1` 时已经自动生成过一份**，之后想刷新就手动跑：
+
+```powershell
+.\scripts\export-agent-sessions.ps1
+```
+
+在 `docs/` 下生成两份表格（Codex 一份、Claude Code 一份），每行是：**最近活动日期 · 对话所在路径 · Session ID · 开头 3 条 prompt**。靠前 3 条 prompt 认出是哪个对话，再把 Session ID 填进「继续旧对话」。
+
+纯 PowerShell，无依赖。可选参数：`-PromptCount 5`（多显示几条）、`-MaxLength 0`（不截断长 prompt）。
 
 ---
 
