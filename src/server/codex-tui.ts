@@ -724,7 +724,16 @@ export async function resolveCodexTuiLaunch(launch: AgentProcessLaunch): Promise
     const resolved = await codexLaunchFrom(candidate, launch);
     if (resolved) return resolved;
   }
-  throw new Error("CODEX_NATIVE_EXECUTABLE_NOT_FOUND");
+  // Says where it looked. A codex installed somewhere neither PATH nor npm
+  // knows about -- a desktop installer's own directory, say -- is not
+  // findable by any amount of guessing, and the reader needs to see that the
+  // search happened and missed rather than read one opaque code and wonder
+  // whether the conversation is broken.
+  const looked = candidates.length ? candidates.join(", ") : "nowhere on PATH and no npm global directory";
+  throw new Error(
+    `CODEX_NATIVE_EXECUTABLE_NOT_FOUND: looked at ${looked}. `
+    + "Set CODEX_PROMPTOR_CODEX_EXECUTABLE to the full path of codex.exe if it is installed elsewhere.",
+  );
 }
 
 const QUESTION_OPTION = /^›\s*\d+[.)]\s+\S/u;

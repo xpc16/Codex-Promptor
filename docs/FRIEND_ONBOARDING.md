@@ -170,11 +170,19 @@ where.exe codex
 pm` 和 `npm prefix -g` 说的位置找，所以**先关掉重开应用试一次**，多半就好了。
 - **什么都没输出，也确实没装** —— 装上 `codex` 再重开应用；只想用 Claude Code 或终端对话的话，这个对话打不开，不影响其他对话。
 - **有输出，但应用仍然报错** —— 进程的 PATH 在启动那一刻就定死了，后装的东西它看不见。关掉重开应用即可。
-- **装在了奇怪的位置** —— 直接把完整路径告诉它，加进 `promptor.cmd`：
+- **装在了 npm 之外的位置**（桌面版安装包自己的目录之类）—— 谁也猜不到，直接告诉它。先找出真实位置：
+
+  ```powershell
+  Get-ChildItem -Path $env:APPDATA, $env:LOCALAPPDATA -Recurse -Filter codex.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+  ```
+
+  把找到的路径写进 `promptor.cmd`（放在 `node` 那行之前）：
 
   ```bat
   set CODEX_PROMPTOR_CODEX_EXECUTABLE=C:\完整\路径\codex.exe
   ```
+
+报错信息里会列出它**实际找过的位置**，对照一下就知道差在哪。
 
 顺带一提：这些 Codex 对话是应用第一次启动时从你自己的 `~/.codex` 里自动导入的，所以能看到历史记录是正常的——**看历史不需要装 codex，继续对话才需要**。
 
