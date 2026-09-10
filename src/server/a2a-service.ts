@@ -343,6 +343,7 @@ export class A2aService {
       const member = this.store.member(root, tabId)!;
       const origin = await this.deps.storage.getTabMeta(root.originTabId).catch(() => null);
       const snapshot = a2aSnapshot(root, member.level);
+      const unfinished = root.status === "running" || root.status === "ending";
       summaries.push({
         rootId: root.rootId,
         skill: root.skill,
@@ -361,7 +362,8 @@ export class A2aService {
         remainingMessages: snapshot.budget.remainingMessages,
         usedSpawns: root.usedSpawns,
         advice: snapshot.advice,
-        sessionClosed: (root.status === "running" || root.status === "ending") && tabState === "closed" ? true : undefined,
+        sessionClosed: unfinished && tabState === "closed" ? true : undefined,
+        pendingEnd: unfinished && (await this.outstandingWork(root, null)).length === 0 ? true : undefined,
       });
     }
     return a2aTabSummary(summaries);

@@ -117,6 +117,14 @@ export type A2aRootSummary = {
   advice: A2aAdvice;
   /** Set while the root is unfinished but this conversation's session is not. */
   sessionClosed?: boolean;
+  /**
+   * Unfinished, with nothing left anywhere that could finish it.
+   *
+   * A collaboration does not end because a queue emptied -- someone has to say
+   * so. This is what tells the difference between waiting for work and waiting
+   * for that.
+   */
+  pendingEnd?: boolean;
 };
 
 /**

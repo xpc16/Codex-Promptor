@@ -630,6 +630,27 @@ describe("agent to agent", () => {
     expect(await app.promptor.a2a.readRoot(rootPrompt.id)).toMatchObject({ status: "stopped", endReason: "stopped_by_user" });
   });
 
+  it("says a collaboration is waiting to be ended once nothing is left running", async () => {
+    // It does not end because a queue emptied -- but the difference between
+    // "waiting for work" and "waiting for someone to say so" has to be on
+    // screen, or a bar that will never close on its own looks stuck.
+    const from = await readyTab("协调");
+    const to = await readyTab("执行");
+    const rootPrompt = (await addPrompt(from, "@@ 分工")).json().data.prompt;
+    const { contextId } = await beginTurn(from, rootPrompt.id);
+    const sent = await call(from, { op: "send", contextId, requestId: "r1", to, text: "任务" });
+    await settleTurn(from, rootPrompt.id);
+    // The worker still has it queued, so there is something to wait for.
+    expect((await app.promptor.a2a.summaryForTab(from))!.roots[0].pendingEnd).toBeUndefined();
+
+    const workerPromptId = sent.json().data.delivered.promptId;
+    await beginTurn(to, workerPromptId);
+    await settleTurn(to, workerPromptId);
+    const summary = (await app.promptor.a2a.summaryForTab(from))!;
+    expect(summary.active).toBe(true);
+    expect(summary.roots[0].pendingEnd).toBe(true);
+  });
+
   it("lets a person end a collaboration the agents left open", async () => {
     const from = await readyTab("协调");
     const rootPrompt = (await addPrompt(from, "@@ 一个人也能协作")).json().data.prompt;
