@@ -12,7 +12,8 @@ export type InsertNowResult = { mode: "steered" | "started"; turnId: string | nu
 export type QueueRpc = {
   activeTurnIds(threadId: string): string[];
   waitForThreadIdle(threadId: string, timeoutMs?: number): Promise<void>;
-  startTurn(threadId: string, text: string, clientUserMessageId: string, cwd: string): Promise<{ turnId: string }>;
+  /** `attachments` are absolute paths; providers that cannot carry files ignore them. */
+  startTurn(threadId: string, text: string, clientUserMessageId: string, cwd: string, attachments?: readonly string[]): Promise<{ turnId: string }>;
   steerTurn(threadId: string, turnId: string, text: string, clientUserMessageId: string): Promise<unknown>;
   interruptTurn(threadId: string, turnId: string): Promise<unknown>;
   /** Interrupt a PTY submission before its hook/record has yielded a turn id. */
@@ -26,7 +27,7 @@ export type QueueBinding = { rpc: QueueRpc };
  * text it returns can be frozen onto the attempt before anything is sent.
  */
 export type SubmissionPreparer = (input: { tabId: string; prompt: PromptRecord; attemptId: string; threadId: string })
-  => Promise<{ submittedText: string; a2a?: PromptRecord["a2a"] } | null>;
+  => Promise<{ submittedText: string; a2a?: PromptRecord["a2a"]; attachments?: readonly string[] } | null>;
 type QueueResolver = QueueBinding | (() => QueueBinding);
 export const QUEUE_INTER_PROMPT_DELAY_MS = 5_000;
 
@@ -407,7 +408,7 @@ export class QueueRunner extends EventEmitter {
     if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay));
   }
 
-  private async prepareDispatch(promptId: string, generation: number): Promise<{ prompt: PromptRecord; clientUserMessageId: string; submittedText: string } | null> {
+  private async prepareDispatch(promptId: string, generation: number): Promise<{ prompt: PromptRecord; clientUserMessageId: string; submittedText: string; attachments: readonly string[] } | null> {
     if (generation !== this.loopGeneration) return null;
     return this.storage.withTabLock(this.tabId, async () => {
       if (generation !== this.loopGeneration) return null;
@@ -450,7 +451,7 @@ export class QueueRunner extends EventEmitter {
       bundle.prompts.updatedAt = isoNow();
       await this.storage.writePrompts(this.tabId, bundle.prompts);
       this.oneShotPromptIds.delete(prompt.id);
-      return { prompt, clientUserMessageId, submittedText: attempt.submittedText ?? prompt.text };
+      return { prompt, clientUserMessageId, submittedText: attempt.submittedText ?? prompt.text, attachments: prepared?.attachments ?? [] };
     });
   }
 
@@ -583,12 +584,12 @@ export class QueueRunner extends EventEmitter {
     if (answer) this.emit("answer", answer);
   }
 
-  private async dispatch(threadId: string, cwd: string, dispatched: { prompt: PromptRecord; clientUserMessageId: string; submittedText: string }, generation: number): Promise<boolean> {
+  private async dispatch(threadId: string, cwd: string, dispatched: { prompt: PromptRecord; clientUserMessageId: string; submittedText: string; attachments: readonly string[] }, generation: number): Promise<boolean> {
     await this.setRunnerState("dispatching", dispatched.prompt.id, null);
     let turnId = "";
     try {
       // The CLI gets submittedText; every record below keeps prompt.text.
-      const result = await this.agent().rpc.startTurn(threadId, dispatched.submittedText, dispatched.clientUserMessageId, cwd);
+      const result = await this.agent().rpc.startTurn(threadId, dispatched.submittedText, dispatched.clientUserMessageId, cwd, dispatched.attachments);
       turnId = result.turnId;
       await this.updateAttempt(dispatched.prompt.id, dispatched.clientUserMessageId, (prompt, attempt) => {
         prompt.status = "running";

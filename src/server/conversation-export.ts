@@ -6,6 +6,7 @@ const providerNames: Record<AgentProvider, string> = {
   codex: "Codex",
   claude: "Claude Code",
   cursor: "Cursor CLI",
+  chatgpt: "ChatGPT (web)",
   shell: "PowerShell",
   // Never exported: this tab is the encryption switch, not a conversation.
   e2ee: "End-to-end encryption",

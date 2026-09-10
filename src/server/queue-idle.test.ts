@@ -74,7 +74,7 @@ describe("queue waiting for a busy terminal", () => {
     }
     waits[2].resolve();
     await vi.waitFor(async () => expect((await storage.readRuntime(tabId)).runner.desiredState).toBe("armed"));
-    expect(rpc.startTurn).toHaveBeenCalledExactlyOnceWith("thread", "next prompt", expect.any(String), root);
+    expect(rpc.startTurn).toHaveBeenCalledExactlyOnceWith("thread", "next prompt", expect.any(String), root, []);
     expect((await storage.readPromptsOnly(tabId)).prompts[0].status).toBe("completed");
     expect(errors).not.toHaveBeenCalled();
   });
@@ -112,7 +112,7 @@ describe("queue waiting for a busy terminal", () => {
     await storage.updateTab(tabId, (current) => ({ ...current, session: { ...current.session, threadId: "new-thread", sessionId: "new-thread" } }));
     wait.resolve();
     await vi.waitFor(async () => expect((await storage.readRuntime(tabId)).runner.desiredState).toBe("armed"));
-    expect(rpc.startTurn).toHaveBeenCalledExactlyOnceWith("new-thread", "next prompt", expect.any(String), root);
+    expect(rpc.startTurn).toHaveBeenCalledExactlyOnceWith("new-thread", "next prompt", expect.any(String), root, []);
   });
 
   it("still reports actual provider failures", async () => {

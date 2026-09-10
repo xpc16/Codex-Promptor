@@ -65,7 +65,16 @@ export type A2aDeps = {
   notifyTab: (tabId: string) => void;
 };
 
-const AGENT_PROVIDERS = new Set(["codex", "claude", "cursor"]);
+/**
+ * Conversations a message can be delivered to.
+ *
+ * `chatgpt` is here but is not in `CALLING_PROVIDERS`: the web app has a
+ * queue, a thread and a final answer, so it can be given work -- but it has no
+ * shell, so it can never call the endpoint back. It is a leaf, and §8 of
+ * docs/WEB_CHATGPT_PROVIDER.md is how its result gets home.
+ */
+const AGENT_PROVIDERS = new Set(["codex", "claude", "cursor", "chatgpt"]);
+const CALLING_PROVIDERS = new Set(["codex", "claude", "cursor"]);
 const MAX_REQUEST_TEXT_BYTES = 8 * 1024;
 const MAX_READ_RECORDS = 20;
 const DEFAULT_READ_RECORDS = 3;
@@ -178,6 +187,10 @@ export class A2aService {
     // no context to call the endpoint with and no instructions to follow.
     const requested = input.prompt.a2a ?? await this.continuationMeta(input.tab.id);
     if (!requested) return null;
+    // A conversation that cannot call the endpoint is not given instructions
+    // for calling it. It still joins the collaboration -- its membership is
+    // what makes the reply on its behalf possible.
+    const canCall = CALLING_PROVIDERS.has(input.tab.session.provider);
     const meta = await this.rootForDispatch(input.prompt, requested);
     if (!meta) return null;
     const root = (await this.store.read(meta.rootId))
@@ -238,7 +251,80 @@ export class A2aService {
       level: member.level,
     });
     for (const participant of started.members) this.deps.notifyTab(participant.tabId);
-    return { submittedText: composeSubmittedText(preamble, input.prompt.text), a2a: meta };
+    return {
+      submittedText: canCall ? composeSubmittedText(preamble, input.prompt.text) : input.prompt.text,
+      a2a: meta,
+    };
+  }
+
+  /**
+   * Return a leaf's result for it.
+   *
+   * The rule is narrow on purpose: only for a message that arrived from
+   * another conversation, only on a turn that completed, and only for a
+   * conversation that has no way to send. Everything else still has to write
+   * its own `send` -- only the author knows which part of a turn was the
+   * point, and copying a whole final answer costs the receiver a full model
+   * turn to read.
+   *
+   * It is a real message: same budget, same depth, same idempotent receipt.
+   */
+  async replyForLeaf(input: {
+    tab: TabMeta;
+    prompt: PromptRecord;
+    answerText: string;
+    files: readonly string[];
+  }): Promise<void> {
+    if (!this.deps.enabled()) return;
+    const meta = input.prompt.a2a;
+    if (!meta?.fromTabId || !meta.fromPromptId) return;
+    if (CALLING_PROVIDERS.has(input.tab.session.provider)) return;
+    const root = await this.store.read(meta.rootId);
+    if (!root || root.status !== "running") return;
+    const member = this.store.member(root, input.tab.id);
+    const key = receiptKey(input.tab.id, meta.rootId, `leaf-reply:${input.prompt.id}`);
+    if (this.store.findReceipt(root, key)) return;
+
+    const body = [
+      `「${input.tab.name}」完成了你派过去的任务，以下是它的最终回答：`,
+      "",
+      input.answerText.trim() || "(没有可读到的回答正文)",
+      ...(input.files.length ? ["", "本轮产生的文件：", ...input.files.map((file) => `- ${file}`)] : []),
+    ].join("\n");
+
+    const depth = (member?.level ?? meta.depth) + 1;
+    const reserved = await this.store.withRootLock(root.rootId, async () => {
+      const current = await this.store.read(root.rootId);
+      if (!current || current.status !== "running") return null;
+      if (depth > current.limits.depth || current.usedMessages >= current.limits.messages) return null;
+      return this.store.write({ ...current, usedMessages: current.usedMessages + 1 });
+    });
+    // Out of budget or out of hops: the result stays in this conversation's own
+    // final answer, which is the design's "回传受限" case, not a silent drop.
+    if (!reserved) return;
+
+    try {
+      const delivered = await this.deps.enqueue(meta.fromTabId, body, {
+        rootId: meta.rootId,
+        skill: reserved.skill,
+        depth,
+        fromTabId: input.tab.id,
+        fromPromptId: input.prompt.id,
+      });
+      await this.store.withRootLock(root.rootId, async () => {
+        const current = (await this.store.read(root.rootId))!;
+        await this.store.write(this.store.recordReceipt(current, {
+          key, op: "leaf-reply", digest: paramsDigest({ promptId: input.prompt.id }),
+          resultId: delivered.promptId, result: { delivered: { tabId: meta.fromTabId, promptId: delivered.promptId } }, at: isoNow(),
+        }));
+      });
+      for (const participant of reserved.members) this.deps.notifyTab(participant.tabId);
+    } catch {
+      await this.store.withRootLock(root.rootId, async () => {
+        const current = await this.store.read(root.rootId);
+        if (current) await this.store.write({ ...current, usedMessages: Math.max(0, current.usedMessages - 1) });
+      });
+    }
   }
 
   /**

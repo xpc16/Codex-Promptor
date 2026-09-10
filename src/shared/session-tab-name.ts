@@ -19,6 +19,7 @@ const AUTO_NAMES = {
   // same in both languages.
   e2ee: { "zh-CN": "E2EE", en: "E2EE" },
   shell: { "zh-CN": "终端", en: "Terminal" },
+  chatgpt: { "zh-CN": "ChatGPT", en: "ChatGPT" },
 } as const;
 
 export type AutoNamedProvider = keyof typeof AUTO_NAMES;

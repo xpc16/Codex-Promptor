@@ -40,6 +40,10 @@ import { discoverSessions, importedSessionIds, importedTabName } from "./session
 import { CLAUDE_EXIT_MARKER, CODEX_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
 import { isSlashCommandPrompt } from "./prompt-submit.js";
 import { RunnerManager } from "./queue.js";
+import { BrowserPool, defaultProfileDir } from "./browser.js";
+import { ChatGptError, ChatGptPool } from "./chatgpt.js";
+import { conversationIdFrom, conversationUrl } from "./chatgpt-page.js";
+import { AttachmentError, parseAttachments, resolveAttachments } from "./attach-prefix.js";
 import { A2aError, A2aService } from "./a2a-service.js";
 import { A2aPrefixError, editedPromptPrefix, parsePromptPrefix } from "./a2a-preamble.js";
 import type { A2aPromptMeta } from "../shared/a2a.js";
@@ -92,6 +96,9 @@ export function codexConnectionModeFromEnv(value: unknown): CodexConnectionMode 
 }
 
 export function isValidResumeId(provider: AgentProvider, resumeId: string): boolean {
+  // A ChatGPT conversation is named by its URL, so either the whole link or
+  // the id out of it is what someone has to hand.
+  if (provider === "chatgpt") return conversationIdFrom(resumeId) !== null;
   if (provider !== "cursor") return UUID_RE.test(resumeId);
   return resumeId.length > 0 && resumeId.length <= 256 && !/[\x00-\x1f\x7f]/.test(resumeId);
 }
@@ -172,6 +179,8 @@ export type PromptorApp = FastifyInstance & {
     ui: UiLifecycle;
     traffic: TerminalTrafficMeter;
     documents: DocumentService;
+    chatgpt: ChatGptPool;
+    browser: BrowserPool;
     a2a: A2aService;
     /** The per-conversation credential a launched CLI is given. Exposed so A2A can be exercised without one. */
     issueHookLease: (provider: "codex" | "claude" | "cursor", tabId: string) => { nonce: string; secret: string };
@@ -190,6 +199,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const codexTui = new CodexTuiPool(pty);
   const claude = new ClaudeCodePool(pty);
   const cursor = new CursorCliPool(pty);
+  const browserPool = new BrowserPool({ userDataDir: defaultProfileDir(storage.dataDir) });
+  const chatgpt = new ChatGptPool(browserPool, storage.dataDir);
   const tuiProxy = new TuiProxyPool();
   const directoryPicker = new DirectoryPickerService();
   const ui = new UiLifecycle(Number(process.env.CODEX_PROMPTOR_UI_GRACE_MS ?? DEFAULT_UI_GRACE_MS));
@@ -597,13 +608,17 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     terminalResyncTimers.set(tabId, timer);
   };
 
-  const runners = new RunnerManager(storage, (tabId) => cursor.existing(tabId)
+  const runners = new RunnerManager(storage, (tabId) => chatgpt.existing(tabId)
+    ?? cursor.existing(tabId)
     ?? claude.existing(tabId)
     ?? (codexConnectionMode === "pty-hooks" ? codexTui.get(tabId) : codex.get(tabId)), (event) => {
     // Queue activity is the only signal a collaboration needs: a pending end
     // is confirmed when the turn that requested it actually lands, so nothing
     // has to poll for it.
     if (a2aEnabled && (event.type === "runtime" || event.type === "answer")) void a2a.onQueueEvent(event.tabId).catch(() => undefined);
+    // A conversation that cannot call the endpoint has its result returned for
+    // it, once, when its turn lands (docs/WEB_CHATGPT_PROVIDER.md §8).
+    if (a2aEnabled && event.type === "answer") void replyForLeafAnswer(event.tabId, event.data as AnswerRecord | undefined).catch(() => undefined);
     if (event.type === "error") emit(event.tabId, { type: "error", error: event.data });
     if (event.type === "answer") {
       const answer = event.data as AnswerRecord | undefined;
@@ -618,11 +633,58 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       }
     }
   }, async ({ tabId, prompt, attemptId, threadId }) => {
-    if (!a2aEnabled || !prompt.a2a) return null;
     const tab = await storage.getTabMeta(tabId).catch(() => null);
     if (!tab) return null;
-    return a2a.prepareDispatch({ tab, prompt, attemptId, threadId });
+    const collaboration = a2aEnabled ? await a2a.prepareDispatch({ tab, prompt, attemptId, threadId }) : null;
+    if (tab.session.provider !== "chatgpt") return collaboration;
+    // `/attach` is read from what the author wrote, which is the stored text
+    // whether a person typed it or an agent sent it -- the collaboration
+    // preamble is never injected into a web conversation, so there is nothing
+    // to read it out of.
+    const attachments = await resolveTabAttachments(tab, prompt);
+    if (!attachments.paths.length) return collaboration;
+    chatgpt.get(tabId).setDownloadDir(downloadDirFor(tabId, prompt.a2a?.rootId ?? null, attemptId));
+    return {
+      submittedText: attachments.body || (collaboration?.submittedText ?? prompt.text),
+      a2a: collaboration?.a2a,
+      attachments: attachments.paths,
+    };
   });
+
+  /** Where a turn's downloads land: beside the collaboration when there is one. */
+  const downloadDirFor = (tabId: string, rootId: string | null, turnKey: string): string => rootId
+    ? path.join(storage.dataDir, "a2a", "files", rootId, turnKey)
+    : path.join(storage.dataDir, "downloads", tabId, turnKey);
+
+  const resolveTabAttachments = async (tab: TabMeta, prompt: { text: string; a2a?: { rootId: string; fromTabId: string | null } | null }) => {
+    const parsed = parseAttachments(prompt.text);
+    if (!parsed.paths.length) return { paths: [] as string[], body: parsed.body };
+    const baseDir = tab.session.workingDirectory ?? process.env.USERPROFILE ?? process.cwd();
+    // A path that arrived inside a collaboration message decides which local
+    // file leaves this machine, so it is confined to what its sender could
+    // already reach. A path the reader typed here has no such limit.
+    const fromTabId = prompt.a2a?.fromTabId ?? null;
+    let allowedRoots: string[] | undefined;
+    if (fromTabId) {
+      const sender = await storage.getTabMeta(fromTabId).catch(() => null);
+      allowedRoots = [
+        ...(sender?.session.workingDirectory ? [sender.session.workingDirectory] : []),
+        path.join(storage.dataDir, "a2a", "files", prompt.a2a!.rootId),
+      ];
+    }
+    return { paths: resolveAttachments(parsed.paths, { baseDir, allowedRoots }), body: parsed.body };
+  };
+  const replyForLeafAnswer = async (tabId: string, answer: AnswerRecord | undefined): Promise<void> => {
+    if (!answer || answer.status !== "completed") return;
+    const tab = await storage.getTabMeta(tabId).catch(() => null);
+    if (!tab || tab.session.provider !== "chatgpt") return;
+    const prompts = await storage.readPromptsOnly(tabId).catch(() => null);
+    const prompt = prompts?.prompts.find((item) => item.id === answer.promptId);
+    if (!prompt?.a2a?.fromTabId) return;
+    const files = chatgpt.existing(tabId)?.takeDownloads() ?? [];
+    await a2a.replyForLeaf({ tab, prompt, answerText: answer.finalAnswer, files });
+  };
+
   const timers = new TimerService(storage, (tabId) => runners.get(tabId), (key, active) => ui.setBackgroundHold(key, active));
 
   const scheduleThreadSwitch = (tabId: string, manager: AppServerManager, selection: TuiThreadSelection): Promise<void> => {
@@ -1198,6 +1260,75 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   // Reopening a terminal is just a fresh PowerShell in the same directory:
   // there is no thread to resume, no App Server to wait for, no history to
   // reconcile. It keeps its working directory, which is its whole identity.
+  /**
+   * Re-open the page. Nothing is restarted: the browser is shared, and the
+   * conversation is a URL, so this is a navigation.
+   */
+  const performChatGptReopen = async (tab: TabMeta, recorder: PhaseRecorder = createPhaseRecorder()): Promise<TerminalReopenResult> => {
+    await storage.updateTab(tab.id, (current) => ({
+      ...current,
+      session: { ...current.session, state: "connecting", lastError: null },
+      updatedAt: isoNow(),
+    }));
+    await emitSnapshot(tab.id);
+    await updateTerminalRuntime(storage, tab.id, { state: "starting", lastStartedAt: isoNow(), lastExitCode: null, lastError: null, appServer: null });
+    try {
+      const conversationId = tab.session.threadId ?? tab.session.sessionId;
+      const opened = await recorder.step("start", async () => chatgpt.get(tab.id).open(conversationId
+        ? { mode: "resume", conversationId }
+        : { mode: "new" }));
+      await updateTerminalRuntime(storage, tab.id, { state: "running", lastError: null });
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        session: {
+          ...current.session,
+          state: "ready",
+          reopenOnLaunch: true,
+          threadId: opened.conversationId ?? current.session.threadId,
+          sessionId: opened.conversationId ?? current.session.sessionId,
+          connectedAt: isoNow(),
+          lastError: null,
+        },
+        updatedAt: isoNow(),
+      }));
+      await clearSessionNotReadyError(storage, tab.id);
+      if (opened.conversationId) await syncChatGptHistory(tab.id).catch(() => undefined);
+      return { ok: true, bundle: await readClientTab(tab.id) };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const code = error instanceof ChatGptError ? error.code : "CHATGPT_OPEN_FAILED";
+      await updateTerminalRuntime(storage, tab.id, { state: "error", lastError: { code, message } });
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        session: { ...current.session, state: "error", lastError: { code, message } },
+        updatedAt: isoNow(),
+      }));
+      return { ok: false, statusCode: 502, code, message };
+    }
+  };
+
+  /** Read the page's own transcript into the same idempotent merge every provider uses. */
+  const syncChatGptHistory = async (tabId: string) => {
+    const tab = await storage.getTabMeta(tabId);
+    const threadId = tab.session.threadId;
+    if (!threadId) return { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
+    const turns = await chatgpt.get(tabId).readHistory();
+    let report = { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
+    for (const turn of turns) {
+      const recorded = await recordTurn(storage, tabId, {
+        threadId,
+        turn: { id: turn.turnId, status: "completed", startedAt: null, completedAt: null },
+        items: [
+          { type: "userMessage", text: turn.userText },
+          { type: "agentMessage", phase: "finalAnswer", text: turn.assistantText },
+        ],
+        origin: "imported",
+      });
+      report = { ...report, imported: report.imported + (recorded.answer ? 1 : 0), skipped: report.skipped + (recorded.answer ? 0 : 1) };
+    }
+    return report;
+  };
+
   const performShellTerminalReopen = async (tab: TabMeta, recorder: PhaseRecorder = createPhaseRecorder()): Promise<TerminalReopenResult> => {
     const cwd = tab.session.workingDirectory;
     if (!cwd) return { ok: false, statusCode: 400, code: "SESSION_NOT_READY", message: "This terminal has no working directory." };
@@ -1377,6 +1508,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (tab.session.provider === "claude") return performClaudeTerminalReopen(tab, recorder);
       if (tab.session.provider === "cursor") return performCursorTerminalReopen(tab, recorder);
       if (tab.session.provider === "shell") return performShellTerminalReopen(tab, recorder);
+      if (tab.session.provider === "chatgpt") return performChatGptReopen(tab, recorder);
       // Switching encryption back on, with the key this tab already holds.
       // Nothing starts; the only thing that has to happen is that connections
       // still running in the clear are made to handshake again.
@@ -1772,7 +1904,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   trafficPruneTimer?.unref?.();
   if (trafficLoggingEnabled) void trafficLog.prune();
 
-  app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, a2a, issueHookLease, token, restoreOpenSessions, importDiscoveredSessions, close: async () => {
+  app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, chatgpt, browser: browserPool, a2a, issueHookLease, token, restoreOpenSessions, importDiscoveredSessions, close: async () => {
     clearInterval(stallTimer);
     if (trafficFlushTimer) clearInterval(trafficFlushTimer);
     if (trafficPruneTimer) clearInterval(trafficPruneTimer);
@@ -1796,6 +1928,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await storage.updateIndex((current) => ({ ...current, ui: { ...current.ui, lastSelectedTabId } })).catch(() => undefined);
     }
     await runners.stopAll();
+    await chatgpt.stopAll();
+    await browserPool.stopAll();
     await pty.stopAll();
     await tuiProxy.stopAll();
     await cursor.stopAll();
@@ -2059,6 +2193,17 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (error instanceof A2aError) return apiError(reply, error.statusCode, error.code, error.message);
       return apiError(reply, 500, "A2A_END_FAILED", error instanceof Error ? error.message : String(error));
     }
+  });
+
+  /** Raise this conversation's browser window. Only means anything on this machine. */
+  app.post("/api/tabs/:tabId/chatgpt/front", async (request, reply) => {
+    if (!isLocalBrowserRequest(request.headers)) {
+      return apiError(reply, 403, "CHATGPT_LOCAL_ONLY", "浏览器窗口在运行 Promptor 的那台机器上，只能从本机操作。");
+    }
+    const tabId = String((request.params as any).tabId);
+    const raised = await browserPool.bringToFront(tabId).catch(() => false);
+    if (!raised) return apiError(reply, 409, "CHATGPT_PAGE_CLOSED", "这个对话的浏览器页面已经关闭，请先重新打开。");
+    return reply.send({ data: { ok: true } });
   });
 
   app.get("/api/health", async (_request, reply) => reply.send({ data: { ok: true, codex: codex.status, codexConnectionMode, claude: await claudeVersion, cursor: await cursorVersion } }));
@@ -2587,6 +2732,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
     try {
       await awaitThreadSwitch(tabId);
+      await chatgpt.stop(tabId);
       await pty.stop(tabId, false);
       await tuiProxy.stop(tabId);
       await codexTui.stop(tabId);
@@ -2608,6 +2754,37 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         },
         updatedAt: isoNow(),
       }));
+      if (provider === "chatgpt") {
+        const index = await storage.readIndex();
+        const opened = await chatgpt.get(tabId).open(mode === "resume"
+          ? { mode: "resume", conversationId: conversationIdFrom(resumeId)! }
+          : { mode: "new" });
+        await updateTerminalRuntime(storage, tabId, { state: "running", lastStartedAt: isoNow(), lastExitCode: null, lastError: null, appServer: null });
+        await storage.updateTab(tabId, (current) => ({
+          ...current,
+          name: nameForSession(current.name, "chatgpt", index.ui.locale),
+          session: {
+            ...current.session,
+            provider: "chatgpt",
+            state: "ready",
+            reopenOnLaunch: true,
+            workingDirectory: cwd,
+            // A new conversation has no id until its first prompt creates one,
+            // exactly like a Codex thread. Nothing is invented here.
+            threadId: opened.conversationId,
+            sessionId: opened.conversationId,
+            createdAt: current.session.createdAt ?? isoNow(),
+            connectedAt: isoNow(),
+            lastError: null,
+            lastThreadSwitch: null,
+            e2ee: null,
+          },
+          updatedAt: isoNow(),
+        }));
+        await clearSessionNotReadyError(storage, tabId);
+        const report = opened.conversationId ? await syncChatGptHistory(tabId) : { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
+        return reply.send({ data: { bundle: await readClientTab(tabId), report } });
+      }
       if (provider === "shell") {
         const now = isoNow();
         await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null, appServer: null });
@@ -2839,7 +3016,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await codexTui.stop(tabId).catch(() => undefined);
       await cursor.stop(tabId).catch(() => undefined);
       await claude.stop(tabId).catch(() => undefined);
-      if (provider !== "shell") revokeHookLease(provider, tabId);
+      // Only the three CLI providers ever hold one; the others never launch a process.
+      if (provider === "codex" || provider === "claude" || provider === "cursor") revokeHookLease(provider, tabId);
       await stopAppServer(storage, codex, tabId).catch(() => undefined);
       await updateTerminalRuntime(storage, tabId, { state: "stopped" }).catch(() => undefined);
       const activeWriter = provider === "codex" && isActiveWriterError(message);
@@ -2859,6 +3037,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (tab.session.state === "closed") return apiError(reply, 423, "CONVERSATION_CLOSED", "对话已关闭，请先重新打开终端。");
       if (tab.session.provider === "shell") return apiError(reply, 400, "SHELL_HAS_NO_HISTORY", "终端对话没有可同步的历史。");
       if (!tab.session.threadId) return apiError(reply, 400, "SESSION_NOT_READY", "This tab has no session.");
+      if (tab.session.provider === "chatgpt") {
+        return reply.send({ data: { report: await syncChatGptHistory(tabId), bundle: await readClientTab(tabId) } });
+      }
       if (tab.session.provider === "claude") {
         const manager = claude.existing(tabId);
         const result = await syncClaudeHistory(storage, tabId, tab.session.threadId, manager?.session?.transcriptPath);
@@ -2932,7 +3113,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         revokeEncryptedConnections();
         return reply.send({ data: await readClientTab(tabId) });
       }
-      const openWithoutThread = tab.session.state === "ready" && pty.has(tabId);
+      const openWithoutThread = (tab.session.state === "ready" && pty.has(tabId))
+        || (tab.session.provider === "chatgpt" && Boolean(chatgpt.existing(tabId)));
       if (!tab.session.threadId && tab.session.provider !== "shell" && !openWithoutThread) {
         return apiError(reply, 400, "SESSION_NOT_READY", "This tab has no active session.");
       }
@@ -2948,6 +3130,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           if (activeTurns.length) await manager.rpc.waitForThreadIdle(codexThreadId, 5_000).catch(() => undefined);
         }
       }
+      await chatgpt.stop(tabId);
       await pty.stop(tabId);
       await tuiProxy.stop(tabId);
       await cursor.stop(tabId);
@@ -3746,6 +3929,10 @@ async function clearSessionNotReadyError(storage: StorageService, tabId: string)
 
 function hasRestorableSession(tab: TabMeta): boolean {
   const session = tab.session;
+  // A ChatGPT conversation is restorable with or without a thread: a page that
+  // was opened and never prompted is still a window worth bringing back, and
+  // it needs no working directory to do it.
+  if (session.provider === "chatgpt") return true;
   // Shell and E2EE tabs have no agent thread. E2EE reuses the saved passphrase
   // and key material; an unfinished encryption setup is not restorable.
   return Boolean(session.workingDirectory && (session.provider === "e2ee"

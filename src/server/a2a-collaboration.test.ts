@@ -51,7 +51,7 @@ describe("agent to agent", () => {
    * is paused unless a test asks otherwise, so the real runner does not race
    * the hand-driven turns below for a CLI that is not there.
    */
-  const readyTab = async (name: string, provider: "codex" | "claude" = "codex", options: { armed?: boolean; canDispatch?: boolean } = {}) => {
+  const readyTab = async (name: string, provider: "codex" | "claude" | "chatgpt" = "codex", options: { armed?: boolean; canDispatch?: boolean } = {}) => {
     const { armed = false, canDispatch = false } = options;
     const tab = await app.promptor.storage.createTab(name);
     await app.promptor.storage.updateTab(tab.id, (current) => ({
@@ -482,6 +482,64 @@ describe("agent to agent", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     expect(await status()).not.toBe("pending");
+  });
+
+  it("delivers to a web conversation, and returns its result for it", async () => {
+    // A ChatGPT conversation has a queue, a thread and a final answer, so it
+    // can be given work -- but it has no shell, so it can never call back.
+    const from = await readyTab("协调");
+    const web = await readyTab("ChatGPT", "chatgpt");
+    const rootPrompt = (await addPrompt(from, "@@ 让 ChatGPT 评审这份文档")).json().data.prompt;
+    const { contextId } = await beginTurn(from, rootPrompt.id);
+
+    const sent = await call(from, { op: "send", contextId, requestId: "r1", to: web, text: "请评审并给出修改稿" });
+    expect(sent.statusCode).toBe(200);
+    const deliveredId = sent.json().data.delivered.promptId;
+
+    // It runs the message with no preamble: there is nothing it could call
+    // with one, so it is given the task and nothing else.
+    const { submitted } = await beginTurn(web, deliveredId);
+    expect(submitted).toBe("请评审并给出修改稿");
+    await settleTurn(web, deliveredId);
+
+    const before = (await app.promptor.a2a.readRoot(rootPrompt.id))!.usedMessages;
+    const webTab = await app.promptor.storage.getTabMeta(web);
+    const delivered = (await app.promptor.storage.readTab(web)).prompts.prompts.find((item) => item.id === deliveredId)!;
+    await app.promptor.a2a.replyForLeaf({
+      tab: webTab,
+      prompt: delivered,
+      answerText: "改好了，见修改稿。",
+      files: ["D:\exchange\PLAN.reviewed.md"],
+    });
+
+    // The reply is a real message: it lands in the sender's queue and it costs.
+    const back = (await app.promptor.storage.readTab(from)).prompts.prompts.at(-1)!;
+    expect(back.text).toContain("改好了，见修改稿。");
+    expect(back.text).toContain("PLAN.reviewed.md");
+    expect(back.a2a).toMatchObject({ rootId: rootPrompt.id, fromTabId: web, depth: 2 });
+    expect((await app.promptor.a2a.readRoot(rootPrompt.id))!.usedMessages).toBe(before + 1);
+
+    // Once only, however many times the turn is observed to have landed.
+    await app.promptor.a2a.replyForLeaf({ tab: webTab, prompt: delivered, answerText: "改好了，见修改稿。", files: [] });
+    expect((await app.promptor.storage.readTab(from)).prompts.prompts.at(-1)!.id).toBe(back.id);
+  });
+
+  it("never returns a result for a conversation that could have sent one itself", async () => {
+    const from = await readyTab("协调");
+    const worker = await readyTab("执行");
+    const rootPrompt = (await addPrompt(from, "@@ 分工")).json().data.prompt;
+    const { contextId } = await beginTurn(from, rootPrompt.id);
+    const deliveredId = (await call(from, { op: "send", contextId, requestId: "r1", to: worker, text: "任务" })).json().data.delivered.promptId;
+    const before = (await app.promptor.storage.readTab(from)).prompts.prompts.length;
+
+    const delivered = (await app.promptor.storage.readTab(worker)).prompts.prompts.find((item) => item.id === deliveredId)!;
+    await app.promptor.a2a.replyForLeaf({
+      tab: await app.promptor.storage.getTabMeta(worker),
+      prompt: delivered,
+      answerText: "我本来应该自己 send 回去",
+      files: [],
+    });
+    expect((await app.promptor.storage.readTab(from)).prompts.prompts).toHaveLength(before);
   });
 
   it("refuses a terminal conversation as a target", async () => {

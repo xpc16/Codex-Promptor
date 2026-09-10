@@ -7,12 +7,17 @@ const makeId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.
 // "shell" is a conversation with no coding agent at all: just a PowerShell in
 // a working directory. Turns, final answers and history do not apply to it.
 //
+// "chatgpt" is a conversation with no local process at all: the agent is the
+// ChatGPT web app, driven in a browser page Promptor controls. It has a thread
+// (the conversation URL), turns and final answers like any other, so the queue
+// treats it identically; what it has no part of is the terminal.
+//
 // "e2ee" is not a conversation either: it is the end-to-end encryption switch
 // wearing a tab's clothes, so that turning encryption on and off is the same
 // gesture as opening and deleting a conversation. It has no terminal, no queue
 // and no history, and its working directory field holds the passphrase, which
 // never leaves this machine (see docs/E2EE_MINIMAL_DESIGN.md).
-export const AgentProviderSchema = z.enum(["codex", "claude", "cursor", "shell", "e2ee"]);
+export const AgentProviderSchema = z.enum(["codex", "claude", "cursor", "chatgpt", "shell", "e2ee"]);
 export type AgentProvider = z.infer<typeof AgentProviderSchema>;
 
 export const OriginSchema = z.enum(["queue", "manual", "imported", "timer"]);

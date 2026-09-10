@@ -302,6 +302,10 @@ input, textarea, select { color: var(--text); }
 .a2a-bar .a2a-note { color: var(--notice); }
 .a2a-bar .a2a-soft { padding: 0 6px; border: 1px solid var(--border); border-radius: 999px; }
 .a2a-bar .a2a-actions { margin-left: auto; display: flex; gap: 10px; }
+.chatgpt-card .chatgpt-body { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; overflow: auto; }
+.chatgpt-row { display: flex; gap: 10px; align-items: baseline; font-size: 12px; }
+.chatgpt-row > span:first-child { flex: none; color: var(--muted); }
+.chatgpt-row a { word-break: break-all; }
 .a2a-badge { padding: 0 6px; border-radius: 999px; background: color-mix(in srgb, var(--a2a) 16%, transparent); color: var(--a2a); font-size: 11px; }
 .prompt-list { flex: 1; min-height: 0; overflow-y: auto; display: grid; align-content: start; gap: 8px; margin-top: 10px; padding-right: 3px; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .prompt-row { position: relative; display: grid; grid-template-columns: 24px 18px minmax(0, 1fr) auto; column-gap: 7px; row-gap: 0; align-items: start; padding: 10px 9px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel-soft); transition: .14s; }
