@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isoNow, newAttempt } from "../shared/schemas.js";
+import { outgoingPromptText } from "../shared/a2a-prefix.js";
 import { createApp, type PromptorApp } from "./app.js";
 
 /**
@@ -134,6 +135,83 @@ describe("agent to agent", () => {
     expect(submitted).toContain("Promptor A2A 协作说明");
     expect(submitted).toContain("coordinator");
     expect(submitted!.endsWith("把这件事拆开做")).toBe(true);
+  });
+
+  it("starts a collaboration when @@ is typed in front of a prompt already in the queue", async () => {
+    // The reported case: a prompt is queued as ordinary text, then edited to
+    // begin with @@ and run. It has to become a real collaboration, not a
+    // prompt whose text is literally "\\@@...".
+    const tabId = await readyTab("协调");
+    const queued = (await addPrompt(tabId, "帮我看看这个方案")).json().data.prompt;
+    expect(queued.a2a).toBeUndefined();
+
+    const edited = await app.inject({
+      method: "PATCH",
+      url: `/api/tabs/${tabId}/prompts/${queued.id}`,
+      headers: local(),
+      payload: { text: outgoingPromptText("@@ 帮我看看这个方案", queued) } as never,
+    });
+    expect(edited.statusCode).toBe(200);
+    const prompt = edited.json().data.prompt;
+    expect(prompt.text).toBe("帮我看看这个方案");
+    expect(prompt.a2a).toMatchObject({ rootId: queued.id, skill: "central", depth: 0 });
+    expect(await app.promptor.a2a.readRoot(queued.id)).toMatchObject({ status: "pending", skill: "central" });
+
+    // And it lights up the moment it is dispatched, like any other root.
+    await beginTurn(tabId, queued.id);
+    expect((await app.promptor.a2a.summaryForTab(tabId))!.active).toBe(true);
+  });
+
+  it("keeps a stored literal @@ literal when it is edited again", async () => {
+    const tabId = await readyTab("协调");
+    const queued = (await addPrompt(tabId, "\\@@ 这是正文")).json().data.prompt;
+    expect(queued.text).toBe("@@ 这是正文");
+    expect(queued.a2a).toBeUndefined();
+
+    const edited = await app.inject({
+      method: "PATCH",
+      url: `/api/tabs/${tabId}/prompts/${queued.id}`,
+      headers: local(),
+      payload: { text: outgoingPromptText("@@ 这是正文，改了一个字", queued) } as never,
+    });
+    expect(edited.json().data.prompt.text).toBe("@@ 这是正文，改了一个字");
+    expect(edited.json().data.prompt.a2a).toBeUndefined();
+    expect(await app.promptor.a2a.readRoot(queued.id)).toBeNull();
+  });
+
+  it("never lets an escaped @@ reach the CLI through insert-now", async () => {
+    // This is how "\\@@..." became a prompt's own text: the replacement text on
+    // this route was stored and submitted without ever being parsed.
+    const tabId = await readyTab("协调");
+    const queued = (await addPrompt(tabId, "\\@@ 这是正文")).json().data.prompt;
+
+    const inserted = await app.inject({
+      method: "POST",
+      url: `/api/tabs/${tabId}/prompts/${queued.id}/insert-now`,
+      headers: local(),
+      payload: { text: outgoingPromptText("@@ 这是正文", queued) } as never,
+    });
+    // Whatever the runner does with it, the text it was given is clean.
+    const stored = (await app.promptor.storage.readTab(tabId)).prompts.prompts.find((item) => item.id === queued.id)!;
+    expect(stored.text.startsWith("\\")).toBe(false);
+    void inserted;
+  });
+
+  it("refuses to insert a collaboration into the running turn, and says what to do instead", async () => {
+    const tabId = await readyTab("协调");
+    const queued = (await addPrompt(tabId, "帮我看看这个方案")).json().data.prompt;
+    const refused = await app.inject({
+      method: "POST",
+      url: `/api/tabs/${tabId}/prompts/${queued.id}/insert-now`,
+      headers: local(),
+      payload: { text: "@@ 帮我看看这个方案" } as never,
+    });
+    expect(refused.statusCode).toBe(400);
+    expect(refused.json().error.code).toBe("A2A_INSERT_NOW_UNSUPPORTED");
+    // Refused before anything changed: still an ordinary queued prompt.
+    const stored = (await app.promptor.storage.readTab(tabId)).prompts.prompts.find((item) => item.id === queued.id)!;
+    expect(stored.text).toBe("帮我看看这个方案");
+    expect(stored.a2a).toBeUndefined();
   });
 
   it("refuses a mode that does not exist, before anything is stored", async () => {

@@ -16,7 +16,7 @@ import {
 } from "react";
 import type { AgentProvider, AnswerRecord, Group, IndexFile, PromptRecord, RuntimeFile, TabBundle, TabMeta, TabRecordPage } from "../shared/schemas.js";
 import type { A2aRootSummary } from "../shared/a2a.js";
-import { restorePromptPrefix } from "../shared/a2a-prefix.js";
+import { outgoingPromptText } from "../shared/a2a-prefix.js";
 import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-link.js";
 import { randomPassphrase } from "../shared/e2ee-keys.js";
 import { deriveSessionKey } from "./e2ee-client.js";
@@ -1636,7 +1636,7 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
     if (text.trim() === prompt.text) { setEditing(false); return; }
     // The row shows the clean prompt, so the prefix is rebuilt from the
     // metadata on the way back -- the server parses the same string it wrote.
-    try { const echo = await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "PATCH", body: JSON.stringify({ text: restorePromptPrefix(text.trim(), prompt.a2a) }) }); setEditing(false); onChanged(echo); }
+    try { const echo = await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "PATCH", body: JSON.stringify({ text: outgoingPromptText(text.trim(), prompt) }) }); setEditing(false); onChanged(echo); }
     catch (reason) { onError(reason); }
   };
   const remove = async () => { try { onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}`, { method: "DELETE" })); } catch (reason) { onError(reason); } };
@@ -1648,7 +1648,7 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
     if (editing && !replacementText) { onError(new PromptorApiError("PROMPT_EMPTY", t("queue.promptEmpty"), 400, false)); return; }
     setInsertingNow(true);
     try {
-      onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/insert-now`, jsonBody(replacementText === undefined ? {} : { text: restorePromptPrefix(replacementText, prompt.a2a) })));
+      onChanged(await api(`/api/tabs/${tabId}/prompts/${prompt.id}/insert-now`, jsonBody(replacementText === undefined ? {} : { text: outgoingPromptText(replacementText, prompt) })));
       setEditing(false);
     }
     catch (reason) { onError(reason); }

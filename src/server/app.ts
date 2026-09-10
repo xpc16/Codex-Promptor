@@ -41,7 +41,7 @@ import { CLAUDE_EXIT_MARKER, CODEX_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, 
 import { isSlashCommandPrompt } from "./prompt-submit.js";
 import { RunnerManager } from "./queue.js";
 import { A2aError, A2aService } from "./a2a-service.js";
-import { A2aPrefixError, parsePromptPrefix, restorePromptPrefix } from "./a2a-preamble.js";
+import { A2aPrefixError, parsePromptPrefix } from "./a2a-preamble.js";
 import type { A2aPromptMeta } from "../shared/a2a.js";
 import { recordsForCurrentThread, StorageService } from "./storage.js";
 import { TimerService, TimerServiceError } from "./timer-service.js";
@@ -3162,12 +3162,21 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         return apiError(reply, 400, "A2A_INSERT_NOW_UNSUPPORTED", "协作消息按独立轮次执行，不能插入当前轮，请等待排队执行。");
       }
       const body = (request.body ?? {}) as any;
-      const result = await runners.get(tabId).insertNow(
-        promptId,
-        body.text === undefined ? undefined : String(body.text),
-      );
+      // Replacement text is a queue entry point like any other, so it goes
+      // through the same parser. Without this an escaped `\@@` reached the CLI
+      // verbatim and was stored as the prompt's own text.
+      let replacement: string | undefined;
+      if (body.text !== undefined) {
+        const edited = parsePromptPrefix(String(body.text).trim());
+        if (edited.kind === "a2a") {
+          return apiError(reply, 400, "A2A_INSERT_NOW_UNSUPPORTED", "协作要按独立轮次开始。请先点保存（✓），再用「开始」让队列执行它。");
+        }
+        replacement = edited.text;
+      }
+      const result = await runners.get(tabId).insertNow(promptId, replacement);
       return reply.send({ data: { ...result, runtime: await storage.readRuntime(tabId) } });
     } catch (error) {
+      if (error instanceof A2aPrefixError) return apiError(reply, 400, error.code, error.message);
       return apiError(reply, 400, "PROMPT_INSERT_NOW_FAILED", error instanceof Error ? error.message : String(error));
     }
   });

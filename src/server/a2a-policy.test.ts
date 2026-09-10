@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { A2aSkillError, parseSkillDocument, resolveRolePolicy } from "./a2a-policy.js";
 import { a2aAdvice, a2aBudget, DEFAULT_A2A_LIMITS } from "../shared/a2a.js";
-import { parsePromptPrefix, restorePromptPrefix } from "../shared/a2a-prefix.js";
+import { outgoingPromptText, parsePromptPrefix } from "../shared/a2a-prefix.js";
 
 /**
  * The permission list and the prose that explains it live in one file, so the
@@ -115,14 +115,25 @@ describe("the @@ prefix", () => {
     expect(() => parsePromptPrefix("@@   ")).toThrow(/协作完成的事/);
   });
 
-  it("round-trips: what the composer shows back parses to the same thing", () => {
+  it("round-trips an edited collaboration prompt to the same thing", () => {
     const parsed = parsePromptPrefix("@@debate 应该用 A 方案");
-    const shown = restorePromptPrefix(parsed.text, { rootId: "r", skill: "debate", depth: 0, fromTabId: null, fromPromptId: null });
-    expect(parsePromptPrefix(shown)).toEqual(parsed);
+    const stored = { text: parsed.text, a2a: { rootId: "r", skill: "debate", depth: 0, fromTabId: null, fromPromptId: null } };
+    expect(parsePromptPrefix(outgoingPromptText(parsed.text, stored))).toEqual(parsed);
   });
 
-  it("re-escapes a plain prompt that happens to begin with @@", () => {
-    expect(parsePromptPrefix(restorePromptPrefix("@@ 不是协作", null))).toEqual({ kind: "plain", text: "@@ 不是协作" });
+  it("re-escapes a stored prompt whose own text begins with @@", () => {
+    // It was a literal when it was saved, so editing a word in it must not
+    // quietly turn it into a collaboration.
+    const stored = { text: "@@ 不是协作" };
+    expect(parsePromptPrefix(outgoingPromptText("@@ 不是协作了", stored))).toEqual({ kind: "plain", text: "@@ 不是协作了" });
+  });
+
+  it("lets a person turn a queued prompt into a collaboration by typing @@ in front of it", () => {
+    // The reported bug: this was escaped on the way out, so the prompt ran as
+    // literal `\@@...` text and no collaboration was ever started.
+    const stored = { text: "帮我看看这个方案" };
+    expect(parsePromptPrefix(outgoingPromptText("@@ 帮我看看这个方案", stored)))
+      .toEqual({ kind: "a2a", skill: "central", text: "帮我看看这个方案" });
   });
 });
 

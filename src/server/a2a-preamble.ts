@@ -2,7 +2,7 @@ import { type A2aBudgetSnapshot } from "../shared/a2a.js";
 import { A2A_SKILL_NAME_PATTERN } from "../shared/a2a.js";
 import { describeRolePolicy, type A2aRolePolicy } from "./a2a-policy.js";
 
-export { A2aPrefixError, parsePromptPrefix, restorePromptPrefix, type PromptPrefix } from "../shared/a2a-prefix.js";
+export { A2aPrefixError, outgoingPromptText, parsePromptPrefix, type PromptPrefix } from "../shared/a2a-prefix.js";
 
 export function isValidSkillName(name: string): boolean {
   return A2A_SKILL_NAME_PATTERN.test(name);

@@ -43,12 +43,18 @@ export function parsePromptPrefix(raw: string): PromptPrefix {
 }
 
 /**
- * What the composer should show when a stored prompt is edited: the prefix is
- * rebuilt from the metadata, not from the text, and a plain prompt that merely
- * begins with `@@` is re-escaped so saving it again does not start a
+ * What an edited row sends back to the queue entry point.
+ *
+ * Two facts about the *stored* prompt decide it, never the edited text: an
+ * A2A prompt gets its own skill prefix back, and a prompt whose text already
+ * began with `@@` gets re-escaped so re-saving it cannot start a
  * collaboration nobody asked for.
+ *
+ * Reading the edited text instead would break the case this is most used for:
+ * typing `@@` in front of a queued prompt to turn it into a collaboration.
+ * That is a person asking for one, and it has to survive the round trip.
  */
-export function restorePromptPrefix(text: string, meta?: A2aPromptMeta | null): string {
-  if (meta) return `@@${meta.skill} ${text}`;
-  return text.startsWith("@@") ? `\\${text}` : text;
+export function outgoingPromptText(edited: string, stored: { text: string; a2a?: A2aPromptMeta | null }): string {
+  if (stored.a2a) return `@@${stored.a2a.skill} ${edited}`;
+  return stored.text.startsWith("@@") ? `\\${edited}` : edited;
 }
