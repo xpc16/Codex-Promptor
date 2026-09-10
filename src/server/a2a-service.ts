@@ -321,6 +321,46 @@ export class A2aService {
       });
       if (settled) for (const participant of settled.members) this.deps.notifyTab(participant.tabId);
     }
+    await this.settleQuietRoots(roots);
+  }
+
+  /**
+   * End a collaboration once nothing anywhere in it is pending, dispatching or
+   * running.
+   *
+   * The turn that could still send is always `running` while it sends, so
+   * "nothing outstanding" cannot be observed mid-exchange -- an agent about to
+   * deliver a message is itself the work that keeps the root open. What this
+   * does not cover is an agent that ends its turn intending to continue after
+   * a person answers it: that collaboration closes, and continuing it means
+   * writing `@@` again.
+   */
+  private async settleQuietRoots(roots: readonly A2aRoot[]): Promise<void> {
+    for (const root of roots) {
+      if (root.status !== "running" || root.pendingFinish) continue;
+      if ((await this.outstandingWork(root, null)).length) continue;
+      const settled = await this.store.withRootLock(root.rootId, async () => {
+        const current = await this.store.read(root.rootId);
+        if (!current || current.status !== "running" || current.pendingFinish) return null;
+        return this.store.write({
+          ...current,
+          status: "completed",
+          endedAt: isoNow(),
+          endReason: "completed_no_work",
+          pendingFinish: null,
+        });
+      });
+      if (settled) for (const participant of settled.members) this.deps.notifyTab(participant.tabId);
+    }
+  }
+
+  /**
+   * The same sweep at startup, for roots that went quiet across a restart and
+   * so will never see a queue event of their own.
+   */
+  async settleQuietRootsOnLaunch(): Promise<void> {
+    if (!this.deps.enabled()) return;
+    await this.settleQuietRoots(await this.store.all());
   }
 
   /** Invalidates a context without waiting for storage to disagree with it. */
@@ -363,7 +403,6 @@ export class A2aService {
         usedSpawns: root.usedSpawns,
         advice: snapshot.advice,
         sessionClosed: unfinished && tabState === "closed" ? true : undefined,
-        pendingEnd: unfinished && (await this.outstandingWork(root, null)).length === 0 ? true : undefined,
       });
     }
     return a2aTabSummary(summaries);

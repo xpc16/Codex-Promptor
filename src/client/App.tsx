@@ -1474,7 +1474,6 @@ function A2aRootBar({ root, onError }: { root: A2aRootSummary; onError: (error: 
     <span>{t("a2a.budget", { used: root.usedMessages, total: root.limits.messages })}</span>
     <span>{t("a2a.elapsed", { duration })}</span>
     {root.status === "ending" && <span className="a2a-note">{t("a2a.ending")}</span>}
-    {root.status === "running" && root.pendingEnd && <span className="a2a-note" title={t("a2a.pendingEndHelp")}>{t("a2a.pendingEnd")}</span>}
     {root.sessionClosed && <span className="a2a-note">{t("a2a.sessionClosed")}</span>}
     {root.advice !== "continue" && <span className="a2a-note">{t(`a2a.advice.${root.advice}` as "a2a.advice.wrap_up")}</span>}
     <span className="a2a-actions">

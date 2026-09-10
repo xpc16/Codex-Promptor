@@ -240,12 +240,15 @@ describe("agent to agent", () => {
   });
 
   it("keeps an ordinary prompt in the collaboration its conversation is already inside", async () => {
-    // The reported case: the agent asks a question mid-collaboration and the
-    // reader answers it. That turn has to carry the same context, or the
-    // agent has nothing to call the endpoint with and no rules to follow.
+    // A reply the reader writes while the collaboration is still open belongs
+    // to it, or that turn has nothing to call the endpoint with and no rules
+    // to follow. It has to still be open: a collaboration with nothing left
+    // running ends by itself, and a follow-up after that is ordinary text.
     const tabId = await readyTab("协调");
+    const to = await readyTab("执行");
     const rootPrompt = (await addPrompt(tabId, "@@ 把这件事拆开做")).json().data.prompt;
-    await beginTurn(tabId, rootPrompt.id);
+    const first = await beginTurn(tabId, rootPrompt.id);
+    await call(tabId, { op: "send", contextId: first.contextId, requestId: "r1", to, text: "任务" });
     await settleTurn(tabId, rootPrompt.id);
 
     const answer = (await addPrompt(tabId, "确认")).json().data.prompt;
@@ -278,16 +281,16 @@ describe("agent to agent", () => {
     expect(stored.a2a).toBeUndefined();
   });
 
-  it("starts a new collaboration when a @@ prompt is run again after its own was stopped", async () => {
-    // The reported case: a stopped collaboration's prompt was edited and run
-    // again. It kept pointing at the stopped root, so it dispatched with the
+  it("starts a new collaboration when a @@ prompt is run again after its own ended", async () => {
+    // The reported case: an ended collaboration's prompt was edited and run
+    // again. It kept pointing at the ended root, so it dispatched with the
     // badge still on and none of the behaviour -- no preamble, no context.
     const tabId = await readyTab("协调");
     const first = (await addPrompt(tabId, "@@ 让另一个对话算一道题")).json().data.prompt;
     await beginTurn(tabId, first.id);
     await settleTurn(tabId, first.id);
-    await app.inject({ method: "POST", url: `/api/a2a/roots/${first.id}/stop`, headers: local() });
-    expect((await app.promptor.a2a.readRoot(first.id))!.status).toBe("stopped");
+    // Nothing is left running, so it has already ended on its own.
+    expect((await app.promptor.a2a.readRoot(first.id))!.status).toBe("completed");
 
     // Editing it and running it again is the reader starting over.
     await app.inject({
@@ -303,8 +306,8 @@ describe("agent to agent", () => {
     expect(stored.a2a!.rootId).not.toBe(first.id);
     const fresh = await app.promptor.a2a.readRoot(stored.a2a!.rootId);
     expect(fresh).toMatchObject({ status: "running", usedMessages: 1, originPromptId: first.id });
-    // The stopped one is still on disk, saying what happened to it.
-    expect((await app.promptor.a2a.readRoot(first.id))!.status).toBe("stopped");
+    // The ended one is still on disk, saying what happened to it.
+    expect((await app.promptor.a2a.readRoot(first.id))!.status).toBe("completed");
     expect((await call(tabId, { op: "list", contextId })).statusCode).toBe(200);
   });
 
@@ -630,35 +633,68 @@ describe("agent to agent", () => {
     expect(await app.promptor.a2a.readRoot(rootPrompt.id)).toMatchObject({ status: "stopped", endReason: "stopped_by_user" });
   });
 
-  it("says a collaboration is waiting to be ended once nothing is left running", async () => {
-    // It does not end because a queue emptied -- but the difference between
-    // "waiting for work" and "waiting for someone to say so" has to be on
-    // screen, or a bar that will never close on its own looks stuck.
+  it("ends on its own once nothing anywhere in it is still running", async () => {
     const from = await readyTab("协调");
     const to = await readyTab("执行");
     const rootPrompt = (await addPrompt(from, "@@ 分工")).json().data.prompt;
     const { contextId } = await beginTurn(from, rootPrompt.id);
     const sent = await call(from, { op: "send", contextId, requestId: "r1", to, text: "任务" });
     await settleTurn(from, rootPrompt.id);
-    // The worker still has it queued, so there is something to wait for.
-    expect((await app.promptor.a2a.summaryForTab(from))!.roots[0].pendingEnd).toBeUndefined();
+    // The worker still has it queued, so the collaboration is not over.
+    expect((await app.promptor.a2a.readRoot(rootPrompt.id))!.status).toBe("running");
+    expect((await app.promptor.a2a.summaryForTab(from))!.active).toBe(true);
 
     const workerPromptId = sent.json().data.delivered.promptId;
     await beginTurn(to, workerPromptId);
     await settleTurn(to, workerPromptId);
-    const summary = (await app.promptor.a2a.summaryForTab(from))!;
-    expect(summary.active).toBe(true);
-    expect(summary.roots[0].pendingEnd).toBe(true);
+    expect(await app.promptor.a2a.readRoot(rootPrompt.id)).toMatchObject({ status: "completed", endReason: "completed_no_work" });
+    expect((await app.promptor.a2a.summaryForTab(from))!.active).toBe(false);
+    expect((await app.promptor.a2a.summaryForTab(to))!.active).toBe(false);
   });
 
-  it("lets a person end a collaboration the agents left open", async () => {
+  it("does not end while the turn that could still send is the one running", async () => {
+    // The sending agent's own turn is the work that keeps its collaboration
+    // open, so "nothing outstanding" can never be observed mid-exchange.
     const from = await readyTab("协调");
-    const rootPrompt = (await addPrompt(from, "@@ 一个人也能协作")).json().data.prompt;
-    await beginTurn(from, rootPrompt.id);
+    const to = await readyTab("执行");
+    const rootPrompt = (await addPrompt(from, "@@ 分工")).json().data.prompt;
+    const { contextId } = await beginTurn(from, rootPrompt.id);
+    await app.promptor.a2a.onQueueEvent(from);
+    expect((await app.promptor.a2a.readRoot(rootPrompt.id))!.status).toBe("running");
+    // And it survives long enough for that turn to deliver.
+    expect((await call(from, { op: "send", contextId, requestId: "r1", to, text: "任务" })).statusCode).toBe(200);
+  });
+
+  it("sweeps a collaboration that went quiet across a restart", async () => {
+    const tabId = await readyTab("协调");
+    const rootPrompt = (await addPrompt(tabId, "@@ 一个人也能协作")).json().data.prompt;
+    await beginTurn(tabId, rootPrompt.id);
+    // Settle the prompt without letting the sweep run, as a crash would.
+    const bundle = await app.promptor.storage.readTab(tabId);
+    const prompt = bundle.prompts.prompts.find((item) => item.id === rootPrompt.id)!;
+    prompt.status = "completed";
+    prompt.completedAt = isoNow();
+    await app.promptor.storage.writePrompts(tabId, bundle.prompts);
+    expect((await app.promptor.a2a.readRoot(rootPrompt.id))!.status).toBe("running");
+
+    await app.promptor.a2a.settleQuietRootsOnLaunch();
+    expect(await app.promptor.a2a.readRoot(rootPrompt.id)).toMatchObject({ status: "completed", endReason: "completed_no_work" });
+  });
+
+  it("lets a person stop a collaboration while its work is still queued", async () => {
+    // Auto-completion covers the quiet case; stopping is for the one that is
+    // still going and should not.
+    const from = await readyTab("协调");
+    const to = await readyTab("执行");
+    const rootPrompt = (await addPrompt(from, "@@ 分工")).json().data.prompt;
+    const { contextId } = await beginTurn(from, rootPrompt.id);
+    await call(from, { op: "send", contextId, requestId: "r1", to, text: "任务" });
     await settleTurn(from, rootPrompt.id);
+    expect((await app.promptor.a2a.readRoot(rootPrompt.id))!.status).toBe("running");
+
     const stopped = await app.inject({ method: "POST", url: `/api/a2a/roots/${rootPrompt.id}/stop`, headers: local() });
-    expect(stopped.statusCode).toBe(200);
     expect(stopped.json().data).toMatchObject({ status: "stopped", endReason: "stopped_by_user" });
+    expect((await app.promptor.storage.readTab(to)).prompts.prompts).toHaveLength(0);
     expect((await app.promptor.a2a.summaryForTab(from))!.active).toBe(false);
   });
 

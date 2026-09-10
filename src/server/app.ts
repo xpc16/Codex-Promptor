@@ -1612,6 +1612,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await queue.done;
       restoreQueue = null;
       await timers.start();
+      // A collaboration that went quiet across the restart will never see a
+      // queue event of its own, so it is swept once here instead.
+      await a2a.settleQuietRootsOnLaunch().catch(() => undefined);
       return { restored, failed, timings: formatRestoreTimings(traces, Date.now() - startedAt, RESTORE_STAGGER_MS) };
     })();
     return restoreOpenSessionsPromise;
