@@ -94,15 +94,15 @@ describe("collaboration skills", () => {
 
 describe("the @@ prefix", () => {
   it("takes the default mode when none is named", () => {
-    expect(parsePromptPrefix("@@ 拆一下这个任务")).toEqual({ kind: "a2a", skill: "central", text: "拆一下这个任务" });
+    expect(parsePromptPrefix("@@ 拆一下这个任务")).toEqual({ kind: "a2a", skill: "central", text: "@@ 拆一下这个任务" });
   });
 
   it("takes a named mode", () => {
-    expect(parsePromptPrefix("@@debate 应该用 A 方案")).toEqual({ kind: "a2a", skill: "debate", text: "应该用 A 方案" });
+    expect(parsePromptPrefix("@@debate 应该用 A 方案")).toEqual({ kind: "a2a", skill: "debate", text: "@@debate 应该用 A 方案" });
   });
 
   it("does not treat a non-ASCII word as a mode name", () => {
-    expect(parsePromptPrefix("@@把这件事分给两个人")).toEqual({ kind: "a2a", skill: "central", text: "把这件事分给两个人" });
+    expect(parsePromptPrefix("@@把这件事分给两个人")).toEqual({ kind: "a2a", skill: "central", text: "@@把这件事分给两个人" });
   });
 
   it("leaves an ordinary prompt entirely alone", () => {
@@ -120,28 +120,29 @@ describe("the @@ prefix", () => {
 });
 
 describe("editing a prompt that is already in the queue", () => {
-  // The row sends what its textarea holds and nothing else, so every one of
-  // these is decided from the stored prompt alone. A page left open across an
-  // upgrade cannot change the answer.
+  // The row sends what its textarea holds and nothing else, and the prefix
+  // stays in the stored text -- so the text is the whole answer, and a page
+  // left open across an upgrade cannot change it.
   it("lets a person turn a queued prompt into a collaboration by typing @@ in front of it", () => {
     expect(editedPromptPrefix({ text: "帮我看看这个方案" }, "@@ 帮我看看这个方案"))
-      .toEqual({ kind: "a2a", skill: "central", text: "帮我看看这个方案" });
+      .toEqual({ kind: "a2a", skill: "central", text: "@@ 帮我看看这个方案" });
   });
 
-  it("keeps a collaboration a collaboration when its body is edited", () => {
-    const stored = { text: "旧正文", a2a: { rootId: "r", skill: "debate", depth: 0, fromTabId: null, fromPromptId: null } };
-    expect(editedPromptPrefix(stored, "新正文")).toEqual({ kind: "a2a", skill: "debate", text: "新正文" });
+  it("lets a person take it back out again by deleting the prefix", () => {
+    const stored = { text: "@@ 正文", a2a: { rootId: "r", skill: "central", depth: 0, fromTabId: null, fromPromptId: null } };
+    expect(editedPromptPrefix(stored, "正文")).toEqual({ kind: "plain", text: "正文" });
   });
 
   it("lets a prefix name a different mode on a collaboration that has not started", () => {
-    const stored = { text: "正文", a2a: { rootId: "r", skill: "central", depth: 0, fromTabId: null, fromPromptId: null } };
-    expect(editedPromptPrefix(stored, "@@debate 正文")).toEqual({ kind: "a2a", skill: "debate", text: "正文" });
+    const stored = { text: "@@ 正文", a2a: { rootId: "r", skill: "central", depth: 0, fromTabId: null, fromPromptId: null } };
+    expect(editedPromptPrefix(stored, "@@debate 正文")).toEqual({ kind: "a2a", skill: "debate", text: "@@debate 正文" });
   });
 
-  it("keeps a stored literal @@ literal, however it is edited", () => {
-    // It was written as `\\@@` on purpose when it was created.
-    const stored = { text: "@@ 不是协作" };
-    expect(editedPromptPrefix(stored, "@@ 不是协作了")).toEqual({ kind: "plain", text: "@@ 不是协作了" });
+  it("keeps a message that arrived from elsewhere in its collaboration", () => {
+    // An inbound message never carried a prefix, so there is none to delete.
+    const stored = { text: "请检查边界条件", a2a: { rootId: "r", skill: "debate", depth: 1, fromTabId: "tab-1", fromPromptId: "p-1" } };
+    expect(editedPromptPrefix(stored, "请检查边界条件和错误分支"))
+      .toEqual({ kind: "a2a", skill: "debate", text: "请检查边界条件和错误分支" });
   });
 
   it("still honours an explicit escape typed into an ordinary prompt", () => {

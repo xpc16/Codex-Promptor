@@ -169,9 +169,14 @@ export class A2aService {
     prompt: PromptRecord;
     attemptId: string;
     threadId: string;
-  }): Promise<string | null> {
-    const meta = input.prompt.a2a;
-    if (!meta || !this.deps.enabled()) return null;
+  }): Promise<{ submittedText: string; a2a: A2aPromptMeta } | null> {
+    if (!this.deps.enabled()) return null;
+    // A conversation inside an unfinished collaboration is still in it, so a
+    // prompt the reader types here belongs to it too -- otherwise answering
+    // the agent's own question drops that turn out of the collaboration, with
+    // no context to call the endpoint with and no instructions to follow.
+    const meta = input.prompt.a2a ?? await this.continuationMeta(input.tab.id);
+    if (!meta) return null;
     const root = await this.store.read(meta.rootId);
     if (!root) return null;
     if (root.status === "completed" || root.status === "stopped") return null;
@@ -229,7 +234,30 @@ export class A2aService {
       level: member.level,
     });
     for (const participant of started.members) this.deps.notifyTab(participant.tabId);
-    return composeSubmittedText(preamble, input.prompt.text);
+    return { submittedText: composeSubmittedText(preamble, input.prompt.text), a2a: meta };
+  }
+
+  /**
+   * The collaboration an ordinary prompt in this conversation belongs to, if
+   * any: the most recently started root it has joined that has not ended. Its
+   * depth is the depth of the last collaboration message this conversation
+   * actually executed, so a reply the reader writes is bounded exactly as the
+   * message it is replying to was.
+   */
+  private async continuationMeta(tabId: string): Promise<A2aPromptMeta | null> {
+    const active = (await this.store.forTab(tabId))
+      .filter((root) => root.status === "running" || root.status === "ending");
+    const root = active[0];
+    if (!root) return null;
+    const prompts = await this.deps.storage.readPromptsOnly(tabId).catch(() => null);
+    const previous = prompts?.prompts.filter((prompt) => prompt.a2a?.rootId === root.rootId).at(-1);
+    return {
+      rootId: root.rootId,
+      skill: root.skill,
+      depth: previous?.a2a?.depth ?? 0,
+      fromTabId: null,
+      fromPromptId: null,
+    };
   }
 
   /**

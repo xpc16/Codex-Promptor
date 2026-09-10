@@ -83,13 +83,21 @@ describe("agent to agent", () => {
     prompt.status = "running";
     prompt.threadId = bundle.tab.session.threadId;
     await app.promptor.storage.writePrompts(tabId, bundle.prompts);
-    const submitted = await app.promptor.a2a.prepareDispatch({
+    const prepared = await app.promptor.a2a.prepareDispatch({
       tab: bundle.tab,
       prompt,
       attemptId: attempt.attemptId,
       threadId: bundle.tab.session.threadId!,
     });
-    return { contextId: attempt.attemptId, submitted };
+    // What QueueRunner does with the result, so the stored record matches a
+    // real dispatch: the submitted text on the attempt, the collaboration on
+    // the prompt.
+    if (prepared) {
+      if (prepared.submittedText !== prompt.text) attempt.submittedText = prepared.submittedText;
+      if (prepared.a2a && !prompt.a2a) prompt.a2a = prepared.a2a;
+      await app.promptor.storage.writePrompts(tabId, bundle.prompts);
+    }
+    return { contextId: attempt.attemptId, submitted: prepared?.submittedText ?? null };
   };
 
   const settleTurn = async (tabId: string, promptId: string, status: "completed" | "interrupted" = "completed") => {
@@ -116,8 +124,8 @@ describe("agent to agent", () => {
     const response = await addPrompt(tabId, "@@ 把这件事拆开做");
     expect(response.statusCode).toBe(200);
     const prompt = response.json().data.prompt;
-    // The stored text is what the reader wrote, with no prefix and no preamble.
-    expect(prompt.text).toBe("把这件事拆开做");
+    // The stored text is exactly what the reader wrote, prefix included.
+    expect(prompt.text).toBe("@@ 把这件事拆开做");
     expect(prompt.a2a).toMatchObject({ rootId: prompt.id, skill: "central", depth: 0, fromTabId: null });
 
     const pending = await app.promptor.a2a.readRoot(prompt.id);
@@ -133,7 +141,7 @@ describe("agent to agent", () => {
     // The preamble goes to the CLI, and the reader's words are still the tail.
     expect(submitted).toContain("Promptor A2A 协作说明");
     expect(submitted).toContain("coordinator");
-    expect(submitted!.endsWith("把这件事拆开做")).toBe(true);
+    expect(submitted!.endsWith("@@ 把这件事拆开做")).toBe(true);
   });
 
   it("starts a collaboration when @@ is typed in front of a prompt already in the queue", async () => {
@@ -152,7 +160,7 @@ describe("agent to agent", () => {
     });
     expect(edited.statusCode).toBe(200);
     const prompt = edited.json().data.prompt;
-    expect(prompt.text).toBe("帮我看看这个方案");
+    expect(prompt.text).toBe("@@ 帮我看看这个方案");
     expect(prompt.a2a).toMatchObject({ rootId: queued.id, skill: "central", depth: 0 });
     expect(await app.promptor.a2a.readRoot(queued.id)).toMatchObject({ status: "pending", skill: "central" });
 
@@ -161,20 +169,11 @@ describe("agent to agent", () => {
     expect((await app.promptor.a2a.summaryForTab(tabId))!.active).toBe(true);
   });
 
-  it("keeps a stored literal @@ literal when it is edited again", async () => {
+  it("keeps an escaped @@ out of a collaboration when it is first written", async () => {
     const tabId = await readyTab("协调");
     const queued = (await addPrompt(tabId, "\\@@ 这是正文")).json().data.prompt;
     expect(queued.text).toBe("@@ 这是正文");
     expect(queued.a2a).toBeUndefined();
-
-    const edited = await app.inject({
-      method: "PATCH",
-      url: `/api/tabs/${tabId}/prompts/${queued.id}`,
-      headers: local(),
-      payload: { text: "@@ 这是正文，改了一个字" } as never,
-    });
-    expect(edited.json().data.prompt.text).toBe("@@ 这是正文，改了一个字");
-    expect(edited.json().data.prompt.a2a).toBeUndefined();
     expect(await app.promptor.a2a.readRoot(queued.id)).toBeNull();
   });
 
@@ -212,7 +211,7 @@ describe("agent to agent", () => {
     expect(inserted.json().data.mode).toBe("started");
     // The edit was applied on the way through, so it really is a collaboration.
     const stored = (await app.promptor.storage.readTab(tabId)).prompts.prompts.find((item) => item.id === queued.id)!;
-    expect(stored.text).toBe("帮我看看这个方案");
+    expect(stored.text).toBe("@@ 帮我看看这个方案");
     expect(stored.a2a).toMatchObject({ rootId: queued.id, skill: "central", depth: 0 });
     expect(await app.promptor.a2a.readRoot(queued.id)).toMatchObject({ skill: "central" });
   });
@@ -238,6 +237,45 @@ describe("agent to agent", () => {
     expect([200, 409]).toContain(refused.statusCode);
     if (refused.statusCode === 200) expect(refused.json().data.mode).toBe("started");
     else expect(refused.json().error.code).toBe("A2A_INSERT_NOW_UNSUPPORTED");
+  });
+
+  it("keeps an ordinary prompt in the collaboration its conversation is already inside", async () => {
+    // The reported case: the agent asks a question mid-collaboration and the
+    // reader answers it. That turn has to carry the same context, or the
+    // agent has nothing to call the endpoint with and no rules to follow.
+    const tabId = await readyTab("协调");
+    const rootPrompt = (await addPrompt(tabId, "@@ 把这件事拆开做")).json().data.prompt;
+    await beginTurn(tabId, rootPrompt.id);
+    await settleTurn(tabId, rootPrompt.id);
+
+    const answer = (await addPrompt(tabId, "确认")).json().data.prompt;
+    // Nothing is claimed before it runs: joining happens at dispatch, when the
+    // root is known to still be open.
+    expect(answer.a2a).toBeUndefined();
+    const { contextId, submitted } = await beginTurn(tabId, answer.id);
+    expect(submitted).toContain("Promptor A2A 协作说明");
+    expect(submitted!.endsWith("确认")).toBe(true);
+
+    // It now shows as part of that collaboration, and can actually call it.
+    const stored = (await app.promptor.storage.readTab(tabId)).prompts.prompts.find((item) => item.id === answer.id)!;
+    expect(stored.text).toBe("确认");
+    expect(stored.a2a).toMatchObject({ rootId: rootPrompt.id, skill: "central", depth: 0, fromTabId: null });
+    const listed = await call(tabId, { op: "list", contextId });
+    expect(listed.statusCode).toBe(200);
+  });
+
+  it("leaves an ordinary prompt alone once the collaboration has ended", async () => {
+    const tabId = await readyTab("协调");
+    const rootPrompt = (await addPrompt(tabId, "@@ 把这件事拆开做")).json().data.prompt;
+    await beginTurn(tabId, rootPrompt.id);
+    await settleTurn(tabId, rootPrompt.id);
+    await app.inject({ method: "POST", url: `/api/a2a/roots/${rootPrompt.id}/stop`, headers: local() });
+
+    const later = (await addPrompt(tabId, "另一件不相干的事")).json().data.prompt;
+    const { submitted } = await beginTurn(tabId, later.id);
+    expect(submitted).toBeNull();
+    const stored = (await app.promptor.storage.readTab(tabId)).prompts.prompts.find((item) => item.id === later.id)!;
+    expect(stored.a2a).toBeUndefined();
   });
 
   it("refuses a mode that does not exist, before anything is stored", async () => {

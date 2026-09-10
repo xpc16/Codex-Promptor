@@ -25,7 +25,8 @@ export type QueueBinding = { rpc: QueueRpc };
  * prompt unchanged. Called once per attempt while the tab lock is held, so the
  * text it returns can be frozen onto the attempt before anything is sent.
  */
-export type SubmissionPreparer = (input: { tabId: string; prompt: PromptRecord; attemptId: string; threadId: string }) => Promise<string | null>;
+export type SubmissionPreparer = (input: { tabId: string; prompt: PromptRecord; attemptId: string; threadId: string })
+  => Promise<{ submittedText: string; a2a?: PromptRecord["a2a"] } | null>;
 type QueueResolver = QueueBinding | (() => QueueBinding);
 export const QUEUE_INTER_PROMPT_DELAY_MS = 5_000;
 
@@ -429,7 +430,12 @@ export class QueueRunner extends EventEmitter {
       const prepared = this.prepareSubmission
         ? await this.prepareSubmission({ tabId: this.tabId, prompt, attemptId: attempt.attemptId, threadId }).catch(() => null)
         : null;
-      if (prepared && prepared !== prompt.text) attempt.submittedText = prepared;
+      if (prepared) {
+        if (prepared.submittedText !== prompt.text) attempt.submittedText = prepared.submittedText;
+        // Written here, inside the same lock, so the queue row says what this
+        // turn actually joined rather than only what it was queued as.
+        if (prepared.a2a && !prompt.a2a) prompt.a2a = prepared.a2a;
+      }
       prompt.attempts.push(attempt);
       prompt.threadId = threadId;
       prompt.status = "dispatching";
