@@ -297,7 +297,6 @@ input, textarea, select { color: var(--text); }
    unfinished, including while it is only waiting for someone else. No
    animation -- it is a lifecycle, not a heartbeat. */
 .status-dot.a2a { background: var(--a2a); box-shadow: 0 0 8px color-mix(in srgb, var(--a2a) 58%, transparent); }
-.queue-state.a2a { color: var(--a2a); }
 .a2a-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0 0; padding: 6px 10px; border: 1px solid color-mix(in srgb, var(--a2a) 34%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--a2a) 8%, var(--panel-soft)); color: var(--muted); font-size: 12px; }
 .a2a-bar strong { color: var(--a2a); font-weight: 600; }
 .a2a-bar .a2a-note { color: var(--notice); }
