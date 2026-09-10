@@ -53,10 +53,26 @@ export function chooseResumeThread(input: {
   fallbackThreadId: string | null;
   threadHasRollout: boolean;
   fallbackHasRollout: boolean;
+  cachedThreadId?: string | null;
+  cachedHasRollout?: boolean;
 }): ResumeThreadChoice {
   if (input.threadHasRollout) return { threadId: input.threadId, fellBack: false };
   if (input.fallbackThreadId && input.fallbackThreadId !== input.threadId && input.fallbackHasRollout) {
     return { threadId: input.fallbackThreadId, fellBack: true };
   }
+  if (input.cachedThreadId && input.cachedThreadId !== input.threadId && input.cachedHasRollout) {
+    return { threadId: input.cachedThreadId, fellBack: true };
+  }
   return { threadId: input.threadId, fellBack: false };
+}
+
+/** Older versions lost the durable origin after two empty thread switches.
+ * Only accept this tab's own cache when its recorded prompts corroborate it.
+ * The caller must still locate that exact id in Codex's sessions directory;
+ * the cache's arbitrary file path is never used as proof of existence.
+ */
+export function cachedResumeThread(cache: unknown, prompts: readonly { threadId?: string | null }[]): string | null {
+  const id = (cache as { threadId?: unknown } | null)?.threadId;
+  if (typeof id !== "string" || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) return null;
+  return prompts.some((prompt) => prompt.threadId === id) ? id : null;
 }

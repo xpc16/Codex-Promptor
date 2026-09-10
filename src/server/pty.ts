@@ -205,9 +205,10 @@ export class PtyManager extends EventEmitter {
           const exitCode = parseAgentExitCode(scanned, exitMarker);
           if (exitCode !== null) {
             session.agentExited = true;
+            const detail = exitCode === 0 ? null : terminalExitDetail(session.buffer.toString("utf8"));
             this.emitEvent(exitCode === 0
               ? { tabId, type: "state", state: "exited", exitCode }
-              : { tabId, type: "state", state: "error", exitCode, message: `${agentLabel} TUI exited with code ${exitCode}. PowerShell remains available.` });
+              : { tabId, type: "state", state: "error", exitCode, message: `${agentLabel} TUI exited with code ${exitCode}. PowerShell remains available.${detail ? ` ${detail}` : ""}` });
           }
         }
       });
@@ -218,7 +219,7 @@ export class PtyManager extends EventEmitter {
         this.emitEvent({ tabId, type: "state", state: "exited", exitCode });
       });
       setTimeout(() => {
-        if (this.sessions.get(tabId)?.process !== child) return;
+        if (this.sessions.get(tabId)?.process !== child || session.agentExited) return;
         this.emitEvent({ tabId, type: "state", state: "running" });
         onReady?.(child);
       }, 180);
@@ -427,6 +428,11 @@ export function parseAgentExitCode(value: string, marker: string): number | null
 export function terminalStartupError(value: string, marker = CODEX_EXIT_MARKER, agentLabel = "Codex"): string | null {
   const exitCode = parseAgentExitCode(value, marker);
   if (exitCode === null) return null;
+  const detail = terminalExitDetail(value);
+  return `${agentLabel} TUI exited before the session was attached (code ${exitCode}).${detail ? ` ${detail}` : ""}`;
+}
+
+function terminalExitDetail(value: string): string | null {
   const plain = value
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
     .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, "")
@@ -434,7 +440,8 @@ export function terminalStartupError(value: string, marker = CODEX_EXIT_MARKER, 
   if (/active writer|already has an active writer|thread\/resume failed.*writer/i.test(plain)) {
     return "thread/resume failed: thread already has an active writer";
   }
-  return `${agentLabel} TUI exited before the session was attached (code ${exitCode}).`;
+  const missing = /No saved session found with ID\s+([0-9a-f-]{36})/i.exec(plain);
+  return missing ? `No saved session found with ID ${missing[1]}.` : null;
 }
 
 function quoteArg(value: string): string {

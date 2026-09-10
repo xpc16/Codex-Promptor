@@ -152,6 +152,25 @@ describe("PtyManager prompt submission", () => {
 });
 
 describe("PtyManager argv launch", () => {
+  it("does not overwrite an early agent failure with the delayed running event", async () => {
+    vi.useFakeTimers();
+    mocks.spawn.mockReset();
+    const term = fakePty();
+    mocks.spawn.mockReturnValueOnce(term.process);
+    const manager = new PtyManager();
+    const events: any[] = [];
+    manager.on("event", (event) => { if (event.type === "state") events.push(event); });
+    await manager.startArgvCommand("tab-fast-exit", "D:\\work", { executable: "codex", args: [] }, "scripts/launch-agent.ps1", "Codex", "__EXIT__:fast:", {}, "light");
+    term.data("ERROR: No saved session found with ID 01a06a46-1538-7a42-b01d-e668743bbf27.\r\n__EXIT__:fast:1\r\n");
+    vi.advanceTimersByTime(180);
+    expect(events.map((event) => event.state)).toEqual(["starting", "error"]);
+    expect(events.at(-1).message).toContain("No saved session found");
+    expect(manager.submitPrompt("tab-fast-exit", "not a shell command")).toBe(false);
+    term.exit();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
   it("passes an encoded argv specification to the tracked PowerShell launcher", async () => {
     vi.useFakeTimers();
     mocks.spawn.mockReset();

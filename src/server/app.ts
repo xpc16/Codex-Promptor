@@ -69,7 +69,7 @@ import { nameForSession } from "../shared/session-tab-name.js";
 import { classifyNetworkScope, isLoopbackAddress, type NetworkScope } from "./traffic-scope.js";
 import { buildIndexDelta, indexDeltaIsEmpty } from "../shared/index-delta.js";
 import { createTrafficLog } from "./traffic-log.js";
-import { chooseResumeThread } from "./codex-thread-fallback.js";
+import { cachedResumeThread, chooseResumeThread } from "./codex-thread-fallback.js";
 import { syncTerminalThreadSelection } from "./terminal-thread-sync.js";
 import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionHandler } from "./tui-protocol.js";
 import { TuiProxyPool } from "./tui-proxy.js";
@@ -1197,16 +1197,30 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const resolveCodexResumeThread = async (tab: TabMeta): Promise<string> => {
     const threadId = tab.session.threadId!;
     const fallbackThreadId = tab.session.lastThreadSwitch?.fromThreadId ?? null;
-    const choice = chooseResumeThread({
+    const evidence = {
       threadId,
       fallbackThreadId,
       threadHasRollout: Boolean(await rolloutFile(threadId)),
       fallbackHasRollout: fallbackThreadId ? Boolean(await rolloutFile(fallbackThreadId)) : false,
-    });
+    };
+    let choice = chooseResumeThread(evidence);
+    // Only read the legacy cache on a broken pointer, never on the normal
+    // reopen path. Do not guess by cwd/name: many tabs share this directory.
+    if (!evidence.threadHasRollout && !choice.fellBack) {
+      const cache = await fs.readFile(path.join(storage.tabDir(tab.id), "rollout-cache.json"), "utf8")
+        .then((text) => JSON.parse(text) as unknown).catch(() => null);
+      const prompts = await storage.readPromptsOnly(tab.id);
+      const cachedThreadId = cachedResumeThread(cache, prompts.prompts);
+      choice = chooseResumeThread({
+        ...evidence,
+        cachedThreadId,
+        cachedHasRollout: cachedThreadId ? Boolean(await rolloutFile(cachedThreadId)) : false,
+      });
+    }
     if (!choice.fellBack) return threadId;
     await storage.updateTab(tab.id, (current) => ({
       ...current,
-      session: { ...current.session, threadId: choice.threadId, sessionId: choice.threadId },
+      session: { ...current.session, threadId: choice.threadId, sessionId: choice.threadId, lastThreadSwitch: null },
       updatedAt: isoNow(),
     }));
     return choice.threadId;
@@ -1244,6 +1258,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           return null;
         } catch (error) { return error instanceof Error ? error.message : String(error); }
       });
+      const startupError = pty.startupError(tabId);
+      if (startupError) throw new Error(startupError);
       await storage.updateTab(tabId, (current) => ({
         ...current,
         session: {
@@ -2664,6 +2680,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         const report = session && mode === "resume"
           ? await syncCodexNativeHistory(tabId, session.sessionId, session.transcriptPath ?? manager.session?.transcriptPath)
           : { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
+        const startupError = pty.startupError(tabId);
+        if (startupError) throw new Error(startupError);
         // A new conversation has no thread yet: Codex creates one when the
         // first prompt is submitted, and the SessionStart hook that follows is
         // what binds it here. Recording null rather than inventing an id keeps

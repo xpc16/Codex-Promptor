@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { chooseResumeThread, durableThreadOrigin } from "./codex-thread-fallback.js";
+import { cachedResumeThread, chooseResumeThread, durableThreadOrigin } from "./codex-thread-fallback.js";
 
 describe("which thread a switch records as its origin", () => {
   const base = { previousThreadId: "d4", previousIsDurable: true, carriedFromThreadId: null };
@@ -26,6 +26,25 @@ describe("which thread a switch records as its origin", () => {
 
 describe("which thread a reopen resumes", () => {
   const base = { threadId: "d7", fallbackThreadId: "d4", threadHasRollout: true, fallbackHasRollout: true };
+
+  it("repairs legacy chains with the tab's corroborated, durable cache", () => {
+    const evidence = { ...base, cachedThreadId: "d1", cachedHasRollout: true };
+    expect(chooseResumeThread(evidence).threadId).toBe("d7");
+    expect(chooseResumeThread({ ...evidence, threadHasRollout: false }).threadId).toBe("d4");
+    expect(chooseResumeThread({ ...evidence, threadHasRollout: false, fallbackHasRollout: false }))
+      .toEqual({ threadId: "d1", fellBack: true });
+    expect(chooseResumeThread({ ...evidence, threadHasRollout: false, fallbackHasRollout: false, cachedHasRollout: false }))
+      .toEqual({ threadId: "d7", fellBack: false });
+  });
+
+  it("rejects a malformed cache or one that belongs to no recorded prompt", () => {
+    const id = "01a03d03-a43c-7c60-956b-5d50212c083e";
+    expect(cachedResumeThread({ threadId: id }, [{ threadId: id }])).toBe(id);
+    expect(cachedResumeThread({ threadId: id }, [{ threadId: "another-session" }])).toBeNull();
+    expect(cachedResumeThread({ threadId: id }, [{ threadId: null }])).toBeNull();
+    expect(cachedResumeThread(null, [])).toBeNull();
+    expect(cachedResumeThread({ threadId: "../../file" }, [{ threadId: "../../file" }])).toBeNull();
+  });
 
   it("resumes the stored thread whenever it has a rollout", () => {
     expect(chooseResumeThread(base)).toEqual({ threadId: "d7", fellBack: false });

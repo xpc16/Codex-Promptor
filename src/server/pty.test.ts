@@ -67,6 +67,13 @@ describe("remote Codex terminal command", () => {
     expect(terminalStartupError("__CODEX_PROMPTOR_EXIT__:0\r\n")).toContain("code 0");
   });
 
+  it("keeps the missing saved session id in the startup failure", () => {
+    const id = "01a06a46-1538-7a42-b01d-e668743bbf27";
+    const output = `\x1b[31mERROR: No saved session found with ID ${id}.\x1b[0m\r\n`;
+    expect(terminalStartupError(output)).toBeNull(); // not an exit until the real marker
+    expect(terminalStartupError(`${output}__CODEX_PROMPTOR_EXIT__:1\r\n`)).toContain(`No saved session found with ID ${id}`);
+  });
+
   it("sends only the missing terminal bytes for a matching cursor", () => {
     const source = { generation: "generation-1", buffer: Buffer.from("abcdef", "utf8"), bufferStart: 10, nextOffset: 16 };
     const delta = sliceTerminalBuffer(source, { generation: "generation-1", nextOffset: 13 });

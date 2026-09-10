@@ -111,6 +111,7 @@ function deferred<T>(): Deferred<T> {
 export class CodexTuiManager extends EventEmitter implements QueueBinding {
   readonly rpc: QueueRpc;
   private launchReady: Deferred<CodexTuiSessionInfo> | null = null;
+  private launchError: Error | null = null;
   private attached: CodexTuiSessionInfo | null = null;
   private readonly turns = new Map<string, TurnState>();
   private readonly completed = new Map<string, { turn: any; items: any[] }>();
@@ -174,10 +175,16 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
     let deadline = started + timeoutMs;
     let asked: string | null = null;
     let quietSince = started;
-    while (Date.now() < deadline) {
-      if (ready.settled) return;
+    const checkFailure = () => {
       const error = probe.startupError();
       if (error) throw new Error(error);
+      if (this.launchError) throw this.launchError;
+    };
+    while (Date.now() < deadline) {
+      checkFailure();
+      // A rejected launch is settled too. Treating both outcomes as success
+      // rebound a dead TUI onto its requested id and displayed "connected".
+      if (ready.settled) { await ready.promise; return; }
       // Codex is waiting for an answer, not stuck. Counting down through the
       // question and then killing the terminal would take away the very prompt
       // the reader has to answer, so the clock stops while it is on screen.
@@ -187,7 +194,9 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
         quietSince = Date.now();
         deadline = Math.min(latest, Date.now() + questionTimeoutMs);
       } else {
-        if (await probe.ready()) return;
+        const visibleReady = await probe.ready();
+        checkFailure(); // the agent can exit while the screen parser drains
+        if (visibleReady) return;
         if (Date.now() - quietSince >= settleMs) return;
       }
       await new Promise<void>((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(1, deadline - Date.now()))));
@@ -204,8 +213,11 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
    * first prompt and confirm what is recorded here.
    */
   async attachKnownSession(info: CodexTuiSessionInfo): Promise<CodexTuiSessionInfo> {
+    if (this.launchError) throw this.launchError;
+    const cursor = await transcriptCursor(info.transcriptPath);
+    if (this.launchError) throw this.launchError;
     this.attached = { ...info };
-    this.sessionCursor = await transcriptCursor(info.transcriptPath);
+    this.sessionCursor = cursor;
     this.launchReady?.resolve(this.attached);
     this.emit("session", this.attached);
     return { ...this.attached };
@@ -283,6 +295,7 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
   }
 
   observeTerminalExit(message = "Codex TUI exited before the turn produced a final answer."): void {
+    this.launchError = new Error(message);
     if (this.submission) this.rejectSubmission(this.submission, new Error(message));
     for (const turn of [...this.turns.values()]) this.completeTurn(turn, "interrupted", "", message);
     if (this.launchReady && !this.launchReady.settled) {
@@ -556,6 +569,7 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
     this.launchReady?.reject(new Error(message));
     void this.launchReady?.promise.catch(() => undefined);
     this.launchReady = null;
+    this.launchError = null;
     this.attached = null;
     this.sessionCursor = { path: null, offset: 0 };
   }

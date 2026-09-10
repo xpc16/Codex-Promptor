@@ -233,6 +233,31 @@ describe("the questions Codex asks before a session exists", () => {
     expect(manager.session?.sessionId).toBe("thread-1");
   });
 
+  it("does not turn a rejected startup into a successful attachment", async () => {
+    const manager = new CodexTuiManager("tab-dead", {} as any);
+    const launch = { cwd: "D:\\work", launch: { mode: "resume", sessionId: "missing" } as const, hookScriptPath: "scripts/codex-hook.mjs" };
+    await manager.beginLaunch(launch);
+    manager.observeTerminalExit("No saved session found with ID missing");
+    const probe = { startupError: () => null, question: () => null, ready: () => true };
+    await expect(manager.waitForStartup(probe)).rejects.toThrow("No saved session found");
+    await expect(manager.attachKnownSession({ sessionId: "missing", cwd: launch.cwd, transcriptPath: null, source: "resume" }))
+      .rejects.toThrow("No saved session found");
+    expect(manager.session).toBeNull();
+    await manager.beginLaunch(launch);
+    await expect(manager.waitForStartup(probe)).resolves.toBeUndefined();
+    await manager.stop();
+  });
+
+  it("checks for an exit while waiting for the screen parser", async () => {
+    const manager = new CodexTuiManager("tab-screen-exit", {} as any);
+    await manager.beginLaunch({ cwd: "D:\\work", launch: { mode: "new" }, hookScriptPath: "scripts/codex-hook.mjs" });
+    await expect(manager.waitForStartup({
+      startupError: () => null, question: () => null,
+      ready: async () => { manager.observeTerminalExit("exited during screen read"); return true; },
+    })).rejects.toThrow("exited during screen read");
+    await manager.stop();
+  });
+
   it("tells the reader what to do about each hook failure", () => {
     const unanswered = codexHookFailureText("CODEX_STARTUP_QUESTION_UNANSWERED:Hooks need review");
     expect(unanswered).toContain("Hooks need review");
