@@ -51,11 +51,16 @@ describe("agent to agent", () => {
    * is paused unless a test asks otherwise, so the real runner does not race
    * the hand-driven turns below for a CLI that is not there.
    */
-  const readyTab = async (name: string, provider: "codex" | "claude" = "codex", armed = false) => {
+  const readyTab = async (name: string, provider: "codex" | "claude" = "codex", options: { armed?: boolean; canDispatch?: boolean } = {}) => {
+    const { armed = false, canDispatch = false } = options;
     const tab = await app.promptor.storage.createTab(name);
     await app.promptor.storage.updateTab(tab.id, (current) => ({
       ...current,
-      session: { ...current.session, provider, state: "ready", threadId: `thread-${tab.id}`, sessionId: `session-${tab.id}`, workingDirectory: root, connectedAt: isoNow() },
+      // These tests drive dispatch by hand, so by default the real runner must
+      // not race them for a CLI that is not there: without a working directory
+      // it refuses to dispatch and a delivered message stays queued.
+      // `canDispatch` opts in where the runner itself is what is being tested.
+      session: { ...current.session, provider, state: "ready", threadId: `thread-${tab.id}`, sessionId: `session-${tab.id}`, workingDirectory: canDispatch ? root : null, connectedAt: isoNow() },
     }));
     const runtime = await app.promptor.storage.readRuntime(tab.id);
     await app.promptor.storage.writeRuntime(tab.id, { ...runtime, runner: { ...runtime.runner, desiredState: armed ? "armed" : "paused" } });
@@ -180,7 +185,7 @@ describe("agent to agent", () => {
   it("never lets an escaped @@ reach the CLI through insert-now", async () => {
     // This is how "\\@@..." became a prompt's own text: the replacement text on
     // this route was stored and submitted without ever being parsed.
-    const tabId = await readyTab("协调");
+    const tabId = await readyTab("协调", "codex", { canDispatch: true });
     const queued = (await addPrompt(tabId, "\\@@ 这是正文")).json().data.prompt;
 
     const inserted = await app.inject({
@@ -199,7 +204,7 @@ describe("agent to agent", () => {
     // The reported case: run-now on a collaboration prompt was refused even
     // with the queue idle. With no turn to steer into, this is an ordinary
     // start, which is exactly what a collaboration message needs.
-    const tabId = await readyTab("协调");
+    const tabId = await readyTab("协调", "codex", { canDispatch: true });
     const queued = (await addPrompt(tabId, "帮我看看这个方案")).json().data.prompt;
     const inserted = await app.inject({
       method: "POST",
@@ -217,7 +222,7 @@ describe("agent to agent", () => {
   });
 
   it("refuses to steer a collaboration into a turn that is already running", async () => {
-    const tabId = await readyTab("协调");
+    const tabId = await readyTab("协调", "codex", { canDispatch: true });
     const queued = (await addPrompt(tabId, "@@ 帮我看看这个方案")).json().data.prompt;
     // One turn in flight, which run-now would otherwise steer into.
     const active = (await addPrompt(tabId, "另一件事")).json().data.prompt;
@@ -346,7 +351,7 @@ describe("agent to agent", () => {
 
   it("delivers a send to the target queue, and only the target's queue holds the text", async () => {
     const from = await readyTab("协调");
-    const to = await readyTab("执行", "claude", true);
+    const to = await readyTab("执行", "claude", { armed: true });
     const rootPrompt = (await addPrompt(from, "@@ 分给执行者")).json().data.prompt;
     const { contextId } = await beginTurn(from, rootPrompt.id);
 
@@ -430,18 +435,53 @@ describe("agent to agent", () => {
     expect((await app.promptor.a2a.readRoot(rootPrompt.id))!.usedMessages).toBe(1);
   });
 
-  it("saves a message for a paused queue without starting it", async () => {
+  it("runs itself in a paused queue without taking the pause off", async () => {
+    // A message does not wait for the reader to press start, and does not drag
+    // their own queued prompts along with it: it runs as a one-shot, after
+    // whatever turn is in flight, and leaves the queue's intent alone.
     const from = await readyTab("协调");
     const to = await readyTab("执行");
     const runtime = await app.promptor.storage.readRuntime(to);
     await app.promptor.storage.writeRuntime(to, { ...runtime, runner: { ...runtime.runner, desiredState: "paused" } });
+    const mine = (await addPrompt(to, "我自己排的，先别跑")).json().data.prompt;
     const rootPrompt = (await addPrompt(from, "@@ 分工")).json().data.prompt;
     const { contextId } = await beginTurn(from, rootPrompt.id);
 
     const sent = await call(from, { op: "send", contextId, requestId: "r", to, text: "任务" });
-    expect(sent.json().data.delivered.delivery).toBe("waitingForStart");
+    expect(sent.json().data.delivered.delivery).toBe("queued");
     expect((await app.promptor.storage.readRuntime(to)).runner.desiredState).toBe("paused");
-    expect((await app.promptor.storage.readTab(to)).prompts.prompts).toHaveLength(1);
+    const queued = (await app.promptor.storage.readTab(to)).prompts.prompts;
+    expect(queued).toHaveLength(2);
+    // The reader's own prompt is still theirs to start.
+    expect(queued.find((item) => item.id === mine.id)!.status).toBe("pending");
+  });
+
+  it("runs a delivered message after the turn in flight, without the queue rolling", async () => {
+    // Reported: a message sat in the target queue until someone pressed start.
+    // It now runs itself -- the one-shot waits for the thread to be idle, so
+    // it never cuts into the turn already running.
+    const from = await readyTab("协调");
+    const to = await readyTab("执行", "codex", { canDispatch: true });
+    const rootPrompt = (await addPrompt(from, "@@ 分工")).json().data.prompt;
+    const { contextId } = await beginTurn(from, rootPrompt.id);
+    const before = (await app.promptor.storage.readRuntime(to)).runner.desiredState;
+
+    const sent = await call(from, { op: "send", contextId, requestId: "r1", to, text: "任务" });
+    expect(sent.json().data.delivered.delivery).toBe("queued");
+    expect(sent.json().data.note).toContain("那一轮结束后会自动执行");
+    // Nothing about the target's own queue intent changed to make that happen.
+    expect((await app.promptor.storage.readRuntime(to)).runner.desiredState).toBe(before);
+    // And the runner really did take it, rather than leaving it for a person.
+    // Delivery returns as soon as the message is stored; the one-shot picks it
+    // up on its own, so this waits for that rather than assuming it happened.
+    const deliveredId = sent.json().data.delivered.promptId;
+    const status = async () => (await app.promptor.storage.readTab(to)).prompts.prompts
+      .find((item) => item.id === deliveredId)!.status;
+    const deadline = Date.now() + 5_000;
+    while (await status() === "pending" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(await status()).not.toBe("pending");
   });
 
   it("refuses a terminal conversation as a target", async () => {

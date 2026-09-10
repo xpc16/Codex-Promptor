@@ -26,7 +26,7 @@ import type { StorageService } from "./storage.js";
  * lock -- so two concurrent sends cannot both see the last free message.
  */
 
-export type A2aDeliveryState = "queued" | "waitingForStart";
+export type A2aDeliveryState = "queued";
 
 export class A2aError extends Error {
   constructor(
@@ -637,9 +637,7 @@ export class A2aService {
     for (const participant of finalRoot.members) this.deps.notifyTab(participant.tabId);
     return {
       delivered: { tabId: targetId, promptId: delivered.promptId, delivery: delivered.delivery },
-      note: delivered.delivery === "waitingForStart"
-        ? "对方队列处于暂停状态，消息已保存但不会自动开始，需要用户在页面上启动。"
-        : "已入队。这只表示对方收到了，不表示已经执行或成功完成。",
+      note: "已入队，对方当前那一轮结束后会自动执行。这只表示已接收，不表示已经执行或成功完成。",
       ...this.snapshotOf(finalRoot, context.depth),
     };
   }

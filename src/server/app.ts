@@ -441,8 +441,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
    * own rules deciding whether it waits or runs. It is never inserted into a
    * running turn and never wakes a queue the user paused.
    */
-  const enqueueA2aPrompt = async (targetTabId: string, text: string, meta: A2aPromptMeta): Promise<{ promptId: string; delivery: "queued" | "waitingForStart"; threadId: string }> => {
-    let armed = false;
+  const enqueueA2aPrompt = async (targetTabId: string, text: string, meta: A2aPromptMeta): Promise<{ promptId: string; delivery: "queued"; threadId: string }> => {
     let delta: PromptDelta | null = null;
     const result = await storage.withTabLock(targetTabId, async () => {
       const bundle = await storage.readTab(targetTabId);
@@ -454,7 +453,6 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (session.state !== "ready" || !session.threadId) {
         throw new A2aError("A2A_TARGET_NOT_READY", 409, "目标对话还没有连接，请先让用户打开它。");
       }
-      armed = bundle.runtime.runner.desiredState === "armed";
       const prompt = newPrompt(text, "queue");
       prompt.a2a = meta;
       // Bound to the thread it was addressed to: if the conversation is later
@@ -464,16 +462,17 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       bundle.prompts.revision += 1;
       bundle.prompts.updatedAt = isoNow();
       delta = await storage.writePrompts(targetTabId, bundle.prompts);
-      return {
-        promptId: prompt.id,
-        threadId: session.threadId,
-        delivery: (bundle.runtime.runner.desiredState === "paused" ? "waitingForStart" : "queued") as "queued" | "waitingForStart",
-      };
+      return { promptId: prompt.id, threadId: session.threadId, delivery: "queued" as const };
     });
     // storage.onPromptsChanged already pushed the queue delta to subscribers;
     // the snapshot follows so the collaboration summary moves with it.
     void delta;
-    if (armed) await runners.get(targetTabId).start().catch(() => undefined);
+    // A message runs itself, without the target's queue having to be rolling
+    // and without waking the reader's own queued prompts: a one-shot waits for
+    // the turn in flight to finish, runs this one, and leaves the queue's own
+    // intent exactly as it found it. A rolling queue keeps its order -- the
+    // loop still takes pending prompts front to back.
+    await runners.get(targetTabId).runOneShotBatch([result.promptId]).catch(() => undefined);
     void emitSnapshot(targetTabId);
     return result;
   };
