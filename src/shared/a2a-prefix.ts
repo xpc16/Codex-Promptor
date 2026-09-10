@@ -43,18 +43,30 @@ export function parsePromptPrefix(raw: string): PromptPrefix {
 }
 
 /**
- * What an edited row sends back to the queue entry point.
+ * What an edited prompt becomes, decided from the prompt that is stored.
  *
- * Two facts about the *stored* prompt decide it, never the edited text: an
- * A2A prompt gets its own skill prefix back, and a prompt whose text already
- * began with `@@` gets re-escaped so re-saving it cannot start a
- * collaboration nobody asked for.
+ * The row sends exactly what its textarea holds, with no prefix bookkeeping
+ * of its own -- a browser tab left open across an upgrade would otherwise
+ * still be speaking the previous convention, and the disagreement is silent:
+ * a collaboration someone asked for just quietly runs as ordinary text.
  *
- * Reading the edited text instead would break the case this is most used for:
- * typing `@@` in front of a queued prompt to turn it into a collaboration.
- * That is a person asking for one, and it has to survive the round trip.
+ * Two facts about the stored prompt settle it. One that is already a
+ * collaboration stays one. One whose own text already begins with `@@` was
+ * written that way on purpose and stays literal. Anything else is read as
+ * typed -- which is what makes "put @@ in front of a queued prompt" work.
  */
-export function outgoingPromptText(edited: string, stored: { text: string; a2a?: A2aPromptMeta | null }): string {
-  if (stored.a2a) return `@@${stored.a2a.skill} ${edited}`;
-  return stored.text.startsWith("@@") ? `\\${edited}` : edited;
+export function editedPromptPrefix(
+  stored: { text: string; a2a?: A2aPromptMeta | null },
+  incoming: string,
+): PromptPrefix {
+  const parsed = parsePromptPrefix(incoming);
+  if (stored.a2a) {
+    // A prefix may still name a different mode; without one the body is taken
+    // as typed and the collaboration keeps the mode it already had.
+    return { kind: "a2a", skill: parsed.kind === "a2a" ? parsed.skill : stored.a2a.skill, text: parsed.text };
+  }
+  if (stored.text.startsWith("@@")) {
+    return { kind: "plain", text: parsed.kind === "a2a" ? incoming.trim() : parsed.text };
+  }
+  return parsed;
 }

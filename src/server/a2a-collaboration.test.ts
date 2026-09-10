@@ -3,7 +3,6 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isoNow, newAttempt } from "../shared/schemas.js";
-import { outgoingPromptText } from "../shared/a2a-prefix.js";
 import { createApp, type PromptorApp } from "./app.js";
 
 /**
@@ -149,7 +148,7 @@ describe("agent to agent", () => {
       method: "PATCH",
       url: `/api/tabs/${tabId}/prompts/${queued.id}`,
       headers: local(),
-      payload: { text: outgoingPromptText("@@ 帮我看看这个方案", queued) } as never,
+      payload: { text: "@@ 帮我看看这个方案" } as never,
     });
     expect(edited.statusCode).toBe(200);
     const prompt = edited.json().data.prompt;
@@ -172,7 +171,7 @@ describe("agent to agent", () => {
       method: "PATCH",
       url: `/api/tabs/${tabId}/prompts/${queued.id}`,
       headers: local(),
-      payload: { text: outgoingPromptText("@@ 这是正文，改了一个字", queued) } as never,
+      payload: { text: "@@ 这是正文，改了一个字" } as never,
     });
     expect(edited.json().data.prompt.text).toBe("@@ 这是正文，改了一个字");
     expect(edited.json().data.prompt.a2a).toBeUndefined();
@@ -189,7 +188,7 @@ describe("agent to agent", () => {
       method: "POST",
       url: `/api/tabs/${tabId}/prompts/${queued.id}/insert-now`,
       headers: local(),
-      payload: { text: outgoingPromptText("@@ 这是正文", queued) } as never,
+      payload: { text: "@@ 这是正文" } as never,
     });
     // Whatever the runner does with it, the text it was given is clean.
     const stored = (await app.promptor.storage.readTab(tabId)).prompts.prompts.find((item) => item.id === queued.id)!;

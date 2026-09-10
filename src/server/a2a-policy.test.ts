@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { A2aSkillError, parseSkillDocument, resolveRolePolicy } from "./a2a-policy.js";
 import { a2aAdvice, a2aBudget, DEFAULT_A2A_LIMITS } from "../shared/a2a.js";
-import { outgoingPromptText, parsePromptPrefix } from "../shared/a2a-prefix.js";
+import { editedPromptPrefix, parsePromptPrefix } from "../shared/a2a-prefix.js";
 
 /**
  * The permission list and the prose that explains it live in one file, so the
@@ -115,25 +115,35 @@ describe("the @@ prefix", () => {
     expect(() => parsePromptPrefix("@@   ")).toThrow(/协作完成的事/);
   });
 
-  it("round-trips an edited collaboration prompt to the same thing", () => {
-    const parsed = parsePromptPrefix("@@debate 应该用 A 方案");
-    const stored = { text: parsed.text, a2a: { rootId: "r", skill: "debate", depth: 0, fromTabId: null, fromPromptId: null } };
-    expect(parsePromptPrefix(outgoingPromptText(parsed.text, stored))).toEqual(parsed);
-  });
+});
 
-  it("re-escapes a stored prompt whose own text begins with @@", () => {
-    // It was a literal when it was saved, so editing a word in it must not
-    // quietly turn it into a collaboration.
-    const stored = { text: "@@ 不是协作" };
-    expect(parsePromptPrefix(outgoingPromptText("@@ 不是协作了", stored))).toEqual({ kind: "plain", text: "@@ 不是协作了" });
-  });
-
+describe("editing a prompt that is already in the queue", () => {
+  // The row sends what its textarea holds and nothing else, so every one of
+  // these is decided from the stored prompt alone. A page left open across an
+  // upgrade cannot change the answer.
   it("lets a person turn a queued prompt into a collaboration by typing @@ in front of it", () => {
-    // The reported bug: this was escaped on the way out, so the prompt ran as
-    // literal `\@@...` text and no collaboration was ever started.
-    const stored = { text: "帮我看看这个方案" };
-    expect(parsePromptPrefix(outgoingPromptText("@@ 帮我看看这个方案", stored)))
+    expect(editedPromptPrefix({ text: "帮我看看这个方案" }, "@@ 帮我看看这个方案"))
       .toEqual({ kind: "a2a", skill: "central", text: "帮我看看这个方案" });
+  });
+
+  it("keeps a collaboration a collaboration when its body is edited", () => {
+    const stored = { text: "旧正文", a2a: { rootId: "r", skill: "debate", depth: 0, fromTabId: null, fromPromptId: null } };
+    expect(editedPromptPrefix(stored, "新正文")).toEqual({ kind: "a2a", skill: "debate", text: "新正文" });
+  });
+
+  it("lets a prefix name a different mode on a collaboration that has not started", () => {
+    const stored = { text: "正文", a2a: { rootId: "r", skill: "central", depth: 0, fromTabId: null, fromPromptId: null } };
+    expect(editedPromptPrefix(stored, "@@debate 正文")).toEqual({ kind: "a2a", skill: "debate", text: "正文" });
+  });
+
+  it("keeps a stored literal @@ literal, however it is edited", () => {
+    // It was written as `\\@@` on purpose when it was created.
+    const stored = { text: "@@ 不是协作" };
+    expect(editedPromptPrefix(stored, "@@ 不是协作了")).toEqual({ kind: "plain", text: "@@ 不是协作了" });
+  });
+
+  it("still honours an explicit escape typed into an ordinary prompt", () => {
+    expect(editedPromptPrefix({ text: "普通" }, "\\@@ 这是正文")).toEqual({ kind: "plain", text: "@@ 这是正文" });
   });
 });
 

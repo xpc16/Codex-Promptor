@@ -41,7 +41,7 @@ import { CLAUDE_EXIT_MARKER, CODEX_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, 
 import { isSlashCommandPrompt } from "./prompt-submit.js";
 import { RunnerManager } from "./queue.js";
 import { A2aError, A2aService } from "./a2a-service.js";
-import { A2aPrefixError, parsePromptPrefix } from "./a2a-preamble.js";
+import { A2aPrefixError, editedPromptPrefix, parsePromptPrefix } from "./a2a-preamble.js";
 import type { A2aPromptMeta } from "../shared/a2a.js";
 import { recordsForCurrentThread, StorageService } from "./storage.js";
 import { TimerService, TimerServiceError } from "./timer-service.js";
@@ -3050,22 +3050,23 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         if (!prompt) throw new Error("PROMPT_NOT_FOUND");
         if (["completed", "running", "dispatching"].includes(prompt.status)) throw new Error("PROMPT_READ_ONLY");
         if (body.text !== undefined) {
-          // The composer round-trips the prefix, so editing goes through the
-          // same parser: the stored text stays clean, and an existing root
-          // keeps its identity and its spent budget.
-          const edited = parsePromptPrefix(String(body.text).trim());
+          // The row sends what it holds; what that means is decided here, from
+          // the prompt on disk. The stored text stays clean, and an existing
+          // root keeps its identity and its spent budget.
+          const edited = editedPromptPrefix(prompt, String(body.text).trim());
           if (!edited.text) throw new Error("PROMPT_EMPTY");
           prompt.text = edited.text;
+          if (edited.kind === "a2a" && !prompt.a2a && !a2aEnabled) {
+            throw new A2aError("A2A_DISABLED", 400, "A2A 协作已被关闭（CODEX_PROMPTOR_A2A=0）。去掉这个环境变量并重启即可使用 @@。");
+          }
           if (edited.kind === "a2a" && a2aEnabled) {
             const rootId = prompt.a2a?.rootId ?? prompt.id;
             const started = prompt.a2a ? await a2a.readRoot(rootId) : null;
             // A running collaboration executes the version it froze at start.
             const skill = started && started.status !== "pending" ? started.skill : edited.skill;
-            if (!prompt.a2a) await a2a.loadSkill(skill);
+            if (!prompt.a2a || skill !== prompt.a2a.skill) await a2a.loadSkill(skill);
             prompt.a2a = { ...(prompt.a2a ?? { depth: 0, fromTabId: null, fromPromptId: null }), rootId, skill };
             created.root = prompt.a2a.depth === 0 && !started ? { promptId: prompt.id, skill } : null;
-          } else if (edited.kind !== "a2a" && prompt.a2a) {
-            throw new Error("A2A_PREFIX_REQUIRED");
           }
         }
         prompt.updatedAt = isoNow();
@@ -3162,12 +3163,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         return apiError(reply, 400, "A2A_INSERT_NOW_UNSUPPORTED", "协作消息按独立轮次执行，不能插入当前轮，请等待排队执行。");
       }
       const body = (request.body ?? {}) as any;
-      // Replacement text is a queue entry point like any other, so it goes
-      // through the same parser. Without this an escaped `\@@` reached the CLI
-      // verbatim and was stored as the prompt's own text.
+      // Replacement text is a queue entry point like any other, so it is read
+      // the same way. Without this an escaped `@@` reached the CLI verbatim
+      // and was stored as the prompt's own text.
       let replacement: string | undefined;
       if (body.text !== undefined) {
-        const edited = parsePromptPrefix(String(body.text).trim());
+        const existing = bundle.prompts.prompts.find((item) => item.id === promptId);
+        const edited = editedPromptPrefix(existing ?? { text: "" }, String(body.text).trim());
         if (edited.kind === "a2a") {
           return apiError(reply, 400, "A2A_INSERT_NOW_UNSUPPORTED", "协作要按独立轮次开始。请先点保存（✓），再用「开始」让队列执行它。");
         }
