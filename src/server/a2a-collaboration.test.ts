@@ -22,7 +22,8 @@ describe("agent to agent", () => {
   let root: string;
 
   beforeEach(async () => {
-    process.env.CODEX_PROMPTOR_A2A = "1";
+    // Nothing is set: A2A is on by default, and these tests exercise that.
+    delete process.env.CODEX_PROMPTOR_A2A;
     root = await mkdtemp(path.join(os.tmpdir(), "promptor-a2a-"));
     await mkdir(path.join(root, "dist", "client"), { recursive: true });
     await writeFile(path.join(root, "dist", "client", "index.html"), "<!doctype html><title>t</title>", "utf8");
@@ -406,9 +407,12 @@ describe("agent to agent", () => {
     expect((await app.promptor.a2a.summaryForTab(from))!.active).toBe(false);
   });
 
-  it("refuses everything when the feature is off", async () => {
+  it("refuses @@ only when it has been turned off explicitly", async () => {
     const tabId = await readyTab("协调");
-    delete process.env.CODEX_PROMPTOR_A2A;
+    // On by default -- every other test in this file relies on it.
+    expect((await addPrompt(tabId, "@@ 分工")).statusCode).toBe(200);
+
+    process.env.CODEX_PROMPTOR_A2A = "0";
     const restarted = await createApp(root);
     await restarted.ready();
     try {
@@ -416,10 +420,37 @@ describe("agent to agent", () => {
         method: "POST",
         url: `/api/tabs/${tabId}/prompts`,
         headers: { "x-codex-promptor-token": restarted.promptor.token, host: LOCAL, origin: `http://${LOCAL}` },
-        payload: { text: "@@ 分工" } as never,
+        payload: { text: "@@ 再分一次" } as never,
       });
       expect(response.statusCode).toBe(400);
       expect(response.json().error.code).toBe("A2A_DISABLED");
+    } finally {
+      await restarted.promptor.close();
+      await restarted.close();
+    }
+  });
+
+  it("does not dispatch a collaboration message that was queued before it was turned off", async () => {
+    // The switch has to hold on both sides: an already-accepted A2A prompt
+    // must not quietly start collaborating after someone turns the feature off.
+    const tabId = await readyTab("协调");
+    const prompt = (await addPrompt(tabId, "@@ 分工")).json().data.prompt;
+
+    process.env.CODEX_PROMPTOR_A2A = "0";
+    const restarted = await createApp(root);
+    await restarted.ready();
+    try {
+      const bundle = await restarted.promptor.storage.readTab(tabId);
+      const queued = bundle.prompts.prompts.find((item) => item.id === prompt.id)!;
+      const submitted = await restarted.promptor.a2a.prepareDispatch({
+        tab: bundle.tab,
+        prompt: queued,
+        attemptId: "attempt-after-the-switch",
+        threadId: bundle.tab.session.threadId!,
+      });
+      // Submitted unchanged: no preamble, and no context to call the endpoint with.
+      expect(submitted).toBeNull();
+      expect((await restarted.promptor.a2a.readRoot(prompt.id))!.status).toBe("pending");
     } finally {
       await restarted.promptor.close();
       await restarted.close();

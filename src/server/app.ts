@@ -419,13 +419,15 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   };
 
   /**
-   * Agent to Agent, off unless asked for.
+   * Agent to Agent, on unless turned off with `CODEX_PROMPTOR_A2A=0`.
    *
-   * Every message it carries is a real model turn on this machine, so the
-   * default has to be the one a reader would not mind discovering after the
-   * fact (docs/AGENT_TO_AGENT.md 5.2).
+   * Nothing here happens on its own: a collaboration begins only when a person
+   * writes a prompt starting with `@@`. What keeps that from becoming
+   * expensive is the budget, not the switch -- every message is a real model
+   * turn, and the root's limits are what bound how many there can be
+   * (docs/AGENT_TO_AGENT.md §5.2).
    */
-  const a2aEnabled = process.env.CODEX_PROMPTOR_A2A === "1";
+  const a2aEnabled = process.env.CODEX_PROMPTOR_A2A !== "0";
   const a2a = new A2aService({
     storage,
     rootDir,
@@ -2979,7 +2981,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       throw error;
     }
     if (prefix.kind === "a2a" && !a2aEnabled) {
-      return apiError(reply, 400, "A2A_DISABLED", "A2A 协作未启用。设置 CODEX_PROMPTOR_A2A=1 后重启即可使用 @@。");
+      return apiError(reply, 400, "A2A_DISABLED", "A2A 协作已被关闭（CODEX_PROMPTOR_A2A=0）。去掉这个环境变量并重启即可使用 @@。");
     }
     if (prefix.kind === "a2a") {
       // A skill that does not exist, or does not parse, is refused before the
