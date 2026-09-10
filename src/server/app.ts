@@ -1278,12 +1278,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const opened = await recorder.step("start", async () => chatgpt.get(tab.id).open(conversationId
         ? { mode: "resume", conversationId }
         : { mode: "new" }));
-      await updateTerminalRuntime(storage, tab.id, { state: "running", lastError: null });
+      await updateTerminalRuntime(storage, tab.id, { state: opened.signedIn ? "running" : "starting", lastError: null });
       await storage.updateTab(tab.id, (current) => ({
         ...current,
         session: {
           ...current.session,
-          state: "ready",
+          state: opened.signedIn ? "ready" : "connecting",
           reopenOnLaunch: true,
           threadId: opened.conversationId ?? current.session.threadId,
           sessionId: opened.conversationId ?? current.session.sessionId,
@@ -1293,7 +1293,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         updatedAt: isoNow(),
       }));
       await clearSessionNotReadyError(storage, tab.id);
-      if (opened.conversationId) await syncChatGptHistory(tab.id).catch(() => undefined);
+      watchChatGptPage(tab.id);
+      if (opened.conversationId && opened.signedIn) await syncChatGptHistory(tab.id).catch(() => undefined);
       return { ok: true, bundle: await readClientTab(tab.id) };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1306,6 +1307,46 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       }));
       return { ok: false, statusCode: 502, code, message };
     }
+  };
+
+  /**
+   * Follow a web conversation's page: pick it up when the reader signs in, and
+   * adopt whatever conversation they end up on.
+   *
+   * Both halves fix the same complaint. Signing in used to be a five minute
+   * wait ending in an error nobody could act on, and a conversation started by
+   * hand in that window was never adopted at all -- so typing in it looked
+   * like nothing had happened.
+   */
+  const watchChatGptPage = (tabId: string): void => {
+    void chatgpt.get(tabId).watchPage(async ({ signedIn, conversationId }) => {
+      const tab = await storage.getTabMeta(tabId).catch(() => null);
+      if (!tab || tab.session.provider !== "chatgpt") return;
+      const adopted = conversationId && conversationId !== tab.session.threadId;
+      if (!signedIn && tab.session.state === "ready") return;
+      await storage.updateTab(tabId, (current) => ({
+        ...current,
+        name: signedIn ? nameForSession(current.name, "chatgpt", "zh-CN") : current.name,
+        session: {
+          ...current.session,
+          state: signedIn ? "ready" : "connecting",
+          reopenOnLaunch: true,
+          threadId: conversationId ?? current.session.threadId,
+          sessionId: conversationId ?? current.session.sessionId,
+          connectedAt: signedIn ? (current.session.connectedAt ?? isoNow()) : current.session.connectedAt,
+          lastError: signedIn ? null : current.session.lastError,
+        },
+        updatedAt: isoNow(),
+      }));
+      if (signedIn) {
+        await updateTerminalRuntime(storage, tabId, { state: "running", lastError: null });
+        await clearSessionNotReadyError(storage, tabId);
+      }
+      // A conversation they started by hand has a transcript this side has
+      // never seen; reading it is what makes the queue and the window agree.
+      if (adopted && signedIn) await syncChatGptHistory(tabId).catch(() => undefined);
+      await emitSnapshot(tabId);
+    }).catch(() => undefined);
   };
 
   /** Read the page's own transcript into the same idempotent merge every provider uses. */
@@ -2781,14 +2822,17 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         const opened = await chatgpt.get(tabId).open(mode === "resume"
           ? { mode: "resume", conversationId: conversationIdFrom(resumeId)! }
           : { mode: "new" });
-        await updateTerminalRuntime(storage, tabId, { state: "running", lastStartedAt: isoNow(), lastExitCode: null, lastError: null, appServer: null });
+        await updateTerminalRuntime(storage, tabId, { state: opened.signedIn ? "running" : "starting", lastStartedAt: isoNow(), lastExitCode: null, lastError: null, appServer: null });
         await storage.updateTab(tabId, (current) => ({
           ...current,
           name: nameForSession(current.name, "chatgpt", index.ui.locale),
           session: {
             ...current.session,
             provider: "chatgpt",
-            state: "ready",
+            // Signed out is not an error and not something this end can fix.
+            // The window is already in front of the reader; the watcher below
+            // picks the conversation up the moment they sign in.
+            state: opened.signedIn ? "ready" : "connecting",
             reopenOnLaunch: true,
             workingDirectory: cwd,
             // A new conversation has no id until its first prompt creates one,
@@ -2804,7 +2848,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           updatedAt: isoNow(),
         }));
         await clearSessionNotReadyError(storage, tabId);
-        const report = opened.conversationId ? await syncChatGptHistory(tabId) : { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
+        watchChatGptPage(tabId);
+        const report = opened.conversationId && opened.signedIn
+          ? await syncChatGptHistory(tabId)
+          : { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
         return reply.send({ data: { bundle: await readClientTab(tabId), report } });
       }
       if (provider === "shell") {

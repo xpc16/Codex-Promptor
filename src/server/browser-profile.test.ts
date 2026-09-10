@@ -39,7 +39,7 @@ describe("seeding the profile", () => {
 
   it("copies the sign-in and nothing else", async () => {
     const result = await seedProfile(target, sources());
-    expect(result).toMatchObject({ seeded: true, from: source });
+    expect(result).toMatchObject({ seeded: true, from: source, carriedSignIn: true });
     expect(await readFile(path.join(target, "Default", "Network", "Cookies"), "utf8")).toBe("cookie-bytes");
     // The key the cookie values are encrypted with, without which they are noise.
     expect(await readFile(path.join(target, "Local State"), "utf8")).toContain("encrypted_key");
@@ -62,6 +62,15 @@ describe("seeding the profile", () => {
     await writeFile(path.join(target, "Default", "Network", "Cookies"), "stale", "utf8");
     await seedProfile(target, sources(), { force: true });
     expect(await readFile(path.join(target, "Default", "Network", "Cookies"), "utf8")).toBe("cookie-bytes");
+  });
+
+  it("says the sign-in did not come across when the cookie file was locked", async () => {
+    // What a running Chrome actually leaves behind: the key, and nothing to
+    // unlock. Reporting it as a successful borrow is how a signed-out window
+    // came as a surprise.
+    await rm(path.join(source, "Default", "Network"), { recursive: true, force: true });
+    const result = await seedProfile(target, sources());
+    expect(result).toMatchObject({ seeded: true, carriedSignIn: false, reason: "COOKIES_LOCKED" });
   });
 
   it("says so plainly when there is no browser to borrow from", async () => {

@@ -2,17 +2,20 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 /**
- * Borrowing the sign-in from the browser you actually use.
+ * Borrowing the sign-in from the browser you actually use -- as far as that
+ * goes, which is not far.
  *
- * A profile of its own cannot sign in to some sites at all: the bot checks in
- * front of a fresh, automated profile are exactly what they are there for. So
- * the cookies come from the everyday profile instead.
+ * Measured on Windows with Chrome running: the cookie database is held with an
+ * exclusive lock and `copyFile` returns EBUSY, so only `Local State` comes
+ * across and the copy is signed out. Even with the browser closed, Chrome 127
+ * and later bind the cookie key to the browser itself, so a copy is not
+ * guaranteed to decrypt.
  *
- * They are *copied*, not shared. Chrome refuses to open a user-data-dir that
- * another Chrome already holds, so pointing at the real directory would mean
- * Promptor and your browser could never run at the same time. A copy keeps
- * both usable. Set CODEX_PROMPTOR_BROWSER_PROFILE to a directory to share one
- * for real, and then only one of the two may be running.
+ * So this is best-effort and honest about it: it reports which files it
+ * actually got, and the reliable path is signing in once inside Promptor's own
+ * window, which then lasts. Set CODEX_PROMPTOR_BROWSER_PROFILE to share the
+ * real directory instead -- and then only one of Promptor and that browser may
+ * be running.
  */
 
 export type ProfileSource = { userDataDir: string; channel: "chrome" | "msedge" };
@@ -44,7 +47,14 @@ export const PROFILE_FILES: readonly string[] = [
   path.join("Default", "Cookies"),
 ];
 
-export type SeedResult = { seeded: boolean; from: string | null; copied: string[]; reason?: string };
+export type SeedResult = {
+  seeded: boolean;
+  from: string | null;
+  copied: string[];
+  /** True only when a cookie database actually came across, not just the key. */
+  carriedSignIn: boolean;
+  reason?: string;
+};
 
 /**
  * Copy the sign-in into Promptor's profile, if it does not have one yet.
@@ -59,7 +69,7 @@ export async function seedProfile(
   options: { force?: boolean } = {},
 ): Promise<SeedResult> {
   if (!options.force && await hasCookies(target)) {
-    return { seeded: false, from: null, copied: [], reason: "ALREADY_SEEDED" };
+    return { seeded: false, from: null, copied: [], carriedSignIn: false, reason: "ALREADY_SEEDED" };
   }
   for (const source of sources) {
     if (!await exists(path.join(source.userDataDir, "Local State"))) continue;
@@ -74,9 +84,14 @@ export async function seedProfile(
         copied.push(relative);
       } catch { /* a locked file is not a reason to abandon the rest */ }
     }
-    if (copied.length) return { seeded: true, from: source.userDataDir, copied };
+    // Only a cookie database is a sign-in. `Local State` on its own is the key
+    // to a lock with nothing behind it, which is what a running browser leaves.
+    const carriedSignIn = copied.some((relative) => relative.endsWith("Cookies"));
+    if (copied.length) {
+      return { seeded: true, from: source.userDataDir, copied, carriedSignIn, reason: carriedSignIn ? undefined : "COOKIES_LOCKED" };
+    }
   }
-  return { seeded: false, from: null, copied: [], reason: "NO_SOURCE_PROFILE" };
+  return { seeded: false, from: null, copied: [], carriedSignIn: false, reason: "NO_SOURCE_PROFILE" };
 }
 
 async function hasCookies(userDataDir: string): Promise<boolean> {

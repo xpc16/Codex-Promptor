@@ -1689,9 +1689,11 @@ function ChatGptPanel({ bundle, localControls, onError }: { bundle: TabBundle; l
   const session = bundle.tab.session;
   const conversationId = session.threadId ?? session.sessionId;
   const url = conversationId ? `https://chatgpt.com/c/${conversationId}` : "https://chatgpt.com/";
+  // "Connecting" here almost always means one thing: the window is open and
+  // waiting to be signed in. Saying that beats a spinner.
   const state = session.state === "error" || bundle.runtime.terminal.state === "error"
     ? "error"
-    : session.state === "ready" ? "ready" : "connecting";
+    : session.state === "ready" ? "ready" : "signIn";
   const files = bundle.answers.answers.at(-1)?.metadata?.files;
   const reimportProfile = async () => {
     if (busy) return;
@@ -1710,11 +1712,12 @@ function ChatGptPanel({ bundle, localControls, onError }: { bundle: TabBundle; l
   return <div className="terminal-card chatgpt-card">
     <div className="terminal-heading">
       <span><i className={`status-dot ${state === "ready" ? "running" : state === "error" ? "error" : ""}`} /><span className="terminal-title-text">{t("provider.chatgpt")}</span></span>
-      <span className="terminal-meta">{t(state === "ready" ? "chatgpt.ready" : state === "error" ? "chatgpt.error" : "chatgpt.connecting")}</span>
+      <span className="terminal-meta">{t(state === "ready" ? "chatgpt.ready" : state === "error" ? "chatgpt.error" : "chatgpt.signIn")}</span>
     </div>
     <div className="chatgpt-body">
       <div className="chatgpt-row"><span>{t("chatgpt.conversation")}</span><a href={url} target="_blank" rel="noreferrer">{conversationId ?? t("chatgpt.noConversation")}</a></div>
       {Array.isArray(files) && files.length > 0 && <div className="chatgpt-row"><span>{t("chatgpt.files")}</span><code>{(files as string[]).map((file) => file.split(/[\/]/).at(-1)).join("、")}</code></div>}
+      {state === "signIn" && <p className="field-hint chatgpt-signin">{t(localControls ? "chatgpt.signInHint" : "chatgpt.signInRemote")}</p>}
       <p className="field-hint">{t(localControls ? "chatgpt.localHint" : "chatgpt.remoteHint")}</p>
       {localControls && <div className="session-actions">
         <button className="ghost" disabled={busy} onClick={() => void bringToFront()}>{t("chatgpt.bringToFront")}</button>
