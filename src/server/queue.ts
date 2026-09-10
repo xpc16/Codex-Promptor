@@ -148,7 +148,16 @@ export class QueueRunner extends EventEmitter {
     return this.updateRuntime((runtime) => ({ ...runtime, queueConfig: { onFailure } }));
   }
 
-  async insertNow(promptId: string, editedText?: string): Promise<InsertNowResult> {
+  /**
+   * Run one pending prompt ahead of the queue.
+   *
+   * Two different things wear this one button: with a turn in flight it steers
+   * the text into it, and with the queue idle it simply starts that prompt as
+   * its own turn. `steerable: false` keeps only the second -- what a
+   * collaboration message needs, since steering would fold it into a turn
+   * that belongs to something else (docs/AGENT_TO_AGENT.md §4.1).
+   */
+  async insertNow(promptId: string, editedText?: string, options: { steerable?: boolean } = {}): Promise<InsertNowResult> {
     const replacementText = editedText === undefined ? undefined : editedText.trim();
     if (editedText !== undefined && !replacementText) throw new Error("PROMPT_EMPTY");
     const initial = await this.storage.readTab(this.tabId);
@@ -167,6 +176,7 @@ export class QueueRunner extends EventEmitter {
     // model turn. Steering /compact or /status makes the provider wait for a
     // turn/final-answer lifecycle those commands intentionally do not have.
     if (activeTurnId && !isSlashCommandPrompt(effectiveText)) {
+      if (options.steerable === false) throw new Error("PROMPT_NOT_STEERABLE");
       try {
         await this.steerPendingPrompt(promptId, threadId, activeTurnId, replacementText);
         return { mode: "steered", turnId: activeTurnId };

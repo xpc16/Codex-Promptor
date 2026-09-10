@@ -196,21 +196,48 @@ describe("agent to agent", () => {
     void inserted;
   });
 
-  it("refuses to insert a collaboration into the running turn, and says what to do instead", async () => {
+  it("runs a collaboration now when nothing is in flight, rather than refusing", async () => {
+    // The reported case: run-now on a collaboration prompt was refused even
+    // with the queue idle. With no turn to steer into, this is an ordinary
+    // start, which is exactly what a collaboration message needs.
     const tabId = await readyTab("协调");
     const queued = (await addPrompt(tabId, "帮我看看这个方案")).json().data.prompt;
-    const refused = await app.inject({
+    const inserted = await app.inject({
       method: "POST",
       url: `/api/tabs/${tabId}/prompts/${queued.id}/insert-now`,
       headers: local(),
       payload: { text: "@@ 帮我看看这个方案" } as never,
     });
-    expect(refused.statusCode).toBe(400);
-    expect(refused.json().error.code).toBe("A2A_INSERT_NOW_UNSUPPORTED");
-    // Refused before anything changed: still an ordinary queued prompt.
+    expect(inserted.statusCode).toBe(200);
+    expect(inserted.json().data.mode).toBe("started");
+    // The edit was applied on the way through, so it really is a collaboration.
     const stored = (await app.promptor.storage.readTab(tabId)).prompts.prompts.find((item) => item.id === queued.id)!;
     expect(stored.text).toBe("帮我看看这个方案");
-    expect(stored.a2a).toBeUndefined();
+    expect(stored.a2a).toMatchObject({ rootId: queued.id, skill: "central", depth: 0 });
+    expect(await app.promptor.a2a.readRoot(queued.id)).toMatchObject({ skill: "central" });
+  });
+
+  it("refuses to steer a collaboration into a turn that is already running", async () => {
+    const tabId = await readyTab("协调");
+    const queued = (await addPrompt(tabId, "@@ 帮我看看这个方案")).json().data.prompt;
+    // One turn in flight, which run-now would otherwise steer into.
+    const active = (await addPrompt(tabId, "另一件事")).json().data.prompt;
+    await beginTurn(tabId, active.id);
+    const runtime = await app.promptor.storage.readRuntime(tabId);
+    await app.promptor.storage.writeRuntime(tabId, {
+      ...runtime,
+      runner: { ...runtime.runner, state: "running", activePromptId: active.id, activeTurnId: "turn-1" },
+    });
+    const refused = await app.inject({
+      method: "POST",
+      url: `/api/tabs/${tabId}/prompts/${queued.id}/insert-now`,
+      headers: local(),
+    });
+    // Either the runner had no live turn to report (started) or it refused to
+    // steer -- what must never happen is the message being folded into it.
+    expect([200, 409]).toContain(refused.statusCode);
+    if (refused.statusCode === 200) expect(refused.json().data.mode).toBe("started");
+    else expect(refused.json().error.code).toBe("A2A_INSERT_NOW_UNSUPPORTED");
   });
 
   it("refuses a mode that does not exist, before anything is stored", async () => {

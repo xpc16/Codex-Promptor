@@ -3035,49 +3035,70 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
   });
 
+  /** A PATCH that carries no text still bumps the record, as it always has. */
+  const touchPrompt = async (tabId: string, promptId: string) => storage.withTabLock(tabId, async () => {
+    const bundle = await storage.readTab(tabId);
+    assertQueueUsable(bundle);
+    const prompt = bundle.prompts.prompts.find((item) => item.id === promptId);
+    if (!prompt) throw new Error("PROMPT_NOT_FOUND");
+    if (["completed", "running", "dispatching"].includes(prompt.status)) throw new Error("PROMPT_READ_ONLY");
+    prompt.updatedAt = isoNow();
+    bundle.prompts.revision += 1;
+    bundle.prompts.updatedAt = isoNow();
+    return { prompt, delta: await storage.writePrompts(tabId, bundle.prompts) };
+  });
+
+  /**
+   * Apply an edit to a queued prompt, and start its collaboration if the edit
+   * created one. Shared by the save button and by run-now, so a prompt means
+   * the same thing whichever one is pressed.
+   */
+  const applyPromptEdit = async (tabId: string, promptId: string, incoming: string) => {
+    const created: { root: { promptId: string; skill: string } | null } = { root: null };
+    const result = await storage.withTabLock(tabId, async () => {
+      const bundle = await storage.readTab(tabId);
+      assertQueueUsable(bundle);
+      const prompt = bundle.prompts.prompts.find((item) => item.id === promptId);
+      if (!prompt) throw new Error("PROMPT_NOT_FOUND");
+      if (["completed", "running", "dispatching"].includes(prompt.status)) throw new Error("PROMPT_READ_ONLY");
+      // The row sends what it holds; what that means is decided here, from the
+      // prompt on disk. The stored text stays clean, and an existing root keeps
+      // its identity and its spent budget.
+      const edited = editedPromptPrefix(prompt, incoming.trim());
+      if (!edited.text) throw new Error("PROMPT_EMPTY");
+      prompt.text = edited.text;
+      if (edited.kind === "a2a" && !prompt.a2a && !a2aEnabled) {
+        throw new A2aError("A2A_DISABLED", 400, "A2A 协作已被关闭（CODEX_PROMPTOR_A2A=0）。去掉这个环境变量并重启即可使用 @@。");
+      }
+      if (edited.kind === "a2a" && a2aEnabled) {
+        const rootId = prompt.a2a?.rootId ?? prompt.id;
+        const started = prompt.a2a ? await a2a.readRoot(rootId) : null;
+        // A running collaboration executes the version it froze at start.
+        const skill = started && started.status !== "pending" ? started.skill : edited.skill;
+        if (!prompt.a2a || skill !== prompt.a2a.skill) await a2a.loadSkill(skill);
+        prompt.a2a = { ...(prompt.a2a ?? { depth: 0, fromTabId: null, fromPromptId: null }), rootId, skill };
+        created.root = prompt.a2a.depth === 0 && !started ? { promptId: prompt.id, skill } : null;
+      }
+      prompt.updatedAt = isoNow();
+      bundle.prompts.revision += 1;
+      bundle.prompts.updatedAt = isoNow();
+      return { prompt, delta: await storage.writePrompts(tabId, bundle.prompts) };
+    });
+    if (created.root) {
+      await a2a.beginRoot({ originTabId: tabId, originPromptId: created.root.promptId, skillName: created.root.skill });
+      void emitSnapshot(tabId);
+    }
+    return result;
+  };
+
   app.patch("/api/tabs/:tabId/prompts/:promptId", async (request, reply) => {
     const tabId = String((request.params as any).tabId);
     const promptId = String((request.params as any).promptId);
     const body = (request.body ?? {}) as any;
-    // A holder, not a `let`: the assignment happens inside the tab lock's
-    // closure, which TypeScript cannot narrow through.
-    const created: { root: { promptId: string; skill: string } | null } = { root: null };
     try {
-      const { prompt, delta } = await storage.withTabLock(tabId, async () => {
-        const bundle = await storage.readTab(tabId);
-        assertQueueUsable(bundle);
-        const prompt = bundle.prompts.prompts.find((item) => item.id === promptId);
-        if (!prompt) throw new Error("PROMPT_NOT_FOUND");
-        if (["completed", "running", "dispatching"].includes(prompt.status)) throw new Error("PROMPT_READ_ONLY");
-        if (body.text !== undefined) {
-          // The row sends what it holds; what that means is decided here, from
-          // the prompt on disk. The stored text stays clean, and an existing
-          // root keeps its identity and its spent budget.
-          const edited = editedPromptPrefix(prompt, String(body.text).trim());
-          if (!edited.text) throw new Error("PROMPT_EMPTY");
-          prompt.text = edited.text;
-          if (edited.kind === "a2a" && !prompt.a2a && !a2aEnabled) {
-            throw new A2aError("A2A_DISABLED", 400, "A2A 协作已被关闭（CODEX_PROMPTOR_A2A=0）。去掉这个环境变量并重启即可使用 @@。");
-          }
-          if (edited.kind === "a2a" && a2aEnabled) {
-            const rootId = prompt.a2a?.rootId ?? prompt.id;
-            const started = prompt.a2a ? await a2a.readRoot(rootId) : null;
-            // A running collaboration executes the version it froze at start.
-            const skill = started && started.status !== "pending" ? started.skill : edited.skill;
-            if (!prompt.a2a || skill !== prompt.a2a.skill) await a2a.loadSkill(skill);
-            prompt.a2a = { ...(prompt.a2a ?? { depth: 0, fromTabId: null, fromPromptId: null }), rootId, skill };
-            created.root = prompt.a2a.depth === 0 && !started ? { promptId: prompt.id, skill } : null;
-          }
-        }
-        prompt.updatedAt = isoNow();
-        bundle.prompts.revision += 1;
-        bundle.prompts.updatedAt = isoNow();
-        return { prompt, delta: await storage.writePrompts(tabId, bundle.prompts) };
-      });
-      if (created.root) {
-        await a2a.beginRoot({ originTabId: tabId, originPromptId: created.root.promptId, skillName: created.root.skill });
-        void emitSnapshot(tabId);
-      }
+      const { prompt, delta } = body.text === undefined
+        ? await touchPrompt(tabId, promptId)
+        : await applyPromptEdit(tabId, promptId, String(body.text));
       return reply.send({ data: { prompt, delta } });
     } catch (error) {
       if (error instanceof A2aPrefixError) return apiError(reply, 400, error.code, error.message);
@@ -3156,30 +3177,26 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const bundle = await storage.readTab(tabId);
       assertQueueUsable(bundle);
       const promptId = String((request.params as any).promptId);
-      // A collaboration message runs as its own turn. Steering it into the
-      // turn already in flight would mix two collaboration contexts into one
-      // (docs/AGENT_TO_AGENT.md §4.1).
-      if (bundle.prompts.prompts.find((item) => item.id === promptId)?.a2a) {
-        return apiError(reply, 400, "A2A_INSERT_NOW_UNSUPPORTED", "协作消息按独立轮次执行，不能插入当前轮，请等待排队执行。");
-      }
       const body = (request.body ?? {}) as any;
-      // Replacement text is a queue entry point like any other, so it is read
-      // the same way. Without this an escaped `@@` reached the CLI verbatim
-      // and was stored as the prompt's own text.
-      let replacement: string | undefined;
-      if (body.text !== undefined) {
-        const existing = bundle.prompts.prompts.find((item) => item.id === promptId);
-        const edited = editedPromptPrefix(existing ?? { text: "" }, String(body.text).trim());
-        if (edited.kind === "a2a") {
-          return apiError(reply, 400, "A2A_INSERT_NOW_UNSUPPORTED", "协作要按独立轮次开始。请先点保存（✓），再用「开始」让队列执行它。");
-        }
-        replacement = edited.text;
-      }
-      const result = await runners.get(tabId).insertNow(promptId, replacement);
+      // Replacement text is a queue entry point like any other, so it is
+      // applied through the same helper as the save button -- including
+      // starting a collaboration when that is what the edit asks for.
+      let target = bundle.prompts.prompts.find((item) => item.id === promptId);
+      if (body.text !== undefined) target = (await applyPromptEdit(tabId, promptId, String(body.text))).prompt;
+      // A collaboration message runs as its own turn: with the queue idle this
+      // simply starts it, and with a turn in flight the runner refuses rather
+      // than folding it into a turn that belongs to something else
+      // (docs/AGENT_TO_AGENT.md §4.1).
+      const result = await runners.get(tabId).insertNow(promptId, undefined, { steerable: !target?.a2a });
       return reply.send({ data: { ...result, runtime: await storage.readRuntime(tabId) } });
     } catch (error) {
       if (error instanceof A2aPrefixError) return apiError(reply, 400, error.code, error.message);
-      return apiError(reply, 400, "PROMPT_INSERT_NOW_FAILED", error instanceof Error ? error.message : String(error));
+      if (error instanceof A2aError) return apiError(reply, error.statusCode, error.code, error.message);
+      const message = error instanceof Error ? error.message : String(error);
+      if (message === "PROMPT_NOT_STEERABLE") {
+        return apiError(reply, 409, "A2A_INSERT_NOW_UNSUPPORTED", "协作消息要按独立轮次执行。当前这一轮还没结束，等它跑完再点，或者用「开始」让队列执行它。");
+      }
+      return apiError(reply, 400, "PROMPT_INSERT_NOW_FAILED", message);
     }
   });
 
