@@ -1693,6 +1693,13 @@ function ChatGptPanel({ bundle, localControls, onError }: { bundle: TabBundle; l
     ? "error"
     : session.state === "ready" ? "ready" : "connecting";
   const files = bundle.answers.answers.at(-1)?.metadata?.files;
+  const reimportProfile = async () => {
+    if (busy) return;
+    setBusy(true);
+    try { await api("/api/chatgpt/profile/refresh", jsonBody({})); }
+    catch (reason) { onError(reason); }
+    finally { setBusy(false); }
+  };
   const bringToFront = async () => {
     if (busy) return;
     setBusy(true);
@@ -1709,7 +1716,10 @@ function ChatGptPanel({ bundle, localControls, onError }: { bundle: TabBundle; l
       <div className="chatgpt-row"><span>{t("chatgpt.conversation")}</span><a href={url} target="_blank" rel="noreferrer">{conversationId ?? t("chatgpt.noConversation")}</a></div>
       {Array.isArray(files) && files.length > 0 && <div className="chatgpt-row"><span>{t("chatgpt.files")}</span><code>{(files as string[]).map((file) => file.split(/[\/]/).at(-1)).join("、")}</code></div>}
       <p className="field-hint">{t(localControls ? "chatgpt.localHint" : "chatgpt.remoteHint")}</p>
-      {localControls && <div className="session-actions"><button className="ghost" disabled={busy} onClick={() => void bringToFront()}>{t("chatgpt.bringToFront")}</button></div>}
+      {localControls && <div className="session-actions">
+        <button className="ghost" disabled={busy} onClick={() => void bringToFront()}>{t("chatgpt.bringToFront")}</button>
+        <button className="ghost" disabled={busy} title={t("chatgpt.reimportHelp")} onClick={() => void reimportProfile()}>{t("chatgpt.reimport")}</button>
+      </div>}
     </div>
   </div>;
 }

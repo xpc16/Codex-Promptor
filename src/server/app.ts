@@ -40,8 +40,9 @@ import { discoverSessions, importedSessionIds, importedTabName } from "./session
 import { CLAUDE_EXIT_MARKER, CODEX_EXIT_MARKER, CURSOR_EXIT_MARKER, PtyManager, sessionExitMarker, type TerminalCursor } from "./pty.js";
 import { isSlashCommandPrompt } from "./prompt-submit.js";
 import { RunnerManager } from "./queue.js";
-import { BrowserPool, defaultProfileDir } from "./browser.js";
+import { BrowserPool, browserLaunchFromEnv } from "./browser.js";
 import { ChatGptError, ChatGptPool } from "./chatgpt.js";
+import { BrowserUnavailableError } from "./browser.js";
 import { conversationIdFrom, conversationUrl } from "./chatgpt-page.js";
 import { AttachmentError, parseAttachments, resolveAttachments } from "./attach-prefix.js";
 import { A2aError, A2aService } from "./a2a-service.js";
@@ -199,7 +200,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const codexTui = new CodexTuiPool(pty);
   const claude = new ClaudeCodePool(pty);
   const cursor = new CursorCliPool(pty);
-  const browserPool = new BrowserPool({ userDataDir: defaultProfileDir(storage.dataDir) });
+  const browserPool = new BrowserPool(browserLaunchFromEnv(storage.dataDir));
   const chatgpt = new ChatGptPool(browserPool, storage.dataDir);
   const tuiProxy = new TuiProxyPool();
   const directoryPicker = new DirectoryPickerService();
@@ -2192,6 +2193,27 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     } catch (error) {
       if (error instanceof A2aError) return apiError(reply, error.statusCode, error.code, error.message);
       return apiError(reply, 500, "A2A_END_FAILED", error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  /**
+   * Copy the sign-in across from the everyday browser again.
+   *
+   * The browser comes down to do it -- the files being replaced are the ones it
+   * has open -- and the conversations reopen on their own afterwards.
+   */
+  app.post("/api/chatgpt/profile/refresh", async (request, reply) => {
+    if (!isLocalBrowserRequest(request.headers)) {
+      return apiError(reply, 403, "CHATGPT_LOCAL_ONLY", "浏览器配置在运行 Promptor 的那台机器上，只能从本机操作。");
+    }
+    try {
+      const seed = await browserPool.reseed();
+      const tabs = (await storage.listTabMeta()).filter((tab) => tab.session.provider === "chatgpt" && tab.session.state === "ready");
+      for (const tab of tabs) void performChatGptReopen(tab).catch(() => undefined);
+      return reply.send({ data: { ...seed, reopening: tabs.length } });
+    } catch (error) {
+      const code = error instanceof BrowserUnavailableError ? error.code : "CHATGPT_PROFILE_REFRESH_FAILED";
+      return apiError(reply, 400, code, error instanceof Error ? error.message : String(error));
     }
   });
 
