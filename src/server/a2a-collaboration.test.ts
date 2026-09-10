@@ -94,7 +94,7 @@ describe("agent to agent", () => {
     // the prompt.
     if (prepared) {
       if (prepared.submittedText !== prompt.text) attempt.submittedText = prepared.submittedText;
-      if (prepared.a2a && !prompt.a2a) prompt.a2a = prepared.a2a;
+      if (prepared.a2a) prompt.a2a = prepared.a2a;
       await app.promptor.storage.writePrompts(tabId, bundle.prompts);
     }
     return { contextId: attempt.attemptId, submitted: prepared?.submittedText ?? null };
@@ -276,6 +276,54 @@ describe("agent to agent", () => {
     expect(submitted).toBeNull();
     const stored = (await app.promptor.storage.readTab(tabId)).prompts.prompts.find((item) => item.id === later.id)!;
     expect(stored.a2a).toBeUndefined();
+  });
+
+  it("starts a new collaboration when a @@ prompt is run again after its own was stopped", async () => {
+    // The reported case: a stopped collaboration's prompt was edited and run
+    // again. It kept pointing at the stopped root, so it dispatched with the
+    // badge still on and none of the behaviour -- no preamble, no context.
+    const tabId = await readyTab("协调");
+    const first = (await addPrompt(tabId, "@@ 让另一个对话算一道题")).json().data.prompt;
+    await beginTurn(tabId, first.id);
+    await settleTurn(tabId, first.id);
+    await app.inject({ method: "POST", url: `/api/a2a/roots/${first.id}/stop`, headers: local() });
+    expect((await app.promptor.a2a.readRoot(first.id))!.status).toBe("stopped");
+
+    // Editing it and running it again is the reader starting over.
+    await app.inject({
+      method: "PATCH",
+      url: `/api/tabs/${tabId}/prompts/${first.id}`,
+      headers: local(),
+      payload: { text: "@@ 让另一个对话算一道积分题" } as never,
+    });
+    const { contextId, submitted } = await beginTurn(tabId, first.id);
+    expect(submitted).toContain("Promptor A2A 协作说明");
+
+    const stored = (await app.promptor.storage.readTab(tabId)).prompts.prompts.find((item) => item.id === first.id)!;
+    expect(stored.a2a!.rootId).not.toBe(first.id);
+    const fresh = await app.promptor.a2a.readRoot(stored.a2a!.rootId);
+    expect(fresh).toMatchObject({ status: "running", usedMessages: 1, originPromptId: first.id });
+    // The stopped one is still on disk, saying what happened to it.
+    expect((await app.promptor.a2a.readRoot(first.id))!.status).toBe("stopped");
+    expect((await call(tabId, { op: "list", contextId })).statusCode).toBe(200);
+  });
+
+  it("does not resurrect a collaboration by re-running a message that arrived from elsewhere", async () => {
+    const from = await readyTab("协调");
+    const to = await readyTab("执行");
+    const rootPrompt = (await addPrompt(from, "@@ 分工")).json().data.prompt;
+    const { contextId } = await beginTurn(from, rootPrompt.id);
+    const sent = await call(from, { op: "send", contextId, requestId: "r1", to, text: "任务" });
+    const workerPromptId = sent.json().data.delivered.promptId;
+    await settleTurn(from, rootPrompt.id);
+    // Run it once so stopping cannot simply cancel it as unstarted work.
+    await beginTurn(to, workerPromptId);
+    await settleTurn(to, workerPromptId, "interrupted");
+    await app.inject({ method: "POST", url: `/api/a2a/roots/${rootPrompt.id}/stop`, headers: local() });
+
+    const { submitted } = await beginTurn(to, workerPromptId);
+    expect(submitted).toBeNull();
+    expect((await app.promptor.a2a.store.all()).filter((root) => root.originPromptId === workerPromptId)).toHaveLength(0);
   });
 
   it("refuses a mode that does not exist, before anything is stored", async () => {

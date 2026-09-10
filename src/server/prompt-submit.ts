@@ -124,17 +124,38 @@ export function clearSubmitTimers(timers: SubmitTimers): void {
 }
 
 /**
+ * Characters a TUI paste is known to give back unchanged: ASCII, CJK, and
+ * CJK/fullwidth punctuation.
+ *
+ * Everything outside it has been observed to disappear somewhere between the
+ * PTY and the provider transcript -- a U+2192 arrow and a U+222B integral
+ * sign, both silently. Curly quotes belong here too, which is why the
+ * comparison below already had to strip them.
+ */
+const SURVIVES_A_PASTE = /[\t\n\r\x20-\x7E\u3000-\u303F\u4E00-\u9FFF\uFF00-\uFFEF]/;
+
+/** The distinct characters in `text` that a paste may not give back. */
+export function charactersAPasteMayDrop(text: string): string[] {
+  const offending = new Set<string>();
+  for (const character of text) if (!SURVIVES_A_PASTE.test(character)) offending.add(character);
+  return [...offending];
+}
+
+/**
  * Limited normalization only: never substring- or fuzzy-match user text.
  *
- * One native Codex/PowerShell submission was persisted without the two smart
- * double quotes present in the bracketed paste. Treat those presentation
- * marks as transport decoration so the hook and rollout can still acknowledge
- * the exact queued submission; ordinary ASCII quotes remain significant.
+ * Beyond line endings, the one thing removed is characters the terminal may
+ * not hand back, and they are removed from *both* sides -- so this is not
+ * fuzziness, it is undoing a known, symmetric transport loss. Without it a
+ * prompt containing one of them can never be acknowledged: the queue sits in
+ * `dispatching` forever while the answer is written above it, and history
+ * sync imports the CLI's version as a second prompt.
  */
 export function sameSubmittedPrompt(left: string, right: string): boolean {
-  const comparable = (value: string) => value
-    .replace(/\r\n/g, "\n")
-    .replace(/[\u201c\u201d]/g, "")
-    .trim();
+  const comparable = (value: string) => {
+    let out = "";
+    for (const character of value.replace(/\r\n/g, "\n")) if (SURVIVES_A_PASTE.test(character)) out += character;
+    return out.trim();
+  };
   return comparable(left) === comparable(right);
 }

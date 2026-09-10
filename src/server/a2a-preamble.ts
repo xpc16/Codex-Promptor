@@ -1,6 +1,7 @@
 import { type A2aBudgetSnapshot } from "../shared/a2a.js";
 import { A2A_SKILL_NAME_PATTERN } from "../shared/a2a.js";
 import { describeRolePolicy, type A2aRolePolicy } from "./a2a-policy.js";
+import { charactersAPasteMayDrop } from "./prompt-submit.js";
 
 export { A2aPrefixError, editedPromptPrefix, parsePromptPrefix, type PromptPrefix } from "../shared/a2a-prefix.js";
 
@@ -77,29 +78,16 @@ export function buildA2aPreamble(input: PreambleInput): string {
 }
 
 /**
- * Characters observed to survive a paste into the agent TUIs.
+ * The distinct characters in generated preamble text that the terminal may
+ * not hand back.
  *
- * ASCII, CJK, and CJK/fullwidth punctuation. This is a whitelist because the
- * failure it prevents is silent and expensive: a single U+2192 in the
- * generated preamble was dropped somewhere between the PTY and the Codex
- * transcript, so the text the CLI recorded no longer equalled the text that
- * was submitted, submission was never confirmed, and the queue sat in
- * `dispatching` forever with the answer already written above it.
- *
- * Curly quotes are deliberately excluded: `sameSubmittedPrompt` already has
- * to normalise those away for the same reason.
- */
-const PREAMBLE_SAFE_CHARACTER = /[\t\n\r\x20-\x7E\u3000-\u303F\u4E00-\u9FFF\uFF00-\uFFEF]/;
-
-/**
- * The distinct characters in generated preamble text that may not survive the
- * trip. Empty is the only acceptable answer; a skill template that trips this
- * has to say the same thing in plainer characters.
+ * `sameSubmittedPrompt` now normalises these away on both sides, so one of
+ * them no longer wedges a queue -- but the preamble is machinery, not the
+ * reader's words, and there is no reason for it to say anything that cannot
+ * make the round trip intact.
  */
 export function unsafePreambleCharacters(text: string): string[] {
-  const offending = new Set<string>();
-  for (const character of text) if (!PREAMBLE_SAFE_CHARACTER.test(character)) offending.add(character);
-  return [...offending];
+  return charactersAPasteMayDrop(text);
 }
 
 /** The text actually handed to the CLI. Kept separate from `prompt.text`, which stays clean. */

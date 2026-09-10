@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearSubmitTimers,
   isSlashCommandPrompt,
+  charactersAPasteMayDrop,
   sameSubmittedPrompt,
   scheduleSubmitRecovery,
   SUBMIT_RETRY_DELAYS_MS,
@@ -102,6 +103,24 @@ describe("evidence-gated prompt submission recovery", () => {
     expect(sameSubmittedPrompt('say "yes"', "say yes")).toBe(false);
     expect(sameSubmittedPrompt("one two", "one  two")).toBe(false);
     expect(sameSubmittedPrompt("prefix", "prefix suffix")).toBe(false);
+  });
+
+  it("acknowledges a prompt whose special characters the terminal did not give back", () => {
+    // Observed twice, silently: a U+2192 in an injected preamble and a U+222B
+    // an author typed. The transcript simply had them missing, the submission
+    // was never confirmed, and the prompt sat in `dispatching` while its
+    // answer was written above it.
+    expect(sameSubmittedPrompt("可作用范围：list→all", "可作用范围：listall")).toBe(true);
+    expect(sameSubmittedPrompt("计算 ∫_0^1 x^3 dx", "计算 _0^1 x^3 dx")).toBe(true);
+    // Symmetric: the same text either way round, and still not a substring match.
+    expect(sameSubmittedPrompt("计算 _0^1 x^3 dx", "计算 ∫_0^1 x^3 dx")).toBe(true);
+    expect(sameSubmittedPrompt("计算 ∫_0^1 x^3 dx", "计算 _0^1 x^4 dx")).toBe(false);
+    expect(sameSubmittedPrompt("∫", "∫")).toBe(true);
+  });
+
+  it("names the characters a paste may not give back", () => {
+    expect(charactersAPasteMayDrop("普通正文，list: all（含中文标点）")).toEqual([]);
+    expect(charactersAPasteMayDrop("a→b→c ∫")).toEqual(["→", "∫"]);
   });
 
   it("recognizes CLI slash commands after leading whitespace only", () => {

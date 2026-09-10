@@ -137,6 +137,22 @@ export class A2aStore {
     return [...this.cache.values()];
   }
 
+  /**
+   * A free root id for a prompt whose previous collaboration has ended.
+   *
+   * Root ids are prompt ids, so re-running the same prompt cannot reuse one
+   * without overwriting the record of what happened last time -- and a root
+   * that a person explicitly stopped is exactly the record worth keeping.
+   */
+  async nextRootId(promptId: string): Promise<string> {
+    const taken = new Set((await this.all()).map((root) => root.rootId));
+    for (let attempt = 2; attempt < 1000; attempt += 1) {
+      const candidate = `${promptId}-${attempt}`;
+      if (!taken.has(candidate)) return candidate;
+    }
+    throw new Error("A2A_ROOT_ID_EXHAUSTED");
+  }
+
   /** Roots this conversation has joined, newest first. */
   async forTab(tabId: string): Promise<A2aRoot[]> {
     return (await this.all())

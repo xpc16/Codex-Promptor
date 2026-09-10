@@ -433,8 +433,10 @@ export class QueueRunner extends EventEmitter {
       if (prepared) {
         if (prepared.submittedText !== prompt.text) attempt.submittedText = prepared.submittedText;
         // Written here, inside the same lock, so the queue row says what this
-        // turn actually joined rather than only what it was queued as.
-        if (prepared.a2a && !prompt.a2a) prompt.a2a = prepared.a2a;
+        // turn actually joined rather than only what it was queued as -- which
+        // is not always what it was queued with: re-running a prompt whose
+        // collaboration has ended starts a new one.
+        if (prepared.a2a) prompt.a2a = prepared.a2a;
       }
       prompt.attempts.push(attempt);
       prompt.threadId = threadId;

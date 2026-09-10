@@ -123,11 +123,12 @@ export class A2aService {
    * not started until it is dispatched, so the purple light does not come on
    * for something sitting in a paused queue.
    */
-  async beginRoot(input: { originTabId: string; originPromptId: string; skillName: string }): Promise<A2aRoot> {
+  async beginRoot(input: { originTabId: string; originPromptId: string; skillName: string; rootId?: string }): Promise<A2aRoot> {
     const skill = await this.loadSkill(input.skillName);
-    return this.store.withRootLock(input.originPromptId, async () => this.store.write({
+    const rootId = input.rootId ?? input.originPromptId;
+    return this.store.withRootLock(rootId, async () => this.store.write({
       schemaVersion: 1,
-      rootId: input.originPromptId,
+      rootId,
       revision: 0,
       status: "pending",
       skill: skill.name,
@@ -175,11 +176,14 @@ export class A2aService {
     // prompt the reader types here belongs to it too -- otherwise answering
     // the agent's own question drops that turn out of the collaboration, with
     // no context to call the endpoint with and no instructions to follow.
-    const meta = input.prompt.a2a ?? await this.continuationMeta(input.tab.id);
+    const requested = input.prompt.a2a ?? await this.continuationMeta(input.tab.id);
+    if (!requested) return null;
+    const meta = await this.rootForDispatch(input.prompt, requested);
     if (!meta) return null;
-    const root = await this.store.read(meta.rootId);
+    const root = (await this.store.read(meta.rootId))
+      ?? await this.beginRoot({ originTabId: input.tab.id, originPromptId: input.prompt.id, skillName: meta.skill, rootId: meta.rootId })
+        .catch(() => null);
     if (!root) return null;
-    if (root.status === "completed" || root.status === "stopped") return null;
 
     const started = await this.store.withRootLock(root.rootId, async () => {
       const current = await this.store.read(root.rootId);
@@ -235,6 +239,24 @@ export class A2aService {
     });
     for (const participant of started.members) this.deps.notifyTab(participant.tabId);
     return { submittedText: composeSubmittedText(preamble, input.prompt.text), a2a: meta };
+  }
+
+  /**
+   * Which collaboration this dispatch belongs to.
+   *
+   * Usually the one the prompt already names. But a `@@` prompt the reader
+   * edits and runs again after stopping its collaboration is them starting
+   * over -- so it gets a new root rather than silently running with the badge
+   * of an ended one and none of its behaviour. A message that arrived from
+   * another conversation gets no such treatment: its collaboration ended, and
+   * re-running it is just re-running text.
+   */
+  private async rootForDispatch(prompt: PromptRecord, requested: A2aPromptMeta): Promise<A2aPromptMeta | null> {
+    const existing = await this.store.read(requested.rootId);
+    if (existing && existing.status !== "completed" && existing.status !== "stopped") return requested;
+    if (requested.fromTabId || requested.depth !== 0) return null;
+    const rootId = existing ? await this.store.nextRootId(prompt.id) : prompt.id;
+    return { ...requested, rootId };
   }
 
   /**
