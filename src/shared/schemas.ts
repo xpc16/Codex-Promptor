@@ -118,6 +118,9 @@ export const SessionSchema = z.object({
   workingDirectory: z.string().nullable(),
   threadId: z.string().nullable(),
   sessionId: z.string().nullable(),
+  // Optional for v1 files. Unlike the live thread, this must have verified
+  // on-disk history before it becomes the restart recovery target.
+  lastDurableThreadId: z.string().nullable().optional(),
   createdAt: z.string().nullable(),
   connectedAt: z.string().nullable(),
   lastError: z.object({ code: z.string(), message: z.string() }).nullable(),
@@ -366,6 +369,7 @@ export const defaultSession = (): Session => ({
   workingDirectory: null,
   threadId: null,
   sessionId: null,
+  lastDurableThreadId: null,
   createdAt: null,
   connectedAt: null,
   lastError: null,

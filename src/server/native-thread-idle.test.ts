@@ -38,7 +38,7 @@ describe.each(providers)("$name idle wait", ({ Manager, start, prompt, stop, beg
     const root = await mkdtemp(path.join(os.tmpdir(), "promptor-native-idle-"));
     temporaryDirectories.push(root);
     const file = path.join(root, "session.jsonl");
-    await writeFile(file, "", "utf8");
+    await writeFile(file, Manager === CodexTuiManager ? jsonl([{ type: "session_meta", payload: { id: "session", source: "cli" } }]) : "", "utf8");
     const pty = { write: vi.fn(), submitPrompt: vi.fn() };
     const manager = new Manager("tab", pty as any);
     await manager.handleHook({ hook_event_name: start, session_id: "session", cwd: root, transcript_path: file });

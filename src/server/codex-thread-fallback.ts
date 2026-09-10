@@ -39,31 +39,39 @@ export type ResumeThreadChoice = {
   fellBack: boolean;
 };
 
-/**
- * Which thread a reopen should actually resume.
- *
- * Falling back is deliberately conservative: it happens only when the stored
- * thread is known to have no rollout *and* the recorded origin is known to
- * have one. A lookup that merely failed to find a file is not enough to
- * override what the tab says, so anything less certain resumes the stored id
- * and lets the launch report its own error.
+type RecoverySession = {
+  threadId: string | null;
+  lastDurableThreadId?: string | null;
+  lastThreadSwitch?: { fromThreadId: string } | null;
+};
+export type ThreadDurabilityProbe = (threadId: string) => Promise<boolean>;
+
+/** Shared by native hooks and App Server. Never let an empty switch erase
+ * the last verified thread; a failed probe must not promote an unverified id.
  */
-export function chooseResumeThread(input: {
-  threadId: string;
-  fallbackThreadId: string | null;
-  threadHasRollout: boolean;
-  fallbackHasRollout: boolean;
-  cachedThreadId?: string | null;
-  cachedHasRollout?: boolean;
-}): ResumeThreadChoice {
-  if (input.threadHasRollout) return { threadId: input.threadId, fellBack: false };
-  if (input.fallbackThreadId && input.fallbackThreadId !== input.threadId && input.fallbackHasRollout) {
-    return { threadId: input.fallbackThreadId, fellBack: true };
+export async function rememberDurableThread(session: RecoverySession, targetId: string | null, probe: ThreadDurabilityProbe): Promise<string | null> {
+  for (const id of new Set([targetId, session.threadId, session.lastDurableThreadId, session.lastThreadSwitch?.fromThreadId])) {
+    if (id && await probe(id).catch(() => false)) return id;
   }
-  if (input.cachedThreadId && input.cachedThreadId !== input.threadId && input.cachedHasRollout) {
-    return { threadId: input.cachedThreadId, fellBack: true };
+  return session.lastDurableThreadId ?? null;
+}
+
+/** Missing history permits recovery; permission/identity errors do not. The
+ * normal path checks one header and never reads cache or full history.
+ */
+export async function resolveSavedCodexThread(session: RecoverySession, probe: ThreadDurabilityProbe, cachedId: () => Promise<string | null>): Promise<ResumeThreadChoice> {
+  const checked = new Set<string>();
+  const usable = async (id: string | null | undefined) => {
+    if (!id || checked.has(id)) return false;
+    checked.add(id);
+    return probe(id);
+  };
+  for (const id of [session.threadId, session.lastDurableThreadId, session.lastThreadSwitch?.fromThreadId]) {
+    if (await usable(id)) return { threadId: id!, fellBack: id !== session.threadId };
   }
-  return { threadId: input.threadId, fellBack: false };
+  const cached = await cachedId();
+  if (await usable(cached)) return { threadId: cached!, fellBack: cached !== session.threadId };
+  throw new Error(`CODEX_SESSION_NOT_SAVED: No saved session found with ID ${session.threadId}. No verified history is available for this tab; choose a saved session to resume.`);
 }
 
 /** Older versions lost the durable origin after two empty thread switches.

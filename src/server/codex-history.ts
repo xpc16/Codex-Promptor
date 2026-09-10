@@ -386,7 +386,10 @@ export function repointThread<T extends { threadId?: string | null }>(
 /** How far in the opening record is looked for. Session metadata carries the whole system prompt. */
 const SESSION_META_SCAN_BYTES = 8 * 1024 * 1024;
 
-export async function readRolloutHistoryBase(file: string): Promise<RolloutHistoryBase | null> {
+export type CodexRolloutMetadata = { id: string | null; source: unknown; historyBase: RolloutHistoryBase | null };
+
+/** Reads just the opening record, never the conversation's turns. */
+export async function readCodexRolloutMetadata(file: string): Promise<CodexRolloutMetadata | null> {
   let head: string | null = null;
   let buffer: Buffer = Buffer.alloc(0);
   const stream = createReadStream(file, { start: 0, end: SESSION_META_SCAN_BYTES - 1 });
@@ -404,11 +407,39 @@ export async function readRolloutHistoryBase(file: string): Promise<RolloutHisto
   if (head === null) return null;
   let record: any;
   try { record = JSON.parse(head); } catch { return null; }
+  if (record?.type !== "session_meta") return null;
   const base = record?.payload?.history_base ?? record?.payload?.historyBase;
   const threadId = String(base?.thread_id ?? base?.threadId ?? "");
   const endByteOffset = Number(base?.end_byte_offset ?? base?.endByteOffset);
-  if (!threadId || !Number.isSafeInteger(endByteOffset) || endByteOffset <= 0) return null;
-  return { threadId, endByteOffset };
+  const id = record?.payload?.id ?? record?.payload?.session_id;
+  return {
+    id: typeof id === "string" && id ? id : null,
+    source: record?.payload?.source,
+    historyBase: threadId && Number.isSafeInteger(endByteOffset) && endByteOffset > 0 ? { threadId, endByteOffset } : null,
+  };
+}
+
+export async function readRolloutHistoryBase(file: string): Promise<RolloutHistoryBase | null> {
+  return (await readCodexRolloutMetadata(file))?.historyBase ?? null;
+}
+
+export function isCodexSubagentSource(source: unknown): boolean {
+  return source === "subagent" || Boolean(source && typeof source === "object" && "subagent" in source);
+}
+
+/** A filename or a Hook path alone is not proof of the thread it contains. */
+export async function verifyCodexRollout(file: string, threadId: string): Promise<boolean> {
+  const meta = await readCodexRolloutMetadata(file);
+  if (!meta?.id) return false; // empty/partial/unknown metadata is not durable
+  if (meta.id !== threadId) throw new Error(`CODEX_ROLLOUT_ID_MISMATCH:${threadId}:${meta.id}`);
+  if (isCodexSubagentSource(meta.source)) throw new Error(`CODEX_ROLLOUT_IS_SUBAGENT:${threadId}`);
+  return true;
+}
+
+export async function findVerifiedCodexRollout(threadId: string, hint?: string | null): Promise<string | null> {
+  const file = await locateCodexRollout(threadId, hint);
+  if (!file) return null;
+  return await verifyCodexRollout(file, threadId) ? file : null;
 }
 
 /** The same parse, fed from disk, so file size bounds the time it takes and not the memory it needs. */
@@ -421,7 +452,10 @@ export async function locateCodexRollout(threadId: string, hintedPath?: string |
     try {
       const stat = await fs.stat(hintedPath);
       if (stat.isFile()) return path.resolve(hintedPath);
-    } catch { /* fall through to the sessions search */ }
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      // A removed cached path is looked up again in the sessions directory.
+    }
   }
   const sessionsRoot = path.join(path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex")), "sessions");
   const wanted = `${threadId}.jsonl`.toLowerCase();
@@ -430,7 +464,10 @@ export async function locateCodexRollout(threadId: string, hintedPath?: string |
     const directory = stack.pop()!;
     let entries: Array<import("node:fs").Dirent>;
     try { entries = await fs.readdir(directory, { withFileTypes: true }); }
-    catch { continue; }
+    catch (error: any) {
+      if (error?.code === "ENOENT") continue;
+      throw error; // an unreadable directory is not proof that history is absent
+    }
     for (const entry of entries) {
       const candidate = path.join(directory, entry.name);
       if (entry.isDirectory()) stack.push(candidate);

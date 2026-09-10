@@ -17,6 +17,7 @@ import {
 } from "./prompt-submit.js";
 import { inspectCodexSubmission, reconcileCodexTurn, transcriptCursor, type TranscriptCursor } from "./transcript-reconciliation.js";
 import { waitForNativeThreadIdle } from "./native-thread-idle.js";
+import { isCodexSubagentSource, readCodexRolloutMetadata } from "./codex-history.js";
 
 const COMPLETED_CACHE_LIMIT = 100;
 const execFileAsync = promisify(execFile);
@@ -112,6 +113,9 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
   readonly rpc: QueueRpc;
   private launchReady: Deferred<CodexTuiSessionInfo> | null = null;
   private launchError: Error | null = null;
+  private expectedResumeId: string | null = null;
+  private hookGeneration = 0;
+  private hookWork: Promise<void> = Promise.resolve();
   private attached: CodexTuiSessionInfo | null = null;
   private readonly turns = new Map<string, TurnState>();
   private readonly completed = new Map<string, { turn: any; items: any[] }>();
@@ -143,6 +147,7 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
     bypassHookTrust?: boolean;
   }): Promise<AgentProcessLaunch> {
     this.reset("Codex session is restarting.");
+    this.expectedResumeId = options.launch.mode === "resume" ? options.launch.sessionId : null;
     this.launchReady = deferred<CodexTuiSessionInfo>();
     await fs.access(options.hookScriptPath);
     const { node, script } = await resolveHookCommandPaths(options.hookScriptPath, process.execPath);
@@ -213,8 +218,10 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
    * first prompt and confirm what is recorded here.
    */
   async attachKnownSession(info: CodexTuiSessionInfo): Promise<CodexTuiSessionInfo> {
+    const generation = this.hookGeneration;
     if (this.launchError) throw this.launchError;
     const cursor = await transcriptCursor(info.transcriptPath);
+    if (generation !== this.hookGeneration) throw new Error("CODEX_TUI_LAUNCH_REPLACED");
     if (this.launchError) throw this.launchError;
     this.attached = { ...info };
     this.sessionCursor = cursor;
@@ -235,14 +242,48 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
     return result.value;
   }
 
-  async handleHook(payload: any): Promise<void> {
+  handleHook(payload: any): Promise<void> {
+    const generation = this.hookGeneration;
+    const task = this.hookWork.catch(() => undefined).then(async () => {
+      if (generation === this.hookGeneration) await this.applyHook(payload, generation);
+    });
+    this.hookWork = task;
+    return task;
+  }
+
+  private async applyHook(payload: any, generation: number): Promise<void> {
+    if (this.launchError) return;
     const eventName = String(payload?.hook_event_name ?? payload?.hookEventName ?? "");
     const sessionId = String(payload?.session_id ?? payload?.sessionId ?? this.attached?.sessionId ?? "");
-    const transcriptPath = stringOrNull(payload?.transcript_path ?? payload?.transcriptPath);
-    if (this.attached && transcriptPath) this.attached.transcriptPath = transcriptPath;
+    let transcriptPath = stringOrNull(payload?.transcript_path ?? payload?.transcriptPath);
+    if (isCodexSubagentSource(payload?.source)) return;
+    // Reject unrelated hooks before touching the attached transcript or turns.
+    if (eventName !== "SessionStart" && (!sessionId || (this.attached && sessionId !== this.attached.sessionId))) return;
+    if (eventName === "SessionStart" && !this.attached && this.expectedResumeId && sessionId !== this.expectedResumeId) return;
+    if (transcriptPath && (eventName === "SessionStart" || transcriptPath !== this.attached?.transcriptPath)) {
+      const meta = await readCodexRolloutMetadata(transcriptPath).catch((error: any) => {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      });
+      if (generation !== this.hookGeneration) return;
+      if (isCodexSubagentSource(meta?.source)) return;
+      if (meta?.id && meta.id !== sessionId) throw new Error(`CODEX_HOOK_TRANSCRIPT_MISMATCH:${sessionId}:${meta.id}`);
+      if (eventName === "SessionStart" && payload?.source === "compact" && this.attached && sessionId !== this.attached.sessionId
+        && meta?.historyBase?.threadId !== this.attached.sessionId) {
+        throw new Error(`CODEX_COMPACT_THREAD_UNVERIFIED:${sessionId}`);
+      }
+      // A first hook can beat the rollout flush. Follow its live id, but never
+      // feed an unverified path to history reconciliation.
+      if (!meta?.id) transcriptPath = null;
+    }
+    if (eventName === "SessionStart" && payload?.source === "compact" && this.attached && sessionId !== this.attached.sessionId && !transcriptPath) {
+      throw new Error(`CODEX_COMPACT_THREAD_UNVERIFIED:${sessionId}`);
+    }
 
     if (eventName === "SessionStart") {
       if (!sessionId) throw new Error("CODEX_SESSION_ID_MISSING");
+      const cursor = await transcriptCursor(transcriptPath);
+      if (generation !== this.hookGeneration) return;
       if (this.attached?.sessionId && this.attached.sessionId !== sessionId) {
         const message = `Codex switched from session ${this.attached.sessionId} to ${sessionId}.`;
         if (this.submission) this.rejectSubmission(this.submission, new Error(message));
@@ -255,12 +296,13 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
         source: stringOrNull(payload?.source),
       };
       this.attached = info;
-      this.sessionCursor = await transcriptCursor(transcriptPath);
+      this.sessionCursor = cursor;
       this.launchReady?.resolve(info);
       this.emit("session", info);
+      if (payload?.source === "compact") this.emit("compacted", { sessionId, transcriptPath });
       return;
     }
-    if (!sessionId || (this.attached && sessionId !== this.attached.sessionId)) return;
+    if (this.attached && transcriptPath) this.attached.transcriptPath = transcriptPath;
     if (eventName === "UserPromptSubmit") {
       this.acceptPrompt(payload, sessionId);
       return;
@@ -295,6 +337,7 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
   }
 
   observeTerminalExit(message = "Codex TUI exited before the turn produced a final answer."): void {
+    this.hookGeneration += 1;
     this.launchError = new Error(message);
     if (this.submission) this.rejectSubmission(this.submission, new Error(message));
     for (const turn of [...this.turns.values()]) this.completeTurn(turn, "interrupted", "", message);
@@ -562,6 +605,8 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
   }
 
   private reset(message: string): void {
+    this.hookGeneration += 1;
+    this.expectedResumeId = null;
     this.submissionReservation += 1;
     this.reservationInFlight = false;
     if (this.submission) this.rejectSubmission(this.submission, new Error(message));

@@ -1,6 +1,6 @@
 import { isoNow } from "../shared/schemas.js";
-import { readCodexThreadForHistory } from "./codex-history.js";
-import { durableThreadOrigin } from "./codex-thread-fallback.js";
+import { findVerifiedCodexRollout, readCodexThreadForHistory } from "./codex-history.js";
+import { durableThreadOrigin, rememberDurableThread } from "./codex-thread-fallback.js";
 import { syncHistory, type HistoryReport } from "./history.js";
 import type { StorageService } from "./storage.js";
 import type { TuiThreadSelection } from "./tui-protocol.js";
@@ -38,8 +38,7 @@ export async function syncTerminalThreadSelection(options: {
    * Whether a thread has a rollout on disk. A thread that `thread/start` just
    * created has none until the first prompt lands, and recording such an id as
    * the origin of the switch loses the way back to the conversation (see
-   * `durableThreadOrigin`). Absent, every thread is assumed durable, which is
-   * the behaviour this had before.
+   * `durableThreadOrigin`). Absent, verify the actual rollout header.
    */
   isDurableThread?: (threadId: string) => Promise<boolean>;
 }): Promise<TerminalThreadSwitchResult | null> {
@@ -65,14 +64,14 @@ export async function syncTerminalThreadSelection(options: {
     if (!announcedCwd) throw new Error("TUI_THREAD_CWD_MISSING");
     const announcedSessionId = nonEmptyString(selection.thread?.sessionId) ?? targetThreadId;
     const switchedAt = isoNow();
-    const previousIsDurable = options.isDurableThread
-      ? await options.isDurableThread(previousThreadId).catch(() => true)
-      : true;
+    const probe = options.isDurableThread ?? (async (id: string) => Boolean(await findVerifiedCodexRollout(id)));
+    const previousIsDurable = await probe(previousThreadId).catch(() => false);
     const fromThreadId = durableThreadOrigin({
       previousThreadId,
       previousIsDurable,
       carriedFromThreadId: before.tab.session.lastThreadSwitch?.fromThreadId ?? null,
     });
+    const lastDurableThreadId = await rememberDurableThread(before.tab.session, targetThreadId, async (id) => id === previousThreadId ? previousIsDurable : probe(id));
 
     // Bind first so any new turn emitted immediately after the TUI response is
     // attributed to the selected thread, then subscribe this controller client.
@@ -84,6 +83,7 @@ export async function syncTerminalThreadSelection(options: {
         workingDirectory: announcedCwd,
         threadId: targetThreadId,
         sessionId: announcedSessionId,
+        lastDurableThreadId,
         connectedAt: switchedAt,
         lastError: null,
         lastThreadSwitch: {

@@ -1,6 +1,96 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildCodexHookOverride, buildCodexTuiLaunch, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, codexTuiReady, CodexTuiManager, resolveHookCommandPaths, spaceFreePath } from "./codex-tui.js";
 import { SLASH_COMMAND_NO_TURN } from "./prompt-submit.js";
+import * as history from "./codex-history.js";
+
+describe("Codex hook identity", () => {
+  let root = "";
+  let manager: CodexTuiManager;
+  afterEach(async () => {
+    await manager?.stop();
+    vi.restoreAllMocks();
+    if (root) await rm(root, { recursive: true, force: true });
+    root = "";
+  });
+  async function setup() {
+    root = await mkdtemp(path.join(os.tmpdir(), "promptor-hook-identity-"));
+    manager = new CodexTuiManager("identity", { write: () => undefined } as any);
+    return manager;
+  }
+  async function transcript(id: string, extra: object = {}) {
+    const file = path.join(root, `${id}.jsonl`);
+    await writeFile(file, JSON.stringify({ type: "session_meta", payload: { id, source: "cli", ...extra } }) + "\n");
+    return file;
+  }
+  it("rejects a foreign path before changing session, transcript or active turn", async () => {
+    await setup();
+    const file = await transcript("a");
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "a", transcript_path: file });
+    await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "a", turn_id: "turn-a", prompt: "still running" });
+    const foreign = await transcript("b");
+    await manager.handleHook({ hook_event_name: "Stop", session_id: "b", transcript_path: foreign, turn_id: "turn-a" });
+    await expect(manager.handleHook({ hook_event_name: "SessionStart", session_id: "c", transcript_path: foreign })).rejects.toThrow("CODEX_HOOK_TRANSCRIPT_MISMATCH");
+    expect(manager.session?.sessionId).toBe("a");
+    expect(manager.session?.transcriptPath).toBe(file);
+    expect(manager.rpc.activeTurnIds("a")).toEqual(["turn-a"]);
+  });
+  it("ignores inherited subagent hooks but still allows an explicit resume", async () => {
+    await setup();
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "a", transcript_path: await transcript("a") });
+    const child = await transcript("child", { source: { subagent: { spawn: { parent_thread_id: "a" } } } });
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "a", transcript_path: child, source: "startup" });
+    expect(manager.session?.sessionId).toBe("a");
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "b", transcript_path: await transcript("b"), source: "resume" });
+    expect(manager.session?.sessionId).toBe("b");
+  });
+  it("accepts compact on the current thread and a verified continuation only", async () => {
+    await setup();
+    const file = await transcript("a"), compacted = vi.fn();
+    manager.on("compacted", compacted);
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "a", transcript_path: file });
+    await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "a", turn_id: "turn-a", prompt: "work" });
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "a", transcript_path: file, source: "compact" });
+    expect(manager.rpc.activeTurnIds("a")).toEqual(["turn-a"]);
+    await expect(manager.handleHook({ hook_event_name: "SessionStart", session_id: "b", transcript_path: await transcript("b"), source: "compact" }))
+      .rejects.toThrow("CODEX_COMPACT_THREAD_UNVERIFIED");
+    const continuation = await transcript("b", { history_base: { thread_id: "a", end_byte_offset: 100 } });
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "b", transcript_path: continuation, source: "compact" });
+    expect(manager.session?.sessionId).toBe("b");
+    expect(compacted).toHaveBeenCalledTimes(2);
+  });
+  it("does not accept a different session during an explicit resume startup", async () => {
+    await setup();
+    await manager.beginLaunch({ cwd: root, launch: { mode: "resume", sessionId: "requested" }, hookScriptPath: "scripts/codex-hook.mjs" });
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "other", source: "startup" });
+    expect(manager.session).toBeNull();
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "requested", source: "resume" });
+    expect(manager.session?.sessionId).toBe("requested");
+  });
+  it("discards a SessionStart whose metadata read finishes after closing", async () => {
+    await setup();
+    let release!: (meta: history.CodexRolloutMetadata) => void;
+    const delayed = new Promise<history.CodexRolloutMetadata>((resolve) => { release = resolve; });
+    const read = vi.spyOn(history, "readCodexRolloutMetadata").mockReturnValue(delayed);
+    const connected = vi.fn();
+    manager.on("session", connected);
+    const hook = manager.handleHook({ hook_event_name: "SessionStart", session_id: "a", transcript_path: path.join(root, "a.jsonl") });
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+    await manager.stop();
+    release({ id: "a", source: "cli", historyBase: null });
+    await hook;
+    expect(manager.session).toBeNull();
+    expect(connected).not.toHaveBeenCalled();
+  });
+  it("does not let a late hook reattach an exited terminal", async () => {
+    await setup();
+    manager.observeTerminalExit("closed");
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "late" });
+    expect(manager.session).toBeNull();
+  });
+});
 
 describe("Codex native PTY/hooks provider", () => {
   it("builds per-run hooks and keeps every Codex argument in an argv slot", () => {

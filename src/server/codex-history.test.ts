@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { mergeRolloutTurns, parseCodexRollout, readCodexRollout, readCodexThreadForHistory, continuesThread, repointThread } from "./codex-history.js";
+import { mergeRolloutTurns, parseCodexRollout, readCodexRollout, readCodexThreadForHistory, continuesThread, repointThread, readCodexRolloutMetadata, findVerifiedCodexRollout } from "./codex-history.js";
 
 const line = (value: unknown) => JSON.stringify(value);
 const event = (type: string, turnId: string, extra: Record<string, unknown> = {}, timestamp = "2026-08-25T14:22:20.489Z") =>
@@ -140,6 +140,25 @@ describe("Codex rollout history", () => {
 });
 
 describe("reading a rollout from disk", () => {
+  it("verifies the opening identity without reading the conversation", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "promptor-rollout-identity-"));
+    try {
+      const file = path.join(root, "rollout-thread-a.jsonl");
+      await writeFile(file, line({ type: "session_meta", payload: { id: "thread-a", source: "cli", base_instructions: "x".repeat(200_000), history_base: { thread_id: "parent", end_byte_offset: 100 } } }) + "\n" + "unparseable history".repeat(100_000));
+      expect(await readCodexRolloutMetadata(file)).toEqual({ id: "thread-a", source: "cli", historyBase: { threadId: "parent", endByteOffset: 100 } });
+      expect(await findVerifiedCodexRollout("thread-a", file)).toBe(file);
+      await expect(findVerifiedCodexRollout("thread-b", file)).rejects.toThrow("CODEX_ROLLOUT_ID_MISMATCH");
+      await writeFile(file, line({ type: "session_meta", payload: { id: "thread-a", source: { subagent: { spawn: { parent_thread_id: "parent" } } } } }) + "\n");
+      await expect(findVerifiedCodexRollout("thread-a", file)).rejects.toThrow("CODEX_ROLLOUT_IS_SUBAGENT");
+      for (const unknown of ["", '{"type":"session_meta",', '{}\n', '{"type":"session_meta","payload":{}}\n']) {
+        await writeFile(file, unknown);
+        expect(await findVerifiedCodexRollout("thread-a", file)).toBeNull();
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("streams the file instead of holding it whole", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-rollout-"));
     try {

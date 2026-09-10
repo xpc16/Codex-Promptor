@@ -394,6 +394,17 @@ API->>PTY: 启动 PowerShell 和 codex --remote resume id --no-alt-screen
 
 `cwd` 优先采用 TUI 请求中的实时 override，其次才使用 stored thread metadata，避免页面工作路径与终端状态栏不一致。重复成功响应按 tab 串行处理，目标已经绑定时直接跳过。
 
+#### 6.3.2 可恢复会话指针（PTY/hooks 与 App Server 共用）
+
+`session.threadId` 表示当前运行的线程；可选字段 `session.lastDurableThreadId` 独立保存最后核验可恢复的线程。旧 JSON 无需批量迁移，在打开、切换及首次有记录的轮次事件中逐步补记。不得将临时线程 ID 或 `lastThreadSwitch` 这类界面提示记录当作唯一恢复依据。
+
+- 两条连接路径复用 `rememberDurableThread`：当前目标有真实、身份一致且非子代理的 rollout 时才更新恢复指针；连续切换到未落盘线程时保留此前已核验的指针。
+- 重开复用 `resolveSavedCodexThread`：依次检查当前 ID、独立恢复指针、旧切换来源及经本标签 Prompt 佐证的缓存 ID。所有候选都重新校验；权限错误、身份不符不得当作“文件不存在”后猜测其他会话。无可信候选则在启动 CLI 前明确报错，保留原数据。
+- 文件核验复用有上限的首条 `session_meta` 读取，不读取整段对话；正常重开不扫描标签缓存。首次落盘后的轮次事件补记指针，已补记的后续轮次不重复读文件头或写索引，不新增远端轮询。
+- Hook 校验先于修改绑定、历史路径或活动轮次：保留每次启动的 nonce 校验，拒绝显式恢复启动期间的异会话事件，忽略子代理来源，检查 transcript 身份，并丢弃关闭/重启前尚未处理完的旧事件。
+- 同 ID 的 `SessionStart(source=compact)` 不视为切换；不同 ID 的 compact 只有在文件头 `history_base` 指向当前线程时才作为续接接受。显式 `/resume`、`/new`、`/fork` 仍按正常流程跟随。
+- 回退后，PTY 启动、加载等待、controller 订阅及历史读取必须全部使用同一已选定的 ID，不能继续引用回退前的标签快照。
+
 ### 6.4 关闭与重新打开对话
 
 关闭顺序固定为：暂停队列并中断活动 turn、终止该标签的 PowerShell/Codex TUI 完整进程树、关闭该标签的 TUI 转发端口、关闭 controller、终止该标签的 App Server 完整进程树、确认端口释放，最后写入 `session.state=closed`。关闭成功后，外部 `codex resume <thread-id>` 必须可以立即取得 writer。

@@ -26,7 +26,7 @@ import { syncCursorHistory } from "./cursor-history.js";
 import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
 import { buildConversationMarkdown, conversationExportFilename } from "./conversation-export.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
-import { continuesThread, locateCodexRollout, readCodexRollout, readCodexRolloutThread, readCodexThreadForHistory, readRolloutHistoryBase, repointThread } from "./codex-history.js";
+import { continuesThread, findVerifiedCodexRollout, locateCodexRollout, readCodexRollout, readCodexRolloutThread, readCodexThreadForHistory, readRolloutHistoryBase, repointThread } from "./codex-history.js";
 import { decideStall, noteRolloutSize, TURN_STALL_POLL_MS, type RolloutProgress } from "./turn-stall.js";
 import { appendBoundedLines } from "./log-file.js";
 import { readCodexRolloutCached } from "./codex-rollout-cache.js";
@@ -69,7 +69,7 @@ import { nameForSession } from "../shared/session-tab-name.js";
 import { classifyNetworkScope, isLoopbackAddress, type NetworkScope } from "./traffic-scope.js";
 import { buildIndexDelta, indexDeltaIsEmpty } from "../shared/index-delta.js";
 import { createTrafficLog } from "./traffic-log.js";
-import { cachedResumeThread, chooseResumeThread } from "./codex-thread-fallback.js";
+import { cachedResumeThread, rememberDurableThread, resolveSavedCodexThread } from "./codex-thread-fallback.js";
 import { syncTerminalThreadSelection } from "./terminal-thread-sync.js";
 import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionHandler } from "./tui-protocol.js";
 import { TuiProxyPool } from "./tui-proxy.js";
@@ -635,7 +635,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         runner: runners.get(tabId),
         selection,
         isCurrent: () => codex.existing(tabId) === manager,
-        isDurableThread: async (threadId) => Boolean(await rolloutFile(threadId)),
+        isDurableThread,
       });
       if (!result) return;
       emit(tabId, { type: "thread.switched", switch: result });
@@ -672,7 +672,23 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     await threadSwitches.get(tabId);
   };
 
+  // Event-driven checkpoint: once promoted, subsequent turns cost no file read
+  // or metadata write. No periodic scan, history reload, or remote polling.
+  const rememberCurrentDurableThread = async (tabId: string, threadId: string, hint?: string | null): Promise<void> => {
+    const tab = await storage.getTabMeta(tabId);
+    if (tab.session.provider !== "codex" || tab.session.threadId !== threadId || tab.session.lastDurableThreadId === threadId) return;
+    if (!await durableRolloutFile(threadId, hint)) return;
+    await storage.updateTab(tabId, (current) => current.session.provider === "codex" && current.session.threadId === threadId
+      ? { ...current, session: { ...current.session, lastDurableThreadId: threadId }, updatedAt: isoNow() }
+      : current);
+  };
+
   codex.on("created", ({ tabId, manager }: { tabId: string; manager: AppServerManager }) => {
+    for (const event of ["turnStarted", "turnCompleted"]) manager.rpc.on(event, (turn: any) => {
+      void awaitThreadSwitch(tabId).then(async () => {
+        if (codex.existing(tabId) === manager && turn.threadId) await rememberCurrentDurableThread(tabId, turn.threadId);
+      }).catch(() => undefined);
+    });
     manager.rpc.on("turnCompleted", async (event: any) => {
       try {
         const tab = await storage.getTabMeta(tabId);
@@ -728,7 +744,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       if (currentManager !== manager) return;
       const tab = await storage.getTabMeta(tabId);
       const fromThreadId = tab.session.threadId;
-      if (tab.session.provider !== provider || tab.session.state !== "ready" || fromThreadId === session.sessionId) return;
+      if (tab.session.provider !== provider || tab.session.state !== "ready") return;
+      if (fromThreadId === session.sessionId) {
+        if (provider === "codex") await rememberCurrentDurableThread(tabId, session.sessionId, session.transcriptPath);
+        return;
+      }
       // Nothing to switch away from: a new Codex conversation is bound here,
       // when the first submitted prompt finally makes Codex create the thread.
       const adopting = !fromThreadId;
@@ -742,10 +762,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       // the old rollout as the new one's history base. Following that is right;
       // calling it a conversation switch is not, because nobody switched.
       const rolloutPath = provider === "codex"
-        ? session.transcriptPath ?? await rolloutFile(session.sessionId)
+        ? await durableRolloutFile(session.sessionId, session.transcriptPath)
         : null;
       const historyBase = rolloutPath ? await readRolloutHistoryBase(rolloutPath).catch(() => null) : null;
       const method = continuesThread(historyBase, fromThreadId) ? "thread/fork" as const : "session/start" as const;
+      const lastDurableThreadId = provider === "codex"
+        ? await rememberDurableThread(tab.session, session.sessionId, async (id) => id === session.sessionId ? Boolean(rolloutPath) : isDurableThread(id))
+        : null;
       const workingDirectory = await validWorkingDirectory(session.cwd) ?? tab.session.workingDirectory;
       await storage.updateTab(tabId, (current) => ({
         ...current,
@@ -756,6 +779,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           workingDirectory,
           threadId: session.sessionId,
           sessionId: session.sessionId,
+          lastDurableThreadId,
           connectedAt: switchedAt,
           lastError: null,
           lastThreadSwitch: adopting
@@ -776,7 +800,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         if (answers.moved) await storage.writeAnswers(tabId, { ...bundle.answers, answers: answers.records });
       }
       if (provider === "codex") {
-        const thread = await readCodexRolloutThread(session.sessionId, session.transcriptPath);
+        const thread = rolloutPath ? await readCodexRolloutThread(session.sessionId, rolloutPath) : null;
         if (thread) await syncHistory(storage, tabId, thread, { mode: "merge" });
       } else if (provider === "claude") await syncClaudeHistory(storage, tabId, session.sessionId, session.transcriptPath);
       else await syncCursorHistoryIfAvailable(tabId, session.sessionId, session.transcriptPath);
@@ -830,6 +854,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   };
 
   codexTui.on("created", ({ tabId, manager }: { tabId: string; manager: CodexTuiManager }) => {
+    for (const event of ["turnStarted", "turnCompleted"]) manager.on(event, (turn: any) => {
+      void awaitThreadSwitch(tabId).then(async () => {
+        if (codexTui.existing(tabId) === manager && turn.threadId) await rememberCurrentDurableThread(tabId, turn.threadId, manager.session?.transcriptPath);
+      }).catch(() => undefined);
+    });
     manager.on("submissionUnconfirmed", () => markSubmissionUnconfirmed(tabId));
     manager.on("session", (session) => void scheduleNativeSessionSwitch("codex", tabId, manager, session));
     manager.on("compacted", () => scheduleCompactionTerminalResync(tabId));
@@ -940,6 +969,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const lease = issueHookLease("codex", tabId);
     try {
       const manager = codexTui.get(tabId);
+      const transcriptPath = launch.mode === "resume" ? await durableRolloutFile(launch.sessionId) : null;
+      if (launch.mode === "resume" && !transcriptPath) {
+        throw new Error(`CODEX_SESSION_NOT_SAVED: No saved session found with ID ${launch.sessionId}.`);
+      }
       const theme = (await storage.readIndex()).ui.theme;
       const hookScriptPath = path.join(rootDir, "scripts", "codex-hook.mjs");
       const launcherPath = path.join(rootDir, "scripts", "launch-agent.ps1");
@@ -970,7 +1003,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const session = await manager.attachKnownSession({
         sessionId: launch.sessionId,
         cwd,
-        transcriptPath: await rolloutFile(launch.sessionId),
+        transcriptPath,
         source: "resume",
       });
       return { manager, session };
@@ -1195,32 +1228,19 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
    * under the thread that switch left behind.
    */
   const resolveCodexResumeThread = async (tab: TabMeta): Promise<string> => {
-    const threadId = tab.session.threadId!;
-    const fallbackThreadId = tab.session.lastThreadSwitch?.fromThreadId ?? null;
-    const evidence = {
-      threadId,
-      fallbackThreadId,
-      threadHasRollout: Boolean(await rolloutFile(threadId)),
-      fallbackHasRollout: fallbackThreadId ? Boolean(await rolloutFile(fallbackThreadId)) : false,
-    };
-    let choice = chooseResumeThread(evidence);
-    // Only read the legacy cache on a broken pointer, never on the normal
-    // reopen path. Do not guess by cwd/name: many tabs share this directory.
-    if (!evidence.threadHasRollout && !choice.fellBack) {
+    const choice = await resolveSavedCodexThread(tab.session, isDurableThread, async () => {
       const cache = await fs.readFile(path.join(storage.tabDir(tab.id), "rollout-cache.json"), "utf8")
         .then((text) => JSON.parse(text) as unknown).catch(() => null);
       const prompts = await storage.readPromptsOnly(tab.id);
-      const cachedThreadId = cachedResumeThread(cache, prompts.prompts);
-      choice = chooseResumeThread({
-        ...evidence,
-        cachedThreadId,
-        cachedHasRollout: cachedThreadId ? Boolean(await rolloutFile(cachedThreadId)) : false,
-      });
-    }
-    if (!choice.fellBack) return threadId;
-    await storage.updateTab(tab.id, (current) => ({
+      return cachedResumeThread(cache, prompts.prompts);
+    });
+    if (choice.fellBack || tab.session.lastDurableThreadId !== choice.threadId) await storage.updateTab(tab.id, (current) => ({
       ...current,
-      session: { ...current.session, threadId: choice.threadId, sessionId: choice.threadId, lastThreadSwitch: null },
+      session: {
+        ...current.session,
+        lastDurableThreadId: choice.threadId,
+        ...(choice.fellBack ? { threadId: choice.threadId, sessionId: choice.threadId, lastThreadSwitch: null } : {}),
+      },
       updatedAt: isoNow(),
     }));
     return choice.threadId;
@@ -1392,6 +1412,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         updatedAt: now,
       }));
       await emitSnapshot(tabId);
+      const resumeThreadId = await resolveCodexResumeThread(tab);
       const manager = codex.get(tabId);
       const rpc = await recorder.step("appServer", () => manager.ensureReady());
       await rememberAppServer(storage, tabId, manager);
@@ -1399,15 +1420,14 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       await updateTerminalRuntime(storage, tabId, { state: "starting", lastStartedAt: now, lastExitCode: null, lastError: null });
       const tuiUrl = await startTuiProxy(tabId, manager);
       await restoreTerminalSize(storage, pty, tabId);
-      const resumeThreadId = await resolveCodexResumeThread(tab);
       await recorder.step("pty", () => pty.start(tabId, tab.session.workingDirectory!, tuiUrl, { mode: "resume", threadId: resumeThreadId }, theme));
-      await recorder.step("threadLoaded", () => waitForThreadLoaded(rpc, tab.session.threadId!, 30_000, 200, () => pty.startupError(tabId)));
+      await recorder.step("threadLoaded", () => waitForThreadLoaded(rpc, resumeThreadId, 30_000, 200, () => pty.startupError(tabId)));
       // thread/resume ships the whole conversation back and took eleven seconds
       // on the two largest here, but nothing on screen needs it: the terminal is
       // the TUI's own and history comes off the rollout. Only dispatching a turn
       // does, and CodexRpcClient makes that wait. So the tab opens now and the
       // subscription lands behind it.
-      subscribeInBackground(tab, rpc);
+      subscribeInBackground(await storage.getTabMeta(tabId), rpc);
       // Best effort, deliberately. Nothing the conversation needs to work
       // depends on this: the terminal is the TUI's own and the queue talks to
       // the App Server. Failing the whole reopen over it left a usable session
@@ -1416,7 +1436,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       // all. It is reported instead, and everything else carries on.
       const historyError = await recorder.step("history", async (): Promise<string | null> => {
         try {
-          await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, tab.session.threadId!, cachedRollout(tabId)));
+          await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, resumeThreadId, cachedRollout(tabId)));
           return null;
         } catch (error) {
           return error instanceof Error ? error.message : String(error);
@@ -1627,6 +1647,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     if (found) rolloutPaths.set(threadId, found);
     return found;
   };
+  const durableRolloutFile = async (threadId: string, hint?: string | null): Promise<string | null> => {
+    const file = await findVerifiedCodexRollout(threadId, hint ?? rolloutPaths.get(threadId));
+    if (file) rolloutPaths.set(threadId, file);
+    else rolloutPaths.delete(threadId);
+    return file;
+  };
+  const isDurableThread = async (threadId: string, hint?: string | null): Promise<boolean> => Boolean(await durableRolloutFile(threadId, hint));
   const lastRolloutGrowth = async (threadId: string, nowMs: number): Promise<number | null> => {
     try {
       const file = await rolloutFile(threadId);
@@ -2682,6 +2709,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           : { imported: 0, skipped: 0, ignored: 0, repaired: 0 };
         const startupError = pty.startupError(tabId);
         if (startupError) throw new Error(startupError);
+        const lastDurableThreadId = session && await isDurableThread(session.sessionId, session.transcriptPath).catch(() => false) ? session.sessionId : null;
         // A new conversation has no thread yet: Codex creates one when the
         // first prompt is submitted, and the SessionStart hook that follows is
         // what binds it here. Recording null rather than inventing an id keeps
@@ -2695,6 +2723,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             workingDirectory: cwd,
             threadId: session?.sessionId ?? null,
             sessionId: session?.sessionId ?? null,
+            lastDurableThreadId,
             createdAt: current.session.createdAt ?? now,
             connectedAt: isoNow(),
             lastError: null,
@@ -2706,6 +2735,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         await clearSessionNotReadyError(storage, tabId);
         return reply.send({ data: { bundle: await readClientTab(tabId), report } });
       }
+      if (mode === "resume") await resolveSavedCodexThread({ threadId: resumeId }, isDurableThread, async () => null);
       let manager = codex.get(tabId);
       let rpc = await manager.ensureReady();
       await rememberAppServer(storage, tabId, manager);
@@ -2719,6 +2749,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         // one; its history arrives from the rollout below.
         thread = historyThreadFromResponse(await rpc.readThreadSummary(resumeId));
         threadId = String(thread?.id ?? thread?.threadId ?? resumeId);
+        if (threadId !== resumeId) throw new Error(`CODEX_RESUME_ID_MISMATCH:${resumeId}:${threadId}`);
       }
       if (mode === "resume" && !threadId) throw new Error("THREAD_ID_MISSING");
       // The TUI must make the first thread selection on this App Server. For a
@@ -2762,6 +2793,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         await rpc.resumeThread(threadId, cwd);
         report = await syncHistory(storage, tabId, await readCodexThreadForHistory(rpc, threadId, cachedRollout(tabId)));
       }
+      const lastDurableThreadId = await isDurableThread(threadId).catch(() => false) ? threadId : null;
       await storage.updateTab(tabId, (current) => ({
         ...current,
         session: {
@@ -2771,6 +2803,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           workingDirectory: cwd,
           threadId,
           sessionId: String(thread?.sessionId ?? threadId),
+          lastDurableThreadId,
           createdAt: current.session.createdAt ?? now,
           connectedAt: isoNow(),
           lastError: null,
