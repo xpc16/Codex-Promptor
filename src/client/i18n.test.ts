@@ -19,6 +19,8 @@ describe("interface localization", () => {
     expect(terminalStateLabel(zh, "running")).toBe("运行中");
     expect(en.errorText({ code: "SESSION_NOT_READY", message: "请先连接或恢复一个编程代理对话。" })).toBe("Connect or resume a coding-agent conversation first.");
     expect(zh.errorText({ code: "UNMAPPED", message: "raw diagnostic" })).toBe("raw diagnostic");
+    expect(zh.errorText({ code: "E2EE_BODY_UNREADABLE", message: "HTTP 403" })).toContain("加密数据");
+    expect(en.errorText({ code: "E2EE_BODY_UNREADABLE", message: "HTTP 403" })).toContain("encrypted data");
   });
 });
 

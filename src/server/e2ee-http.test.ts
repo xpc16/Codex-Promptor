@@ -1,7 +1,10 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { api } from "../client/api-client.js";
+import { deriveSessionKey } from "../client/e2ee-client.js";
+import { applyRequirement, useKey } from "../client/e2ee-gate.js";
 import { decodeBase64 } from "../shared/e2ee-keys.js";
 import { E2EE_BODY_CONTENT_TYPE, E2EE_BODY_HEADER } from "../shared/e2ee-http.js";
 import { createApp, type PromptorApp } from "./app.js";
@@ -67,6 +70,8 @@ describe("what actually crosses the tunnel", () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
+    await applyRequirement({ required: false });
     await app.promptor.close();
     await app.close();
     await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 60 }).catch(() => undefined);
@@ -130,5 +135,43 @@ describe("what actually crosses the tunnel", () => {
       payload: Buffer.from(sealHttpBody(Buffer.alloc(32, 9), JSON.stringify({ text: "从别处来的" }))),
     });
     expect(forged.statusCode).toBe(403);
+  });
+
+  it("sends bodyless page actions through the real encrypted parser without a false 403", async () => {
+    const e2ee = (await app.promptor.storage.getTabMeta(switchTabId)).session.e2ee!;
+    const pageKey = await deriveSessionKey(PASSPHRASE, e2ee.salt, e2ee.iterations);
+    await useKey(pageKey, false);
+    await applyRequirement({ required: true, fingerprint: e2ee.fingerprint });
+    const statuses: number[] = [];
+    vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
+      const headers = Object.fromEntries(new Headers(init.headers));
+      const response = await app.inject({
+        url, method: init.method as "GET" | "POST" | "DELETE",
+        headers: { ...headers, host: REMOTE_HOST, "x-codex-promptor-token": app.promptor.token },
+        payload: init.body ? Buffer.from(init.body as Uint8Array) : undefined,
+      });
+      statuses.push(response.statusCode);
+      return new Response(Uint8Array.from(response.rawPayload), {
+        status: response.statusCode,
+        headers: { [E2EE_BODY_HEADER]: String(response.headers[E2EE_BODY_HEADER] ?? "") },
+      });
+    });
+
+    await api(`/api/tabs/${tabId}/prompts`, { method: "POST", body: JSON.stringify({ text: "delete this fixture only" }) });
+    const promptId = (await app.promptor.storage.readTab(tabId)).prompts.prompts[0]!.id;
+    await api(`/api/tabs/${tabId}/prompts/${promptId}`, { method: "DELETE" });
+    expect((await app.promptor.storage.readTab(tabId)).prompts.prompts).toHaveLength(0);
+    // An unconfigured fixture reaches the route's normal validation, without
+    // ever launching a real shell or touching a user's running conversation.
+    for (const route of ["terminal/reopen", "session/close"]) {
+      await expect(api(`/api/tabs/${tabId}/${route}`, { method: "POST" }))
+        .rejects.toMatchObject({ code: "SESSION_NOT_READY", status: 400 });
+    }
+    expect(statuses).toEqual([200, 200, 400, 400]);
+
+    // A valid encrypted empty action must not weaken the local-only switch.
+    await expect(api(`/api/tabs/${switchTabId}/session/close`, { method: "POST" }))
+      .rejects.toMatchObject({ code: "E2EE_LOCAL_ONLY", status: 403 });
+    expect((await app.promptor.storage.getTabMeta(switchTabId)).session.state).toBe("ready");
   });
 });
