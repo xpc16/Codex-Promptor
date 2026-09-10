@@ -246,12 +246,17 @@ export class A2aService {
       const bundle = await this.deps.storage.readTab(tabId).catch(() => null);
       if (!bundle) continue;
       const prompt = bundle.prompts.prompts.find((item) => item.attempts.some((attempt) => attempt.attemptId === attemptId));
-      if (!prompt) continue;
-      if (prompt.status === "dispatching" || prompt.status === "running" || prompt.status === "pending") continue;
+      // The prompt it was waiting for is gone -- deleted, or its conversation
+      // rebuilt. There is nothing left to confirm, so settle rather than leave
+      // the root saying "ending" with nothing on the way.
+      if (prompt && ["dispatching", "running", "pending"].includes(prompt.status)) continue;
       const settled = await this.store.withRootLock(root.rootId, async () => {
         const current = await this.store.read(root.rootId);
         if (!current || current.status !== "ending" || current.pendingFinish?.attemptId !== attemptId) return null;
-        if (prompt.status === "completed") {
+        // A stop settles however its turn ended -- interrupting it is one of
+        // the ways a person stops a collaboration. Only a *completion* needs
+        // its turn to have actually succeeded.
+        if (!prompt || prompt.status === "completed" || current.pendingFinish.intent === "stop") {
           return this.store.write({
             ...current,
             status: current.pendingFinish.intent === "stop" ? "stopped" : "completed",
@@ -599,7 +604,13 @@ export class A2aService {
   async endRootFromUser(rootId: string, intent: "complete" | "stop"): Promise<A2aRoot> {
     const root = await this.store.read(rootId);
     if (!root) throw new A2aError("A2A_ROOT_NOT_FOUND", 404, "协作记录不存在。");
-    const outstanding = await this.outstandingWork(root, null);
+    // Stopping first removes work that has not started, so what is left is
+    // only what is genuinely in flight. Doing this the other way round bound
+    // the end to a queued item and then deleted it, leaving the root waiting
+    // for a prompt that no longer existed.
+    if (intent === "stop") await this.cancelPendingWork(root);
+    const outstanding = (await this.outstandingWork(root, null))
+      .filter((item) => intent !== "stop" || (item.status !== "pending" && item.attemptId));
     const settled = await this.store.withRootLock(rootId, async () => {
       const current = await this.store.read(rootId);
       if (!current) throw new A2aError("A2A_ROOT_NOT_FOUND", 404, "协作记录不存在。");
@@ -607,12 +618,17 @@ export class A2aService {
       if (intent === "complete" && outstanding.length) {
         throw new A2aError("A2A_FINISH_BLOCKED", 409, `还有 ${outstanding.length} 条任务未结束，请先等待或使用「停止协作」。`, false, { outstanding });
       }
-      if (!outstanding.length) {
+      // A second stop on a root that is already ending forces it. The turn it
+      // was waiting for may never report -- a submission the CLI never
+      // confirmed leaves one sitting in `dispatching` indefinitely -- and the
+      // person's own control has to win over waiting for it.
+      const forced = intent === "stop" && current.status === "ending";
+      if (!outstanding.length || forced) {
         return this.store.write({
           ...current,
           status: intent === "stop" ? "stopped" : "completed",
           endedAt: isoNow(),
-          endReason: intent === "stop" ? "stopped_by_user" : "completed_by_user",
+          endReason: forced ? "stopped_by_user_unconfirmed" : intent === "stop" ? "stopped_by_user" : "completed_by_user",
           pendingFinish: null,
         });
       }
@@ -630,10 +646,10 @@ export class A2aService {
         },
       });
     });
-    if (intent === "stop") await this.cancelPendingWork(settled);
     for (const participant of settled.members) this.deps.notifyTab(participant.tabId);
     return settled;
   }
+
 
   /** Every unfinished message of this root, anywhere, except the caller's own running turn. */
   private async outstandingWork(root: A2aRoot, exceptPromptId: string | null): Promise<Array<{ tabId: string; promptId: string; attemptId: string | null; status: string }>> {

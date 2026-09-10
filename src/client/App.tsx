@@ -1478,7 +1478,7 @@ function A2aRootBar({ root, onError }: { root: A2aRootSummary; onError: (error: 
     {root.advice !== "continue" && <span className="a2a-note">{t(`a2a.advice.${root.advice}` as "a2a.advice.wrap_up")}</span>}
     <span className="a2a-actions">
       <button className="link-button" disabled={busy !== null} onClick={() => void act("finish")}>{t(busy === "finish" ? "a2a.finishing" : "a2a.finish")}</button>
-      <button className="link-button" disabled={busy !== null} onClick={() => void act("stop")}>{t(busy === "stop" ? "a2a.finishing" : "a2a.stop")}</button>
+      <button className="link-button" disabled={busy !== null} title={root.status === "ending" ? t("a2a.stopAgain") : undefined} onClick={() => void act("stop")}>{t(busy === "stop" ? "a2a.finishing" : "a2a.stop")}</button>
     </span>
   </div>;
 }

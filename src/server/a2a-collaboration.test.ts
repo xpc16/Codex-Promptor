@@ -500,6 +500,50 @@ describe("agent to agent", () => {
     expect(stale.json().error.code).toBe("A2A_CONTEXT_INVALID");
   });
 
+  it("stops a collaboration whose queued work never started, without waiting on it", async () => {
+    // The queued item is cancelled, so there is nothing left in flight and the
+    // root settles at once. Binding the end to that item and then deleting it
+    // left the root saying "ending" with nothing on the way.
+    const from = await readyTab("协调");
+    const to = await readyTab("执行");
+    const rootPrompt = (await addPrompt(from, "@@ 分工")).json().data.prompt;
+    const { contextId } = await beginTurn(from, rootPrompt.id);
+    await call(from, { op: "send", contextId, requestId: "r1", to, text: "任务" });
+    await settleTurn(from, rootPrompt.id);
+    expect((await app.promptor.storage.readTab(to)).prompts.prompts).toHaveLength(1);
+
+    const stopped = await app.inject({ method: "POST", url: `/api/a2a/roots/${rootPrompt.id}/stop`, headers: local() });
+    expect(stopped.json().data).toMatchObject({ status: "stopped", endReason: "stopped_by_user" });
+    expect((await app.promptor.storage.readTab(to)).prompts.prompts).toHaveLength(0);
+    expect((await app.promptor.a2a.summaryForTab(from))!.active).toBe(false);
+  });
+
+  it("lets a second stop end a root whose turn never reported", async () => {
+    // A submission the CLI never confirms leaves its prompt in `dispatching`
+    // for good. The first stop waits for it, as designed; the second must not
+    // leave the person with no way out.
+    const tabId = await readyTab("协调");
+    const rootPrompt = (await addPrompt(tabId, "@@ 一直没有回执")).json().data.prompt;
+    await beginTurn(tabId, rootPrompt.id);
+    // beginTurn leaves the prompt running, which is what a wedged one looks like.
+    const first = await app.inject({ method: "POST", url: `/api/a2a/roots/${rootPrompt.id}/stop`, headers: local() });
+    expect(first.json().data.status).toBe("ending");
+    expect((await app.promptor.a2a.summaryForTab(tabId))!.active).toBe(true);
+
+    const second = await app.inject({ method: "POST", url: `/api/a2a/roots/${rootPrompt.id}/stop`, headers: local() });
+    expect(second.json().data).toMatchObject({ status: "stopped", endReason: "stopped_by_user_unconfirmed" });
+    expect((await app.promptor.a2a.summaryForTab(tabId))!.active).toBe(false);
+  });
+
+  it("settles a stop when its turn is interrupted rather than completed", async () => {
+    const tabId = await readyTab("协调");
+    const rootPrompt = (await addPrompt(tabId, "@@ 会被中断")).json().data.prompt;
+    await beginTurn(tabId, rootPrompt.id);
+    expect((await app.inject({ method: "POST", url: `/api/a2a/roots/${rootPrompt.id}/stop`, headers: local() })).json().data.status).toBe("ending");
+    await settleTurn(tabId, rootPrompt.id, "interrupted");
+    expect(await app.promptor.a2a.readRoot(rootPrompt.id)).toMatchObject({ status: "stopped", endReason: "stopped_by_user" });
+  });
+
   it("lets a person end a collaboration the agents left open", async () => {
     const from = await readyTab("协调");
     const rootPrompt = (await addPrompt(from, "@@ 一个人也能协作")).json().data.prompt;

@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import { A2aSkillError, parseSkillDocument, resolveRolePolicy } from "./a2a-policy.js";
 import { a2aAdvice, a2aBudget, DEFAULT_A2A_LIMITS } from "../shared/a2a.js";
 import { editedPromptPrefix, parsePromptPrefix } from "../shared/a2a-prefix.js";
+import { buildA2aPreamble, unsafePreambleCharacters } from "./a2a-preamble.js";
+import { DEFAULT_A2A_LIMITS as LIMITS } from "../shared/a2a.js";
 
 /**
  * The permission list and the prose that explains it live in one file, so the
@@ -144,6 +146,45 @@ describe("editing a prompt that is already in the queue", () => {
 
   it("still honours an explicit escape typed into an ordinary prompt", () => {
     expect(editedPromptPrefix({ text: "普通" }, "\\@@ 这是正文")).toEqual({ kind: "plain", text: "@@ 这是正文" });
+  });
+});
+
+describe("what the preamble may contain", () => {
+  /**
+   * A single U+2192 in the generated text was dropped between the PTY and the
+   * Codex transcript. The submitted text no longer equalled what the CLI
+   * recorded, submission was never confirmed, and the queue sat in
+   * `dispatching` with the answer already written above it. Nothing about that
+   * failure is visible, so it is caught here instead.
+   */
+  const preambleFor = (skillBody: string, role: string, policy: ReturnType<typeof parseSkillDocument>["policy"]) => buildA2aPreamble({
+    contextId: "attempt-1",
+    skillName: "central",
+    skillBody,
+    role,
+    level: 0,
+    permissionMode: "soft",
+    effective: resolveRolePolicy(policy, role, 0),
+    snapshot: { limits: LIMITS, budget: { revision: 1, usedMessages: 1, remainingMessages: 19, currentDepth: 0, remainingHops: 3, remainingSpawns: 3 }, advice: "continue" },
+    helperCommand: 'node "C:\app\scripts\a2a.mjs"',
+    selfTabId: "tab-1",
+    selfTabName: "协调者",
+    from: { tabId: "tab-2", tabName: "执行者", promptId: "p-1" },
+  });
+
+  it("flags a character that may not survive the trip", () => {
+    expect(unsafePreambleCharacters("可作用范围：list→all")).toEqual(["→"]);
+    expect(unsafePreambleCharacters("普通正文，list: all（含中文标点）")).toEqual([]);
+  });
+
+  it("generates nothing unsafe for any mode this app ships", async () => {
+    for (const name of ["central", "debate", "explore"]) {
+      const skill = parseSkillDocument(name, await fs.readFile(path.join(SKILLS_DIR, `${name}.md`), "utf8"));
+      for (const role of Object.keys(skill.policy.roles)) {
+        const offending = unsafePreambleCharacters(preambleFor(skill.body, role, skill.policy));
+        expect(offending, `${name}/${role} would submit ${JSON.stringify(offending)}`).toEqual([]);
+      }
+    }
   });
 });
 

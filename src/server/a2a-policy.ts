@@ -128,7 +128,7 @@ export function resolveRolePolicy(policy: A2aPolicy, role: string, level: number
 /** The permission paragraph injected into a dispatch. Generated, never hand-maintained. */
 export function describeRolePolicy(role: string, level: number, effective: A2aRolePolicy, mode: "soft" | "hard"): string {
   const targetLine = Object.entries(effective.targets)
-    .map(([op, scopes]) => `${op}→${(scopes ?? []).join("/")}`)
+    .map(([op, scopes]) => `${op}: ${(scopes ?? []).join("/")}`)
     .join("，");
   return [
     `当前角色：${role}（第 ${level} 层，${mode === "soft" ? "软约束：服务端不因角色规则拒绝，请自行遵守" : "硬约束：越界会被服务端拒绝"}）`,

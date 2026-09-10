@@ -61,7 +61,7 @@ export function buildA2aPreamble(input: PreambleInput): string {
     `上限：消息 ${snapshot.limits.messages} 条、深度 ${snapshot.limits.depth} 跳、创建对话 ${snapshot.limits.spawns} 个、每个目标每分钟 ${snapshot.limits.inboundPerMinute} 条。`,
     `当前：已用 ${snapshot.budget.usedMessages} 条，剩余 ${snapshot.budget.remainingMessages} 条；本条深度 ${snapshot.budget.currentDepth}，剩余 ${snapshot.budget.remainingHops} 跳；可创建 ${snapshot.budget.remainingSpawns} 个。`,
     `建议：${ADVICE_TEXT[snapshot.advice]}`,
-    "按完整往返路径规划：A→B→A 需要 2 跳。被限额拒绝后不要换 ID 或新建协作重试，改为写出已完成内容、证据、未完成内容与受限原因。",
+    "按完整往返路径规划：A 发给 B、B 再发回 A，需要 2 跳。被限额拒绝后不要换 ID 或新建协作重试，改为写出已完成内容、证据、未完成内容与受限原因。",
     "",
     `## 协作模式：${input.skillName}`,
     input.skillBody,
@@ -74,6 +74,32 @@ export function buildA2aPreamble(input: PreambleInput): string {
     "",
   ];
   return lines.join("\n");
+}
+
+/**
+ * Characters observed to survive a paste into the agent TUIs.
+ *
+ * ASCII, CJK, and CJK/fullwidth punctuation. This is a whitelist because the
+ * failure it prevents is silent and expensive: a single U+2192 in the
+ * generated preamble was dropped somewhere between the PTY and the Codex
+ * transcript, so the text the CLI recorded no longer equalled the text that
+ * was submitted, submission was never confirmed, and the queue sat in
+ * `dispatching` forever with the answer already written above it.
+ *
+ * Curly quotes are deliberately excluded: `sameSubmittedPrompt` already has
+ * to normalise those away for the same reason.
+ */
+const PREAMBLE_SAFE_CHARACTER = /[\t\n\r\x20-\x7E\u3000-\u303F\u4E00-\u9FFF\uFF00-\uFFEF]/;
+
+/**
+ * The distinct characters in generated preamble text that may not survive the
+ * trip. Empty is the only acceptable answer; a skill template that trips this
+ * has to say the same thing in plainer characters.
+ */
+export function unsafePreambleCharacters(text: string): string[] {
+  const offending = new Set<string>();
+  for (const character of text) if (!PREAMBLE_SAFE_CHARACTER.test(character)) offending.add(character);
+  return [...offending];
 }
 
 /** The text actually handed to the CLI. Kept separate from `prompt.text`, which stays clean. */
