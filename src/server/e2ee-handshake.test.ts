@@ -12,7 +12,10 @@ import {
   challengeIsWellFormed,
   handshakeAad,
 } from "../shared/e2ee-handshake.js";
-import { ClientWire, connectionWireKeys } from "../client/e2ee-wire.js";
+import { loadCodec } from "../client/e2ee-codec.js";
+import { ClientWire, connectionWireKeys, type WireCompression } from "../client/e2ee-wire.js";
+import { DICTIONARY_D1, DICTIONARY_DIGEST } from "../shared/e2ee-dictionary.js";
+import { FLAG_DICTIONARY } from "../shared/e2ee-envelope.js";
 import { createApp, type PromptorApp } from "./app.js";
 import { deriveMasterKey, subKey } from "./e2ee-key-material.js";
 import { open, seal } from "./e2ee-session.js";
@@ -98,11 +101,11 @@ describe("proving both ends hold the same key", () => {
   };
 
   /** The data-plane keys a page derives once the far end says the handshake passed. */
-  const dataPlane = async (socket: WebSocket, challenge: any, passphrase: string) => {
+  const dataPlane = async (socket: WebSocket, challenge: any, passphrase: string, compression: Partial<WireCompression> = {}) => {
     const master = await deriveMasterKey(passphrase, Buffer.from(decodeBase64(salt)), iterations);
     const hkdf = await crypto.subtle.importKey("raw", new Uint8Array(master), "HKDF", false, ["deriveKey"]);
     const keys = await connectionWireKeys(hkdf, decodeBase64(challenge.connectionSalt));
-    return new ClientWire(socket as never, keys.toClient, keys.toServer);
+    return new ClientWire(socket as never, keys.toClient, keys.toServer, compression);
   };
 
   const answer = async (challenge: any, passphrase: string) => {
@@ -225,6 +228,60 @@ describe("proving both ends hold the same key", () => {
     await peer.settle(() => peer.messages.some((message) => message.type === "index.changed"));
     expect(peer.messages.some((message) => message.type === HANDSHAKE_CHALLENGE)).toBe(false);
     expect(peer.messages.some((message) => message.type === "index.changed")).toBe(true);
+  });
+
+  it("offers its compression dictionary, and turns it on for a page that holds the same one", async () => {
+    const codec = await loadCodec();
+    const peer = await connect(REMOTE_HOST);
+    await peer.settle(() => peer.messages.length >= 1);
+    const challenge = peer.messages[0];
+    // Offered by digest, not imposed: a page from before the dictionary sees
+    // a field it does not read and answers as it always did.
+    expect(challenge.dictionaries).toEqual([DICTIONARY_DIGEST]);
+
+    const { proof } = await answer(challenge, PASSPHRASE);
+    peer.socket.send(JSON.stringify({ type: HANDSHAKE_PROOF, proof, dictionary: DICTIONARY_DIGEST }));
+    await peer.settle(() => peer.messages.some((message) => message.type === HANDSHAKE_READY));
+    const ready = peer.messages.find((message) => message.type === HANDSHAKE_READY);
+    // Confirmed back, so both ends flip on the same frame boundary.
+    expect(ready.dictionary).toBe(DICTIONARY_DIGEST);
+
+    peer.useWire(await dataPlane(peer.socket, challenge, PASSPHRASE, { codec, dictionary: DICTIONARY_D1 }));
+    const before = peer.frames.length;
+    peer.send({ type: "subscribe", allTabs: true, index: true, snapshots: false, terminals: {} });
+    await peer.settle(() => peer.messages.some((message) => message.type === "index.changed"));
+    const index = peer.messages.find((message) => message.type === "index.changed");
+    expect(JSON.stringify(index)).toContain("加密");
+    // The index frame is big enough to compress, and was compressed against
+    // the dictionary: the flag is in the header byte, which the tag covers.
+    const sealed = peer.frames.slice(before);
+    expect(sealed.length).toBeGreaterThan(0);
+    expect(sealed.some((frame) => (frame[0]! & FLAG_DICTIONARY) !== 0)).toBe(true);
+
+    // And the ledger says which connections got it, so its effect can be read
+    // as a split rather than a blend.
+    const traffic = await app.inject({ method: "GET", url: "/api/diagnostics/traffic", headers: { "x-codex-promptor-token": app.promptor.token } });
+    expect(traffic.json().data.rollup.entries["in:conn:tunnel:e2ee.dictionary"]).toMatchObject({ count: 1 });
+  });
+
+  it("compresses without one for a page that offers none, or one it does not hold", async () => {
+    const peer = await connect(REMOTE_HOST);
+    await peer.settle(() => peer.messages.length >= 1);
+    const challenge = peer.messages[0];
+    const { proof } = await answer(challenge, PASSPHRASE);
+    // A digest the server has never heard of: perhaps a page built after a
+    // dictionary change this server has not had yet.
+    peer.socket.send(JSON.stringify({ type: HANDSHAKE_PROOF, proof, dictionary: "d1:00000000000000000000000000000000" }));
+    await peer.settle(() => peer.messages.some((message) => message.type === HANDSHAKE_READY));
+    const ready = peer.messages.find((message) => message.type === HANDSHAKE_READY);
+    expect(ready.dictionary).toBeUndefined();
+
+    peer.useWire(await dataPlane(peer.socket, challenge, PASSPHRASE));
+    const before = peer.frames.length;
+    peer.send({ type: "subscribe", allTabs: true, index: true, snapshots: false, terminals: {} });
+    await peer.settle(() => peer.messages.some((message) => message.type === "index.changed"));
+    expect(peer.messages.some((message) => message.type === "index.changed")).toBe(true);
+    expect(peer.frames.slice(before).every((frame) => (frame[0]! & FLAG_DICTIONARY) === 0)).toBe(true);
   });
 
   it("tells a page that encryption is on, and which key it wants", async () => {

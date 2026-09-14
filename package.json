@@ -24,6 +24,7 @@
     "@xterm/headless": "5.5.0",
     "@xterm/xterm": "5.5.0",
     "fastify": "^5.4.0",
+    "fflate": "0.8.3",
     "node-pty": "^1.1.0",
     "playwright-core": "^1.63.0",
     "react": "^19.1.0",

@@ -67,7 +67,8 @@ import { openHttpBody, sealHttpBody } from "./e2ee-http-body.js";
 import { E2EE_BODY_CONTENT_TYPE, E2EE_BODY_HEADER, bodyMustStayReadable, bodyNeedsEncryption } from "../shared/e2ee-http.js";
 import { handshakeAnswered, isEncryptionSwitch, masterKeyFor, startHandshake, type PendingHandshake } from "./e2ee-session.js";
 import { ServerWire } from "./e2ee-wire.js";
-import { HANDSHAKE_PROOF, HANDSHAKE_READY, KEY_CHANGED_CLOSE_CODE, allowedBeforeHandshake } from "../shared/e2ee-handshake.js";
+import { HANDSHAKE_PROOF, HANDSHAKE_READY, KEY_CHANGED_CLOSE_CODE, allowedBeforeHandshake, negotiatedDictionary, type HandshakeChallenge, type HandshakeProof, type HandshakeReady } from "../shared/e2ee-handshake.js";
+import { DICTIONARY_D1, DICTIONARY_DIGEST, digestOf } from "../shared/e2ee-dictionary.js";
 import { redactForScope } from "./e2ee-redaction.js";
 import { normalizePassphrase } from "../shared/e2ee-keys.js";
 import { nameForSession } from "../shared/session-tab-name.js";
@@ -257,6 +258,22 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const websocketKeepaliveMs = process.env.CODEX_PROMPTOR_WS_KEEPALIVE_MS === "0"
     ? 0
     : boundedInteger(process.env.CODEX_PROMPTOR_WS_KEEPALIVE_MS, 1_000, 90_000, 30_000);
+  /**
+   * The preset compression dictionaries this process will offer a sealed
+   * connection (e2ee-dictionary.ts), as digests.
+   *
+   * Checked against the bytes once, here: a digest that did not match its own
+   * bytes would let two ends agree on a name and disagree on the contents,
+   * and every frame between them would open into noise. Better to offer
+   * nothing and say so. `CODEX_PROMPTOR_E2EE_DICTIONARY=0` also offers nothing,
+   * which is the A/B switch.
+   */
+  const heldDictionaries: string[] = [];
+  if (process.env.CODEX_PROMPTOR_E2EE_DICTIONARY !== "0") {
+    const actual = await digestOf(DICTIONARY_D1, globalThis.crypto.subtle);
+    if (actual === DICTIONARY_DIGEST) heldDictionaries.push(DICTIONARY_DIGEST);
+    else console.warn(`[promptor] e2ee dictionary digest mismatch (${actual} != ${DICTIONARY_DIGEST}); offering none`);
+  }
   const terminalResyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const rawResponderOwners = new Map<string, string>();
   const responderLeaseEpochs = new Map<string, number>();
@@ -3558,7 +3575,10 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       void encryptionState().then((encryption) => {
         if (!encryption) { verified = true; return; }
         pending = startHandshake(encryption.master, encryption.fingerprint);
-        if (socket.readyState === 1) socket.send(JSON.stringify(pending.message));
+        // Offered, not imposed: the client answers with the one it also holds,
+        // or with nothing, and the frames say per message which was used.
+        const offer: HandshakeChallenge = { ...pending.message, ...(heldDictionaries.length ? { dictionaries: heldDictionaries } : {}) };
+        if (socket.readyState === 1) socket.send(JSON.stringify(offer));
       }).catch(() => { socket.close(1011, "Encryption unavailable"); });
     }
     socket.on("close", (code: number) => {
@@ -3605,11 +3625,18 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
             verified = true;
             const keys = pending.keys;
             pending = null;
+            // Settled here and echoed back, so both ends flip to the dictionary
+            // on the same frame boundary: everything after `ready` may carry it.
+            const dictionary = negotiatedDictionary((message as HandshakeProof).dictionary, heldDictionaries);
+            const ready: HandshakeReady = { type: HANDSHAKE_READY, ...(dictionary ? { dictionary } : {}) };
             // The last readable frame on this connection, and deliberately so:
             // the page has to be able to read the word that tells it to start
             // sealing. Everything after this, both ways, is ciphertext.
-            socket.send(JSON.stringify({ type: HANDSHAKE_READY }));
-            client.wire = new ServerWire(keys.toClient, keys.toServer);
+            socket.send(JSON.stringify(ready));
+            client.wire = new ServerWire(keys.toClient, keys.toServer, dictionary ? Buffer.from(DICTIONARY_D1) : null);
+            // Which connections got the dictionary, so its effect can be read
+            // off the ledger as a split rather than a blend.
+            recordTraffic("in", "conn", dictionary ? "e2ee.dictionary" : "e2ee.plain", 0, { scope: client.scope });
           }
           return;
         }

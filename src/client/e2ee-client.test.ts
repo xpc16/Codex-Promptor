@@ -5,7 +5,12 @@ import { HANDSHAKE_READY, handshakeAad } from "../shared/e2ee-handshake.js";
 import { deriveMasterKey, fingerprintOf, subKey } from "../server/e2ee-key-material.js";
 import { handshakeAnswered, open, seal, startHandshake } from "../server/e2ee-session.js";
 import { answerChallenge, deriveSessionKey } from "./e2ee-client.js";
-import { applyRequirement, attachSocket, e2eeState, gateSend, handleGateMessage, useKey } from "./e2ee-gate.js";
+import { applyRequirement, attachSocket, e2eeState, gateReceive, gateSend, handleGateMessage, noteSocketClosed, useKey } from "./e2ee-gate.js";
+import { DICTIONARY_FAILED_CLOSE_CODE } from "./e2ee-wire.js";
+import { loadCodec } from "./e2ee-codec.js";
+import { DICTIONARY_D1, DICTIONARY_DIGEST } from "../shared/e2ee-dictionary.js";
+import { FLAG_DICTIONARY } from "../shared/e2ee-envelope.js";
+import { ServerWire } from "../server/e2ee-wire.js";
 
 /**
  * The two halves are written against different crypto libraries -- WebCrypto in
@@ -256,5 +261,110 @@ describe("the gate, on a list of sockets that is not tidy", () => {
     expect(e2eeState().rejected).toBe(true);
     expect(e2eeState().proved).toBe(false);
     expect(open.sent).toHaveLength(0);
+  });
+});
+
+describe("the gate, negotiating the compression dictionary", () => {
+  beforeEach(async () => { await applyRequirement({ required: false }); });
+
+  const passphrase = "correct horse battery staple";
+  const salt = encodeBase64(new Uint8Array(randomBytes(16)));
+  const iterations = 60_000;
+
+  const serverSide = async () => {
+    const master = await deriveMasterKey(passphrase, Buffer.from(salt, "base64"), iterations);
+    return { master, pending: startHandshake(master, fingerprintOf(master)) };
+  };
+
+  const socket = () => {
+    const sent: any[] = [];
+    const binary: Uint8Array[] = [];
+    const closes: number[] = [];
+    return {
+      sent, binary, closes, readyState: 1,
+      send: (data: string | ArrayBuffer) => { if (typeof data === "string") sent.push(JSON.parse(data)); else binary.push(new Uint8Array(data)); },
+      close: (code?: number) => { closes.push(code ?? 1005); },
+    };
+  };
+
+  it("offers the dictionary it holds when the server lists it, and uses it once confirmed", async () => {
+    await loadCodec();
+    const { master, pending } = await serverSide();
+    const peer = socket();
+    await applyRequirement({ required: true, fingerprint: pending.message.fingerprint });
+    await handleGateMessage(peer, { ...pending.message, dictionaries: [DICTIONARY_DIGEST] });
+    await useKey(await deriveSessionKey(passphrase, salt, iterations), false);
+    expect(peer.sent).toHaveLength(1);
+    expect(peer.sent[0].dictionary).toBe(DICTIONARY_DIGEST);
+    expect(handshakeAnswered(pending, peer.sent[0].proof)).toBe(true);
+
+    await handleGateMessage(peer, { type: HANDSHAKE_READY, dictionary: DICTIONARY_DIGEST });
+    // Sealed with the dictionary from the first frame after `ready`...
+    gateSend(peer, JSON.stringify({ type: "subscribe", terminalProtocolVersion: 2, tabIds: ["b3f7c2a1-4d5e-4f60-8a9b-0c1d2e3f4a5b"], snapshots: true, details: true, terminals: {} }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(peer.binary).toHaveLength(1);
+    expect(peer.binary[0]![0]! & FLAG_DICTIONARY).toBe(FLAG_DICTIONARY);
+    // ...and readable by a server holding the same bytes.
+    const server = new ServerWire(pending.keys.toClient, pending.keys.toServer, Buffer.from(DICTIONARY_D1));
+    expect(server.open(peer.binary[0]!)).toContain('"type":"subscribe"');
+    // And the other way.
+    const opened = await gateReceive(peer, new Uint8Array(server.seal(JSON.stringify({ type: "index.changed", index: { tabs: [], groups: [], revision: 1 } }))!));
+    expect(opened?.type).toBe("index.changed");
+    void master;
+  });
+
+  it("offers nothing when the server lists none, or a different one", async () => {
+    await loadCodec();
+    const { pending } = await serverSide();
+    for (const dictionaries of [undefined, [], ["d1:00000000000000000000000000000000"]]) {
+      const peer = socket();
+      await applyRequirement({ required: true, fingerprint: pending.message.fingerprint });
+      await handleGateMessage(peer, { ...pending.message, ...(dictionaries ? { dictionaries } : {}) });
+      await useKey(await deriveSessionKey(passphrase, salt, iterations), false);
+      expect(peer.sent[0].dictionary).toBeUndefined();
+    }
+  });
+
+  it("does not turn it on for a confirmation it did not ask for", async () => {
+    // A `ready` naming a dictionary this page never offered is treated as
+    // none: the server may be confused, or may not be this server.
+    await loadCodec();
+    const { pending } = await serverSide();
+    const peer = socket();
+    await applyRequirement({ required: true, fingerprint: pending.message.fingerprint });
+    await handleGateMessage(peer, pending.message);
+    await useKey(await deriveSessionKey(passphrase, salt, iterations), false);
+    await handleGateMessage(peer, { type: HANDSHAKE_READY, dictionary: DICTIONARY_DIGEST });
+    gateSend(peer, JSON.stringify({ type: "subscribe", tabIds: ["b3f7c2a1-4d5e-4f60-8a9b-0c1d2e3f4a5b"], snapshots: true, details: true, terminals: {} }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(peer.binary[0]![0]! & FLAG_DICTIONARY).toBe(0);
+  });
+
+  it("stops offering it after a frame that claimed it failed to open", async () => {
+    // Same digest, different bytes, is a bug -- and until it is fixed this
+    // page compresses without, rather than reconnecting into the same wall.
+    await loadCodec();
+    const { pending } = await serverSide();
+    const peer = socket();
+    await applyRequirement({ required: true, fingerprint: pending.message.fingerprint });
+    await handleGateMessage(peer, { ...pending.message, dictionaries: [DICTIONARY_DIGEST] });
+    await useKey(await deriveSessionKey(passphrase, salt, iterations), false);
+    await handleGateMessage(peer, { type: HANDSHAKE_READY, dictionary: DICTIONARY_DIGEST });
+    // A server whose "same" dictionary is actually different bytes: the
+    // same words in a different order, so the frame's back-references land on
+    // the wrong ones and inflate "succeeds" into something that is not JSON.
+    const other = Buffer.concat([Buffer.from(DICTIONARY_D1.subarray(1800)), Buffer.from(DICTIONARY_D1.subarray(0, 1800))]);
+    const server = new ServerWire(pending.keys.toClient, pending.keys.toServer, other);
+    const frame = server.seal(JSON.stringify({ type: "index.changed", index: { tabs: [], groups: [], revision: 1, name: "x".repeat(200) } }))!;
+    expect(await gateReceive(peer, new Uint8Array(frame))).toBeNull();
+    expect(peer.closes).toEqual([DICTIONARY_FAILED_CLOSE_CODE]);
+    noteSocketClosed(DICTIONARY_FAILED_CLOSE_CODE);
+
+    const again = socket();
+    const { pending: next } = await serverSide();
+    await applyRequirement({ required: true, fingerprint: next.message.fingerprint });
+    await handleGateMessage(again, { ...next.message, dictionaries: [DICTIONARY_DIGEST] });
+    await useKey(await deriveSessionKey(passphrase, salt, iterations), false);
+    expect(again.sent[0].dictionary).toBeUndefined();
   });
 });

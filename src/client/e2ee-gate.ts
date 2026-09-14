@@ -1,7 +1,9 @@
-import { HANDSHAKE_CHALLENGE, HANDSHAKE_READY, challengeIsWellFormed, type HandshakeChallenge } from "../shared/e2ee-handshake.js";
+import { HANDSHAKE_CHALLENGE, HANDSHAKE_READY, challengeIsWellFormed, negotiatedDictionary, type HandshakeChallenge, type HandshakeProof, type HandshakeReady } from "../shared/e2ee-handshake.js";
+import { DICTIONARY_D1, DICTIONARY_DIGEST } from "../shared/e2ee-dictionary.js";
 import { decodeBase64 } from "../shared/e2ee-keys.js";
 import { answerChallenge, forgetKey, recallKey, rememberKey, type SessionKey } from "./e2ee-client.js";
-import { ClientWire, connectionWireKeys } from "./e2ee-wire.js";
+import { codecWithin, loadCodec, type Codec } from "./e2ee-codec.js";
+import { ClientWire, DICTIONARY_FAILED_CLOSE_CODE, connectionWireKeys } from "./e2ee-wire.js";
 
 /**
  * One key for the whole page, and one place that answers challenges with it.
@@ -46,6 +48,8 @@ type Waiting = { socket: GateSocket; challenge: HandshakeChallenge };
 type SocketState = {
   challenge: HandshakeChallenge | null;
   wire: ClientWire | null;
+  /** The dictionary digest this page put in its proof, so `ready` can be checked against it. */
+  offeredDictionary: string | null;
   /**
    * Called when the far end confirms the handshake. Every subscription a page
    * sent on open was refused while it was still unproved, so this is where a
@@ -58,9 +62,34 @@ const sockets = new WeakMap<object, SocketState>();
 
 const stateFor = (socket: GateSocket): SocketState => {
   let entry = sockets.get(socket as object);
-  if (!entry) { entry = { challenge: null, wire: null, onReady: null }; sockets.set(socket as object, entry); }
+  if (!entry) { entry = { challenge: null, wire: null, offeredDictionary: null, onReady: null }; sockets.set(socket as object, entry); }
   return entry;
 };
+
+/**
+ * The compression codec, once it has loaded, and whether this page still
+ * trusts the dictionary.
+ *
+ * A frame flagged as dictionary-compressed that did not inflate means the two
+ * ends agreed on a digest and hold different bytes anyway. That is a bug to
+ * fix, not a condition to retry: from then on this page offers no dictionary,
+ * and every reconnect compresses without one.
+ */
+let codec: Codec | null = null;
+let dictionaryTrusted = true;
+
+/** Told by a socket's close handler; see DICTIONARY_FAILED_CLOSE_CODE. */
+export function noteSocketClosed(code: number): void {
+  if (code === DICTIONARY_FAILED_CLOSE_CODE) dictionaryTrusted = false;
+}
+
+/**
+ * How long a handshake waits for the codec chunk before answering without
+ * a dictionary. It is a one-time fetch of a few kilobytes, cached for good
+ * (static-cache.ts), so this only ever bites on the first connection of a
+ * slow first visit -- and then only costs that connection the dictionary.
+ */
+const CODEC_WAIT_MS = 1_500;
 
 /** Registers what to do once this socket is proved. Safe to call before it connects. */
 export function attachSocket(socket: GateSocket, onReady: () => void): void {
@@ -148,6 +177,9 @@ export async function applyRequirement(requirement: E2eeRequirement | undefined)
     return;
   }
   const fingerprint = requirement.fingerprint ?? null;
+  // Encryption is on, so there will be a challenge; start fetching the codec
+  // now rather than when the challenge is waiting on it.
+  void loadCodec().then((loaded) => { codec = loaded; });
   if (key && fingerprint && key.fingerprint !== fingerprint) key = null;
   if (!key) key = await recallKey(fingerprint);
   publish({ required: true, fingerprint, rejected: false });
@@ -190,10 +222,25 @@ async function answerWaiting(): Promise<void> {
       await dropKey();
       return;
     }
+    const offered = await dictionaryToOffer(entry.challenge);
+    stateFor(entry.socket).offeredDictionary = offered;
+    const proof: HandshakeProof = { ...answer, ...(offered ? { dictionary: offered } : {}) } as HandshakeProof;
     // It can close between the check above and here; one dead socket must not
     // decide anything for the others.
-    try { entry.socket.send(JSON.stringify(answer)); } catch { /* gone */ }
+    try { entry.socket.send(JSON.stringify(proof)); } catch { /* gone */ }
   }
+}
+
+/**
+ * The digest to put in the proof: the server listed the one this page holds,
+ * the page still trusts it, and the codec that can use it is here.
+ */
+async function dictionaryToOffer(challenge: HandshakeChallenge): Promise<string | null> {
+  if (!dictionaryTrusted) return null;
+  const agreed = negotiatedDictionary(DICTIONARY_DIGEST, challenge.dictionaries ?? []);
+  if (!agreed) return null;
+  codec ??= await codecWithin(CODEC_WAIT_MS);
+  return codec ? agreed : null;
 }
 
 /**
@@ -236,7 +283,12 @@ export async function handleGateMessage(socket: GateSocket, message: any): Promi
     const entry = stateFor(socket);
     if (key && entry.challenge) {
       const keys = await connectionWireKeys(key.master, decodeBase64(entry.challenge.connectionSalt));
-      entry.wire = new ClientWire(socket, keys.toClient, keys.toServer);
+      // The dictionary is on only when the server confirmed the very digest
+      // this page offered. Anything else -- a confirmation nobody asked for,
+      // a different digest -- is treated as none.
+      const confirmed = (message as HandshakeReady).dictionary;
+      const dictionary = entry.offeredDictionary && confirmed === entry.offeredDictionary && codec ? DICTIONARY_D1 : null;
+      entry.wire = new ClientWire(socket, keys.toClient, keys.toServer, { codec, dictionary });
     }
     entry.onReady?.();
     return true;

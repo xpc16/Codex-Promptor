@@ -2,6 +2,7 @@ import {
   COMPRESSION_MIN_BYTES,
   ENVELOPE_HEADER_BYTES,
   GCM_TAG_BYTES,
+  compressionFloor,
   decodeEnvelopeHeader,
   encodeEnvelopeHeader,
   nextCounter,
@@ -9,6 +10,15 @@ import {
   shouldSendCompressed,
 } from "../shared/e2ee-envelope.js";
 import { CONNECTION_LABELS } from "../shared/e2ee-keys.js";
+import type { Codec } from "./e2ee-codec.js";
+
+/**
+ * Closed by this end when a frame flagged as dictionary-compressed did not
+ * inflate. The two ends agreed on a digest and still disagree on the bytes,
+ * which is a bug and not a condition to keep talking through; the gate hears
+ * this code, stops offering the dictionary, and the reconnect goes without.
+ */
+export const DICTIONARY_FAILED_CLOSE_CODE = 4003;
 
 /**
  * The browser's half of one encrypted WebSocket.
@@ -65,6 +75,17 @@ async function inflate(raw: Uint8Array): Promise<Uint8Array | null> {
   }
 }
 
+/** The bytes as text, if they are valid UTF-8 and parse as JSON; else null. */
+function asJsonText(bytes: Uint8Array): string | null {
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    JSON.parse(text);
+    return text;
+  } catch {
+    return null;
+  }
+}
+
 /** A frame arrives as an ArrayBuffer when `binaryType` says so, and as a Blob when nobody set it. */
 async function frameBytes(data: unknown): Promise<Uint8Array | null> {
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
@@ -73,17 +94,30 @@ async function frameBytes(data: unknown): Promise<Uint8Array | null> {
   return null;
 }
 
+/**
+ * How this connection compresses. With a codec, deflate is fflate's and may
+ * use the negotiated dictionary; without one, the platform streams, which
+ * know no dictionary. A dictionary without a codec is not a valid state and
+ * is not constructible from the gate.
+ */
+export type WireCompression = { codec: Codec | null; dictionary: Uint8Array | null };
+
 export class ClientWire {
   private outCounter = 0;
   private inCounter = 0;
   private outTail: Promise<unknown> = Promise.resolve();
   private inTail: Promise<unknown> = Promise.resolve();
+  private readonly compression: WireCompression;
 
   constructor(
     private readonly socket: WireSocket,
     private readonly toClient: CryptoKey,
     private readonly toServer: CryptoKey,
-  ) {}
+    compression: Partial<WireCompression> = {},
+  ) {
+    const codec = compression.codec ?? null;
+    this.compression = { codec, dictionary: codec ? compression.dictionary ?? null : null };
+  }
 
   /**
    * Queued rather than sent, because sealing has to finish first and the
@@ -102,9 +136,13 @@ export class ClientWire {
     // survive, so the connection goes rather than the guarantee.
     if (next === null) { this.socket.close?.(4002, "e2ee_counter_exhausted"); return; }
     const raw = new TextEncoder().encode(text);
-    const candidate = await deflate(raw);
-    const compressed = candidate !== null && shouldSendCompressed(raw.length, candidate.length);
-    const header = encodeEnvelopeHeader({ compressed });
+    const { codec, dictionary } = this.compression;
+    const withDictionary = dictionary !== null;
+    const candidate = codec
+      ? (raw.length >= compressionFloor(withDictionary) ? codec.deflate(raw, dictionary) : null)
+      : await deflate(raw);
+    const compressed = candidate !== null && shouldSendCompressed(raw.length, candidate.length, withDictionary);
+    const header = encodeEnvelopeHeader({ compressed, dictionary: withDictionary });
     const sealed = new Uint8Array(await crypto.subtle.encrypt(
       { name: "AES-GCM", iv: nonceForCounter(counter) as BufferSource, additionalData: header as BufferSource, tagLength: GCM_TAG_BYTES * 8 },
       this.toServer,
@@ -146,7 +184,21 @@ export class ClientWire {
     }
     this.inCounter = next;
     if (!header.compressed) return new TextDecoder().decode(opened);
-    const plain = await inflate(opened);
+    const { codec, dictionary } = this.compression;
+    if (header.dictionary) {
+      // Only readable on a connection that settled on the dictionary. A frame
+      // that claims it and does not come out as a message means the bytes
+      // differ after all; see DICTIONARY_FAILED_CLOSE_CODE. "Does not come
+      // out" has to include garbage: a wrong dictionary usually inflates
+      // without error into bytes that are not the message, so the check is
+      // that what came out is the JSON every frame on this wire is.
+      const plain = codec && dictionary ? codec.inflate(opened, dictionary) : null;
+      const text = plain ? asJsonText(plain) : null;
+      if (text !== null) return text;
+      this.socket.close?.(DICTIONARY_FAILED_CLOSE_CODE, "e2ee_dictionary_mismatch");
+      return null;
+    }
+    const plain = codec ? codec.inflate(opened, null) : await inflate(opened);
     return plain ? new TextDecoder().decode(plain) : null;
   }
 }

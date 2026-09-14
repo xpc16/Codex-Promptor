@@ -17,6 +17,10 @@ function vendorChunk(id: string): string | undefined {
   // here keeps it one chunk rather than whatever the dynamic import carves out.
   if (/react-markdown|remark|rehype|micromark|mdast|hast|unist|unified|vfile|property-information|space-separated|comma-separated|character-entities|decode-named|bail|trough|devlop|zwitch|longest-streak|ccount|markdown-table|escape-string-regexp|is-plain-obj|estree|html-url-attributes/.test(id)) return "markdown";
   if (id.includes("react-dom") || /node_modules[\\/]react[\\/]/.test(id) || id.includes("scheduler")) return "react";
+  // Loaded on demand by e2ee-codec.ts, and only by a page about to seal a
+  // connection. In the shared vendor chunk it would be paid for by the local
+  // page too, which never encrypts anything.
+  if (/node_modules[\\/]fflate[\\/]/.test(id)) return "fflate";
   return "vendor";
 }
 

@@ -67,7 +67,37 @@ export type HandshakeChallenge = {
   serverProof: string;
   /** So a client holding several keys knows which one to try, and a client holding the wrong one is told plainly. */
   fingerprint: string;
+  /**
+   * Preset compression dictionaries this server holds, by digest
+   * (e2ee-dictionary.ts). Absent from older servers, which is the same as
+   * empty: the client offers nothing back and both sides compress without.
+   */
+  dictionaries?: string[];
 };
+
+/**
+ * What the client answers with. `dictionary` is the digest of the one it
+ * holds and found in the challenge's list, or absent; the server confirms in
+ * `e2ee.ready` with the same field, and only then do both sides set
+ * FLAG_DICTIONARY on the frames they compress.
+ *
+ * Both fields travel in the clear, and that is fine: the choice decides how
+ * frames are compressed, not whether they are protected. Someone on the path
+ * who strips it costs the connection some bytes; someone who adds it gets
+ * frames the client cannot open and a reconnect without it -- either outcome
+ * is one they could already produce by dropping frames.
+ */
+export type HandshakeProof = { type: typeof HANDSHAKE_PROOF; proof: string; dictionary?: string };
+export type HandshakeReady = { type: typeof HANDSHAKE_READY; dictionary?: string };
+
+/**
+ * The digest both sides settle on, or null. Only one the client offered and
+ * the server also holds qualifies, so neither side can be talked into a
+ * dictionary it does not have.
+ */
+export function negotiatedDictionary(offered: unknown, held: readonly string[]): string | null {
+  return typeof offered === "string" && held.includes(offered) ? offered : null;
+}
 
 /** Why a handshake did not complete, in the terms the reader needs. */
 export type HandshakeFailure = "wrong-key" | "malformed" | "not-required";

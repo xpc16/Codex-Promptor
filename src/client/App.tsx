@@ -20,7 +20,7 @@ import { extractDocumentTarget, isLoopbackHostname } from "../shared/document-li
 import { randomPassphrase } from "../shared/e2ee-keys.js";
 import { deriveSessionKey } from "./e2ee-client.js";
 import { KEY_CHANGED_CLOSE_CODE } from "../shared/e2ee-handshake.js";
-import { applyRequirement, attachSocket, e2eeState, gateReceive, gateSend, observeE2ee, useKey, type E2eeState } from "./e2ee-gate.js";
+import { applyRequirement, attachSocket, e2eeState, gateReceive, gateSend, noteSocketClosed, observeE2ee, useKey, type E2eeState } from "./e2ee-gate.js";
 import type { RuntimeDelta } from "../shared/runtime-delta.js";
 import type { TerminalScreenFrame, TerminalTransportMode } from "../shared/terminal-protocol.js";
 import { DOCUMENT_RAW_CATCH_UP_BYTES } from "../shared/document-protocol.js";
@@ -372,6 +372,7 @@ export function App() {
       };
       live.onclose = (event) => {
         socket = null;
+        noteSocketClosed(event.code);
         // The key changed, or encryption was turned off, on the machine at the
         // other end. What this page holds is stale either way, and bootstrap is
         // the one route that is never sealed -- so ask it before reconnecting.
@@ -2223,7 +2224,8 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       // whether the reader needs to know, because only it can tell a drop that
       // reconnects from an outage that does not.
       ws.onerror = () => { /* handled on close */ };
-      ws.onclose = () => {
+      ws.onclose = (event) => {
+        noteSocketClosed(event.code);
         if (socket.current !== ws) return;
         socket.current = null;
         if (subscriptionController.current) subscriptionController.current = null;

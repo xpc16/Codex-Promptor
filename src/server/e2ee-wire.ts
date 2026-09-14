@@ -1,7 +1,8 @@
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 import {
-  COMPRESSION_MIN_BYTES,
   ENVELOPE_HEADER_BYTES,
+  MAX_INFLATED_BYTES,
+  compressionFloor,
   decodeEnvelopeHeader,
   encodeEnvelopeHeader,
   nextCounter,
@@ -23,15 +24,22 @@ import { open as openSealed, seal as sealPlain } from "./e2ee-session.js";
  * compress, so the other order would spend CPU to turn 8.31 MB on the tunnel
  * into roughly 19 MB -- worse than sending it in the clear. The same reason is
  * why an encrypted frame is handed to `ws` with `compress: false`.
+ *
+ * The dictionary, when the handshake settled on one, is the bytes both ends
+ * already know (e2ee-dictionary.ts). It changes what deflate can point at,
+ * not the seal: frames are still compressed one at a time, and a frame says
+ * in its header whether it used it.
  */
-
-const MAX_INFLATED_BYTES = 32 * 1024 * 1024;
 
 export class ServerWire {
   private outCounter = 0;
   private inCounter = 0;
 
-  constructor(private readonly toClient: Buffer, private readonly toServer: Buffer) {}
+  constructor(
+    private readonly toClient: Buffer,
+    private readonly toServer: Buffer,
+    private readonly dictionary: Buffer | null = null,
+  ) {}
 
   /**
    * Null when this connection's counter is spent, which is the one condition
@@ -43,9 +51,12 @@ export class ServerWire {
     const next = nextCounter(counter);
     if (next === null) return null;
     const raw = Buffer.from(text, "utf8");
-    const candidate = raw.length >= COMPRESSION_MIN_BYTES ? deflateRawSync(raw) : null;
-    const compressed = candidate !== null && shouldSendCompressed(raw.length, candidate.length);
-    const header = encodeEnvelopeHeader({ compressed });
+    const withDictionary = this.dictionary !== null;
+    const candidate = raw.length >= compressionFloor(withDictionary)
+      ? deflateRawSync(raw, withDictionary ? { dictionary: this.dictionary! } : {})
+      : null;
+    const compressed = candidate !== null && shouldSendCompressed(raw.length, candidate.length, withDictionary);
+    const header = encodeEnvelopeHeader({ compressed, dictionary: withDictionary });
     const frame = Buffer.concat([
       header,
       sealPlain(this.toClient, nonceForCounter(counter), compressed ? candidate! : raw, header),
@@ -78,11 +89,18 @@ export class ServerWire {
     if (!opened) return null;
     this.inCounter = next;
     if (!header.compressed) return opened.toString("utf8");
+    // A dictionary frame on a connection that settled on none cannot be read,
+    // and must not be guessed at: the negotiation is what says which bytes
+    // the sender pointed into.
+    if (header.dictionary && this.dictionary === null) return null;
     try {
       // Bounded, because the inflated length is claimed by whoever sent it.
       // The tag has already proved they hold the key, so this guards against a
       // bug on either end, not against a stranger.
-      return inflateRawSync(opened, { maxOutputLength: MAX_INFLATED_BYTES }).toString("utf8");
+      return inflateRawSync(opened, {
+        maxOutputLength: MAX_INFLATED_BYTES,
+        ...(header.dictionary ? { dictionary: this.dictionary! } : {}),
+      }).toString("utf8");
     } catch {
       return null;
     }

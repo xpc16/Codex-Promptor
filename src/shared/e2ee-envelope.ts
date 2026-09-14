@@ -33,6 +33,14 @@ export const GCM_TAG_BYTES = 16;
 export const ENVELOPE_OVERHEAD_BYTES = ENVELOPE_HEADER_BYTES + GCM_TAG_BYTES;
 
 export const FLAG_COMPRESSED = 0x01;
+/**
+ * The payload was deflated against the negotiated preset dictionary
+ * (e2ee-dictionary.ts). Only meaningful with FLAG_COMPRESSED; a frame that
+ * sets it alone is malformed and refused. Both flags sit in the header byte,
+ * which is the GCM additional data, so neither can be flipped in transit.
+ */
+export const FLAG_DICTIONARY = 0x02;
+const KNOWN_FLAGS = FLAG_COMPRESSED | FLAG_DICTIONARY;
 
 /**
  * Below this, compression is not attempted at all.
@@ -42,6 +50,29 @@ export const FLAG_COMPRESSED = 0x01;
  * larger. The threshold is where deflate's own framing stops dominating.
  */
 export const COMPRESSION_MIN_BYTES = 256;
+
+/**
+ * With a dictionary the floor drops: the field names are already known, so
+ * a 126-byte `terminal.state` deflates to 56 and a 204-byte
+ * `terminal.subscription` to 70 (measured, e2ee-dictionary.test.ts). The
+ * keystroke still does not clear `shouldSendCompressed`'s 32-byte saving,
+ * which is the point of keeping that rule separate from this floor.
+ */
+export const COMPRESSION_MIN_BYTES_WITH_DICTIONARY = 64;
+
+/**
+ * The most a frame may inflate to, on either end.
+ *
+ * The inflated length is claimed by whoever sent the frame. The tag has
+ * already proved they hold the key, so this guards against a bug on either
+ * end rather than a stranger -- but a bug that allocates without bound is
+ * still a bug, and the browser has less room for it than the server.
+ */
+export const MAX_INFLATED_BYTES = 32 * 1024 * 1024;
+
+export function compressionFloor(dictionary: boolean): number {
+  return dictionary ? COMPRESSION_MIN_BYTES_WITH_DICTIONARY : COMPRESSION_MIN_BYTES;
+}
 
 /** Compression is kept only when it earns both of these. */
 export const COMPRESSION_MIN_SAVED_BYTES = 32;
@@ -54,16 +85,18 @@ export const COMPRESSION_MIN_SAVED_RATIO = 0.1;
  * large frame that is not worth the decompress, and an absolute alone keeps a
  * 33-byte saving on a 20 KB frame that is noise.
  */
-export function shouldSendCompressed(plainBytes: number, compressedBytes: number): boolean {
-  if (plainBytes < COMPRESSION_MIN_BYTES) return false;
+export function shouldSendCompressed(plainBytes: number, compressedBytes: number, dictionary = false): boolean {
+  if (plainBytes < compressionFloor(dictionary)) return false;
   const saved = plainBytes - compressedBytes;
   return saved >= COMPRESSION_MIN_SAVED_BYTES && saved >= plainBytes * COMPRESSION_MIN_SAVED_RATIO;
 }
 
-export type EnvelopeHeader = { compressed: boolean };
+export type EnvelopeHeader = { compressed: boolean; dictionary: boolean };
 
 export function encodeEnvelopeHeader(header: EnvelopeHeader): Uint8Array {
-  return new Uint8Array([header.compressed ? FLAG_COMPRESSED : 0]);
+  // A dictionary flag without compression describes nothing; never write one.
+  const dictionary = header.compressed && header.dictionary;
+  return new Uint8Array([(header.compressed ? FLAG_COMPRESSED : 0) | (dictionary ? FLAG_DICTIONARY : 0)]);
 }
 
 /** Null for anything too short to be a frame, or carrying a flag this version does not define. */
@@ -72,8 +105,11 @@ export function decodeEnvelopeHeader(frame: Uint8Array): EnvelopeHeader | null {
   const flags = frame[0]!;
   // An unknown flag means a newer sender. Guessing at its framing would be
   // worse than refusing: the tag would fail anyway, later and less clearly.
-  if ((flags & ~FLAG_COMPRESSED) !== 0) return null;
-  return { compressed: (flags & FLAG_COMPRESSED) !== 0 };
+  if ((flags & ~KNOWN_FLAGS) !== 0) return null;
+  const compressed = (flags & FLAG_COMPRESSED) !== 0;
+  const dictionary = (flags & FLAG_DICTIONARY) !== 0;
+  if (dictionary && !compressed) return null;
+  return { compressed, dictionary };
 }
 
 /**

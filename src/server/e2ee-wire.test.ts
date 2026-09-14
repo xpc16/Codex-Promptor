@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { ClientWire, connectionWireKeys } from "../client/e2ee-wire.js";
-import { ENVELOPE_OVERHEAD_BYTES } from "../shared/e2ee-envelope.js";
+import { loadCodec } from "../client/e2ee-codec.js";
+import { ClientWire, DICTIONARY_FAILED_CLOSE_CODE, connectionWireKeys, type WireCompression } from "../client/e2ee-wire.js";
+import { DICTIONARY_D1 } from "../shared/e2ee-dictionary.js";
+import { ENVELOPE_OVERHEAD_BYTES, FLAG_COMPRESSED, FLAG_DICTIONARY } from "../shared/e2ee-envelope.js";
 import { connectionKeys } from "./e2ee-session.js";
 import { ServerWire } from "./e2ee-wire.js";
 
@@ -17,18 +19,25 @@ const SALT = new Uint8Array(16).fill(9);
 /** A socket that only remembers, so a frame can be inspected before it goes anywhere. */
 const recorder = () => {
   const frames: Uint8Array[] = [];
-  return { frames, readyState: 1, send: (data: ArrayBuffer | string) => { frames.push(new Uint8Array(data as ArrayBuffer)); } };
+  const closes: number[] = [];
+  return {
+    frames,
+    closes,
+    readyState: 1,
+    send: (data: ArrayBuffer | string) => { frames.push(new Uint8Array(data as ArrayBuffer)); },
+    close: (code?: number) => { closes.push(code ?? 1005); },
+  };
 };
 
-const browser = async (socket: ReturnType<typeof recorder>) => {
+const browser = async (socket: ReturnType<typeof recorder>, compression: Partial<WireCompression> = {}) => {
   const hkdf = await crypto.subtle.importKey("raw", new Uint8Array(MASTER), "HKDF", false, ["deriveKey"]);
   const keys = await connectionWireKeys(hkdf, SALT);
-  return new ClientWire(socket, keys.toClient, keys.toServer);
+  return new ClientWire(socket, keys.toClient, keys.toServer, compression);
 };
 
-const server = () => {
+const server = (dictionary: Buffer | null = null) => {
   const keys = connectionKeys(MASTER, SALT);
-  return new ServerWire(keys.toClient, keys.toServer);
+  return new ServerWire(keys.toClient, keys.toServer, dictionary);
 };
 
 /** The client seals on a promise chain, so a test has to let it finish. */
@@ -116,5 +125,93 @@ describe("a sealed WebSocket, in both directions", () => {
     expect(socket.frames.map((frame) => reader.open(frame))).toEqual([
       '{"n":1}', '{"n":2}', '{"n":3}', '{"n":4}',
     ]);
+  });
+});
+
+/**
+ * The same two implementations with the dictionary between them. Here the
+ * codecs differ too -- zlib on the server, fflate in the browser -- and a
+ * dictionary is exactly the kind of option two deflate implementations could
+ * agree to support and still disagree about.
+ */
+describe("a sealed WebSocket with the preset dictionary", () => {
+  const DICT = Buffer.from(DICTIONARY_D1);
+  const style = { fg: "default", bg: "default", flags: [] };
+  const delta = JSON.stringify({
+    type: "terminal.screen", tabId: "b3f7c2a1-4d5e-4f60-8a9b-0c1d2e3f4a5b", generation: "7e8f9a0b-1c2d-4e3f-a4b5-c6d7e8f9a0b1",
+    streamId: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", sequence: 4821, revision: 91827, full: false,
+    cols: 120, totalRows: 6000, viewportTop: 5980, viewportRows: 20, alternateScreen: false, sizeEpoch: 3,
+    inputModes: { applicationCursorKeys: false, applicationKeypad: false, bracketedPaste: true, mouseTracking: "none", sendFocus: false },
+    cursor: { row: 19, col: 2, visible: true },
+    rows: [{ row: 12, clearToEnd: true, runs: [{ text: "  1. Compiling src/server/app.ts (1237 lines)", style }] }],
+    scroll: { top: 0, bottom: 19, lines: 1 },
+  });
+
+  it("carries a delta the server deflated against it, in fewer than half the bytes", async () => {
+    const codec = await loadCodec();
+    expect(codec, "fflate loads in Node the way it will in the browser").not.toBeNull();
+    const plain = server().seal(delta)!;
+    const framed = server(DICT).seal(delta)!;
+    expect(framed[0]! & FLAG_DICTIONARY).toBe(FLAG_DICTIONARY);
+    expect(framed[0]! & FLAG_COMPRESSED).toBe(FLAG_COMPRESSED);
+    expect(framed.length).toBeLessThan(plain.length / 2);
+
+    const socket = recorder();
+    const wire = await browser(socket, { codec, dictionary: DICTIONARY_D1 });
+    expect(await wire.open(new Uint8Array(framed))).toBe(delta);
+  });
+
+  it("carries a subscribe the browser deflated against it, the other way", async () => {
+    const codec = await loadCodec();
+    const socket = recorder();
+    const wire = await browser(socket, { codec, dictionary: DICTIONARY_D1 });
+    const subscribe = JSON.stringify({ type: "subscribe", terminalProtocolVersion: 2, tabIds: ["b3f7c2a1-4d5e-4f60-8a9b-0c1d2e3f4a5b"], snapshots: true, details: true, terminals: { "b3f7c2a1-4d5e-4f60-8a9b-0c1d2e3f4a5b": { mode: "projection", viewportRows: 20, fps: 2, generation: null, revision: null, sizeEpoch: null } } });
+    wire.send(subscribe);
+    await settled();
+    expect(socket.frames[0]![0]! & FLAG_DICTIONARY).toBe(FLAG_DICTIONARY);
+    expect(server(DICT).open(socket.frames[0]!)).toBe(subscribe);
+  });
+
+  it("still lowers the floor for the small frames, which is most of them", async () => {
+    // A 126-byte terminal.state never cleared the plain 256-byte floor; with
+    // the dictionary it is worth compressing.
+    const state = '{"type":"terminal.state","tabId":"b3f7c2a1-4d5e-4f60-8a9b-0c1d2e3f4a5b","sequence":812,"state":"running","cols":132,"rows":34}';
+    expect(server().seal(state)![0]! & FLAG_COMPRESSED).toBe(0);
+    const framed = server(DICT).seal(state)!;
+    expect(framed[0]! & FLAG_DICTIONARY).toBe(FLAG_DICTIONARY);
+    expect(framed.length).toBeLessThan(Buffer.byteLength(state) + ENVELOPE_OVERHEAD_BYTES);
+  });
+
+  it("gives nothing, and hangs up, when a dictionary frame reaches a browser without one", async () => {
+    // The negotiation said none; a frame that claims one is either a bug or
+    // not from this server. Silence would look like a slow terminal, so the
+    // socket is closed with a code the gate recognises.
+    const codec = await loadCodec();
+    const socket = recorder();
+    const wire = await browser(socket, { codec, dictionary: null });
+    expect(await wire.open(new Uint8Array(server(DICT).seal(delta)!))).toBeNull();
+    expect(socket.closes).toEqual([DICTIONARY_FAILED_CLOSE_CODE]);
+  });
+
+  it("gives nothing to a server that settled on none", async () => {
+    const codec = await loadCodec();
+    const socket = recorder();
+    const wire = await browser(socket, { codec, dictionary: DICTIONARY_D1 });
+    wire.send(delta);
+    await settled();
+    expect(server().open(socket.frames[0]!)).toBeNull();
+  });
+
+  it("interoperates without a dictionary when only the codec changed", async () => {
+    // A page whose codec loaded but whose server offered nothing: fflate on
+    // one end, zlib on the other, no dictionary on either.
+    const codec = await loadCodec();
+    const socket = recorder();
+    const wire = await browser(socket, { codec });
+    expect(await wire.open(new Uint8Array(server().seal(delta)!))).toBe(delta);
+    wire.send(delta);
+    await settled();
+    expect(socket.frames[0]![0]! & FLAG_DICTIONARY).toBe(0);
+    expect(server().open(socket.frames[0]!)).toBe(delta);
   });
 });

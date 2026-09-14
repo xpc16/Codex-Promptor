@@ -7,6 +7,7 @@ import {
   encodeHttpHeader,
   httpCiphertext,
 } from "../shared/e2ee-http.js";
+import { MAX_INFLATED_BYTES } from "../shared/e2ee-envelope.js";
 import { subKey } from "./e2ee-key-material.js";
 import { open, seal } from "./e2ee-session.js";
 
@@ -19,8 +20,6 @@ import { open, seal } from "./e2ee-session.js";
  * and letting gzip try afterwards would spend CPU to send more bytes than not
  * encrypting at all.
  */
-
-const MAX_INFLATED_BYTES = 32 * 1024 * 1024;
 
 export function sealHttpBody(master: Buffer, plaintext: string): Buffer {
   const raw = Buffer.from(plaintext, "utf8");

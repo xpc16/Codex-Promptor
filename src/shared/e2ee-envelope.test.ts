@@ -22,10 +22,19 @@ describe("what a frame costs", () => {
 });
 
 describe("the envelope header", () => {
-  it("round-trips the one thing it carries", () => {
+  it("round-trips the two things it carries", () => {
     for (const compressed of [true, false]) {
-      expect(decodeEnvelopeHeader(framed(encodeEnvelopeHeader({ compressed })))).toEqual({ compressed });
+      expect(decodeEnvelopeHeader(framed(encodeEnvelopeHeader({ compressed, dictionary: false })))).toEqual({ compressed, dictionary: false });
     }
+    expect(decodeEnvelopeHeader(framed(encodeEnvelopeHeader({ compressed: true, dictionary: true })))).toEqual({ compressed: true, dictionary: true });
+  });
+
+  it("never writes, and never reads, a dictionary flag on an uncompressed frame", () => {
+    // The flag says how the payload was deflated. Without deflate it describes
+    // nothing, so a sender cannot produce it and a receiver refuses it rather
+    // than guessing which of the two it meant.
+    expect(encodeEnvelopeHeader({ compressed: false, dictionary: true })[0]).toBe(0);
+    expect(decodeEnvelopeHeader(framed(new Uint8Array([0x02])))).toBeNull();
   });
 
   it("refuses a frame too short to hold a tag", () => {
@@ -36,7 +45,8 @@ describe("the envelope header", () => {
   it("refuses a flag this version does not define", () => {
     // A newer sender. Guessing at its framing would fail on the tag anyway,
     // later and less clearly than saying so here.
-    expect(decodeEnvelopeHeader(framed(new Uint8Array([0x02])))).toBeNull();
+    expect(decodeEnvelopeHeader(framed(new Uint8Array([0x04])))).toBeNull();
+    expect(decodeEnvelopeHeader(framed(new Uint8Array([0x83])))).toBeNull();
   });
 });
 
@@ -97,5 +107,14 @@ describe("whether to send the compressed candidate", () => {
 
   it("never keeps a candidate that grew", () => {
     expect(shouldSendCompressed(1000, 1200)).toBe(false);
+  });
+
+  it("lowers the floor with a dictionary, but not the saving it demands", () => {
+    // Measured with the dictionary: a 126-byte terminal.state deflates to 56.
+    // Under the plain floor it would never have been tried.
+    expect(shouldSendCompressed(126, 56)).toBe(false);
+    expect(shouldSendCompressed(126, 56, true)).toBe(true);
+    // The keystroke halves (36 -> 18) and is still not worth a decompress.
+    expect(shouldSendCompressed(36, 18, true)).toBe(false);
   });
 });
