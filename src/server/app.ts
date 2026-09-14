@@ -72,6 +72,7 @@ import { redactForScope } from "./e2ee-redaction.js";
 import { normalizePassphrase } from "../shared/e2ee-keys.js";
 import { nameForSession } from "../shared/session-tab-name.js";
 import { classifyNetworkScope, isLoopbackAddress, type NetworkScope } from "./traffic-scope.js";
+import { immutableCacheControl } from "./static-cache.js";
 import { buildIndexDelta, indexDeltaIsEmpty } from "../shared/index-delta.js";
 import { createTrafficLog } from "./traffic-log.js";
 import { cachedResumeThread, rememberDurableThread, resolveSavedCodexThread } from "./codex-thread-fallback.js";
@@ -137,6 +138,8 @@ type Client = {
   /** Serialized payload sent since the last sample, which is the numerator of the compression ratio. */
   payloadOut: number;
   payloadIn: number;
+  /** When the socket opened, so its close can say how long it lived. */
+  openedAt: number;
   /** The index revision this client was last sent, so the next one can be a delta. */
   indexRevision: number | null;
   /**
@@ -225,13 +228,28 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   });
   const recordTraffic = (
     direction: "out" | "in",
-    channel: "ws" | "http" | "wire",
+    channel: "ws" | "http" | "wire" | "conn",
     type: string,
     bytes: number,
     options: { rawBytes?: number; scope?: NetworkScope } = {},
   ): void => {
     if (trafficLoggingEnabled) ledger.record(direction, channel, type, bytes, options);
   };
+  /**
+   * How often an idle WebSocket is pinged so nothing in between drops it.
+   *
+   * Cloudflare closes a WebSocket that carries no frame for 100 seconds. Two
+   * weeks of ledger showed what that costs a page that is merely open: 412
+   * reconnects in one idle day, each a fresh TLS handshake, an Access-cookied
+   * upgrade, an E2EE handshake and a 2.9 KB subscribe -- 58% of all tunnel
+   * connections were this. Neither side sent a ping; nothing else was wrong.
+   *
+   * A ping is a 2-byte control frame outside the seal and carries nothing.
+   * Loopback has no intermediary and is left alone. `0` turns it off.
+   */
+  const websocketKeepaliveMs = process.env.CODEX_PROMPTOR_WS_KEEPALIVE_MS === "0"
+    ? 0
+    : boundedInteger(process.env.CODEX_PROMPTOR_WS_KEEPALIVE_MS, 1_000, 90_000, 30_000);
   const terminalResyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const rawResponderOwners = new Map<string, string>();
   const responderLeaseEpochs = new Map<string, number>();
@@ -1946,10 +1964,26 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   trafficPruneTimer?.unref?.();
   if (trafficLoggingEnabled) void trafficLog.prune();
 
+  // The pings are recorded under their own type so the wire ratio stays
+  // explainable: a keepalive is real wire cost with no payload behind it, and
+  // hiding it inside `payloadOut` would make the overhead invisible.
+  const pingIdleConnections = (): void => {
+    for (const client of clients) {
+      if (client.scope === "local" || client.socket.readyState !== 1) continue;
+      try {
+        client.socket.ping();
+        recordTraffic("out", "ws", "ping", 2, { scope: client.scope });
+      } catch { /* closing; its close handler does the bookkeeping */ }
+    }
+  };
+  const keepaliveTimer = websocketKeepaliveMs > 0 ? setInterval(pingIdleConnections, websocketKeepaliveMs) : null;
+  keepaliveTimer?.unref?.();
+
   app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, chatgpt, browser: browserPool, a2a, issueHookLease, token, restoreOpenSessions, importDiscoveredSessions, close: async () => {
     clearInterval(stallTimer);
     if (trafficFlushTimer) clearInterval(trafficFlushTimer);
     if (trafficPruneTimer) clearInterval(trafficPruneTimer);
+    if (keepaliveTimer) clearInterval(keepaliveTimer);
     // Seal the minute in progress so a restart does not lose it.
     await trafficLog.append(ledger.drain(Date.now() + 60_000)).catch(() => undefined);
     await timers.stop();
@@ -2012,6 +2046,27 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     }
     return total;
   };
+
+  /** The inbound counterpart: request line plus headers as they arrived, before Node folded them. */
+  const requestHeaderBytes = (request: FastifyRequest): number => {
+    let total = Buffer.byteLength(`${request.method} ${request.url} HTTP/1.1\r\n\r\n`, "utf8");
+    const raw: unknown = request.raw?.rawHeaders;
+    if (Array.isArray(raw)) {
+      for (let index = 0; index + 1 < raw.length; index += 2) {
+        total += Buffer.byteLength(String(raw[index]), "utf8") + Buffer.byteLength(String(raw[index + 1]), "utf8") + 4;
+      }
+    }
+    return total;
+  };
+
+  // Vite's hashed chunks can be cached for good; the plugin below sends
+  // `max-age=0` for everything and cannot decide per file, so the header is
+  // rewritten here. See static-cache.ts for what this was costing.
+  app.addHook("onSend", async (request, reply, payload) => {
+    const pinned = immutableCacheControl(request.url, reply.statusCode);
+    if (pinned) reply.header("cache-control", pinned);
+    return payload;
+  });
 
   // Measured on the socket rather than from the payload, because the payload
   // this hook chain sees is the one *before* @fastify/compress rewrites it:
@@ -2094,10 +2149,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const scope = classifyNetworkScope(request.raw.socket?.remoteAddress, request.headers.host);
     recordTraffic("out", "http", `${request.method} ${route} ${reply.statusCode}`, wire, { rawBytes: headerBytes(reply) + body, scope });
 
-    const requestBytes = Number(request.headers["content-length"]);
-    if (Number.isFinite(requestBytes) && requestBytes > 0) {
-      recordTraffic("in", "http", `${request.method} ${route}`, requestBytes, { scope });
-    }
+    // Headers count, not only the body. Over the tunnel every request carries
+    // the Access JWT cookie and the token header -- about a kilobyte -- and
+    // most requests are GETs with no body at all, so counting bodies alone
+    // left roughly a thousand requests a fortnight at zero.
+    const declared = Number(request.headers["content-length"]);
+    const requestBody = Number.isFinite(declared) && declared > 0 ? declared : 0;
+    recordTraffic("in", "http", `${request.method} ${route}`, requestHeaderBytes(request) + requestBody, { scope });
   });
 
   await app.register(fastifyCompress, {
@@ -3474,10 +3532,15 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       wireInAt: Number(netSocket?.bytesRead ?? 0),
       payloadOut: 0,
       payloadIn: 0,
+      openedAt: Date.now(),
       indexRevision: null,
       wire: null,
     };
     clients.add(client);
+    // Connections are counted as well as their messages: how many opened, and
+    // below, how long each lived and with which close code. A ledger of
+    // messages alone could not see that every idle socket was being cut.
+    recordTraffic("in", "conn", "open", 0, { scope: client.scope });
     ui.connect();
     // Loopback is where the passphrase was typed; it has nothing to prove.
     let pending: PendingHandshake | null = null;
@@ -3489,10 +3552,16 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         if (socket.readyState === 1) socket.send(JSON.stringify(pending.message));
       }).catch(() => { socket.close(1011, "Encryption unavailable"); });
     }
-    socket.on("close", () => {
+    socket.on("close", (code: number) => {
       if (!clients.delete(client)) return;
       // A connection that lived and died between two flushes still spent bytes.
       sampleConnectionWire(client);
+      // Lifetime in seconds, in the `bytes` slot: `mean` then reads as mean
+      // lifetime per close code. 1006 is the TCP connection going away without
+      // a close frame -- an intermediary's timeout looks like many 1006s with
+      // a mean just over its limit.
+      const lifetimeSeconds = Math.max(0, Math.round((Date.now() - client.openedAt) / 1_000));
+      recordTraffic("in", "conn", `close.${Number.isInteger(code) ? code : "unknown"}`, lifetimeSeconds, { scope: client.scope });
       const rawTabs = [...client.terminalSubscriptions.entries()]
         .filter(([, stream]) => stream.mode === "raw")
         .map(([tabId]) => tabId);

@@ -168,7 +168,7 @@ describe("traffic recording", () => {
     // inject() has no peer address, so it classifies as remote -- which is the
     // safe direction to be wrong in, and is asserted here so the fallback does
     // not silently become "local".
-    expect(Object.keys(rollup.entries).every((key) => /^(?:out|in):(?:ws|http|wire):(?:local|tunnel|remote):/.test(key))).toBe(true);
+    expect(Object.keys(rollup.entries).every((key) => /^(?:out|in):(?:ws|http|wire|conn):(?:local|tunnel|remote):/.test(key))).toBe(true);
   });
 
   it("keeps the only real compression ratio on its own channel", async () => {

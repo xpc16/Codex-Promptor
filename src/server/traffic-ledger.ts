@@ -30,8 +30,15 @@ export type TrafficDirection = "out" | "in";
  * seal, so a `ws` entry's `bytes` is the sealed frame and `rawBytes` is the
  * JSON that went into it -- and the `wire` ratio falls to about 1, which is
  * what permessage-deflate is worth against ciphertext.
+ *
+ * `conn` is the odd one out: it counts connections, not bytes. `open` has
+ * `bytes` 0; `close.<code>` carries the connection's lifetime **in seconds**
+ * in `bytes`, so `mean` reads as mean lifetime and the size classes as
+ * lifetime classes. It exists because two weeks of message records could not
+ * show that an intermediary was cutting every idle socket at 100 seconds --
+ * the ledger saw the handshakes but never a close, and never a duration.
  */
-export type TrafficChannel = "ws" | "http" | "wire";
+export type TrafficChannel = "ws" | "http" | "wire" | "conn";
 
 /** Fixed size classes, in bytes. Upper bound of each class; the last is unbounded. */
 export const SIZE_CLASSES = [256, 1024, 4096, 16_384, 65_536, 262_144, 1_048_576, Number.POSITIVE_INFINITY] as const;
