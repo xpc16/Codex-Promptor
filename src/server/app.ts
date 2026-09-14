@@ -125,6 +125,13 @@ type Client = {
   id: string;
   socket: any;
   stateSubscriptions: Set<string>;
+  /**
+   * Every conversation's state events, present and future, without naming
+   * them. The index socket wants exactly this -- the lights on every tab --
+   * and used to say so by listing every id: 2.9 KB per subscribe, 60% of the
+   * tunnel's inbound bytes, and a reconnect whenever a tab was created.
+   */
+  allTabs: boolean;
   terminalSubscriptions: Map<string, TerminalStream>;
   wantsIndex: boolean;
   wantsDetails: boolean;
@@ -444,7 +451,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     const sequence = (sequences.get(tabId) ?? 0) + 1;
     sequences.set(tabId, sequence);
     for (const client of clients) {
-      if (client.stateSubscriptions.has(tabId) && (!detailsOnly || client.wantsDetails)) sendClient(client, { ...message, tabId, sequence }, stateTrafficKind(message.type));
+      const subscribed = client.allTabs || client.stateSubscriptions.has(tabId);
+      if (subscribed && (!detailsOnly || client.wantsDetails)) sendClient(client, { ...message, tabId, sequence }, stateTrafficKind(message.type));
     }
   };
 
@@ -3523,6 +3531,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       id: traffic.register(socket),
       socket,
       stateSubscriptions: new Set(),
+      allTabs: false,
       terminalSubscriptions: new Map(),
       wantsIndex: false,
       wantsDetails: true,
@@ -3629,7 +3638,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
           }
           client.wantsIndex = message.index === true;
           client.wantsDetails = message.details !== false;
-          traffic.setRole(client.id, client.stateSubscriptions.size > 0 || client.wantsIndex, client.terminalSubscriptions.size > 0);
+          // Only the socket that also wants the index may watch every tab: a
+          // terminal socket asking for it would receive every conversation's
+          // events for no reason. Snapshots below still walk the explicit
+          // list only -- "all tabs" must never mean "read every bundle".
+          client.allTabs = message.allTabs === true && client.wantsIndex;
+          traffic.setRole(client.id, client.allTabs || client.stateSubscriptions.size > 0 || client.wantsIndex, client.terminalSubscriptions.size > 0);
 
           for (const [tabId, stream] of client.terminalSubscriptions) {
             if (stream.mode !== "projection") continue;

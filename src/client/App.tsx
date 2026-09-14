@@ -299,7 +299,10 @@ export function App() {
       live.binaryType = "arraybuffer";
       const sendSubscribe = () => gateSend(live, JSON.stringify({
         type: "subscribe",
-        tabIds: tabIdsKey ? tabIdsKey.split(",") : [],
+        // Every conversation, present and future, without naming them. Listing
+        // the ids made this 2.9 KB and tied the socket's life to the tab list,
+        // so creating a conversation tore it down and reconnected it.
+        allTabs: true,
         snapshots: false,
         details: false,
         // Only this socket wants navigation pushes; the per-tab terminal
@@ -360,8 +363,10 @@ export function App() {
             if (next) adoptIndex(next);
             // Deliberately without indexRevision: this page has just proved
             // it cannot line up with what the server holds, so it wants the
-            // whole index, which is the one thing that always applies.
-            else gateSend(live, JSON.stringify({ type: "subscribe", tabIds: [], index: true, snapshots: false, terminals: {} }));
+            // whole index, which is the one thing that always applies. Still
+            // `allTabs`, or this re-subscribe would silently drop every
+            // tab's lights until the next reconnect.
+            else gateSend(live, JSON.stringify({ type: "subscribe", allTabs: true, index: true, snapshots: false, details: false, terminals: {} }));
           }
         }
       };
@@ -380,7 +385,7 @@ export function App() {
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       socket?.close();
     };
-  }, [adoptIndex, markRecentCompletion, refresh, tabIdsKey]);
+  }, [adoptIndex, markRecentCompletion, refresh]);
   useEffect(() => {
     const timer = window.setInterval(() => setClock(new Date()), 30_000);
     return () => window.clearInterval(timer);
