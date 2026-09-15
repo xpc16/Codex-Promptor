@@ -22,7 +22,7 @@ describe("websocket keepalive and connection accounting", () => {
   const previousKeepalive = process.env.CODEX_PROMPTOR_WS_KEEPALIVE_MS;
 
   beforeEach(async () => {
-    // Fast enough to observe in a test; the default is 30s.
+    // Fast enough to observe in a test; the default is 60 s, well inside the edge's 100 s.
     process.env.CODEX_PROMPTOR_WS_KEEPALIVE_MS = "1000";
     root = await mkdtemp(path.join(os.tmpdir(), "promptor-keepalive-"));
     const staticRoot = path.join(root, "dist", "client", "assets");

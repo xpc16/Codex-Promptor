@@ -254,10 +254,17 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
    *
    * A ping is a 2-byte control frame outside the seal and carries nothing.
    * Loopback has no intermediary and is left alone. `0` turns it off.
+   *
+   * Every 60 s, not 30: the edge counts idleness from the last frame in
+   * either direction, and the browser's pong is a frame, so the gap between
+   * frames is the interval itself. 60 leaves 40 s for the event loop to be
+   * late, which is more than any healthy tick will need. The bytes are not
+   * the reason to stretch it -- 8 B a round at the origin -- the phone is:
+   * every ping is a radio wake-up, and half as many is half as many.
    */
   const websocketKeepaliveMs = process.env.CODEX_PROMPTOR_WS_KEEPALIVE_MS === "0"
     ? 0
-    : boundedInteger(process.env.CODEX_PROMPTOR_WS_KEEPALIVE_MS, 1_000, 90_000, 30_000);
+    : boundedInteger(process.env.CODEX_PROMPTOR_WS_KEEPALIVE_MS, 1_000, 90_000, 60_000);
   /**
    * The preset compression dictionaries this process will offer a sealed
    * connection (e2ee-dictionary.ts), as digests.
