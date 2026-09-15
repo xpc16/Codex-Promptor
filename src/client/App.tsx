@@ -49,7 +49,7 @@ import { createInputCoalescer } from "./input-coalescer.js";
 import { applyIndexDelta } from "../shared/index-delta.js";
 import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenState } from "./terminal-projection.js";
 import { resolveAutomaticTerminalTransport } from "./terminal-preference.js";
-import { terminalShortcutInput } from "./terminal-shortcut.js";
+import { altArrowSequence, terminalShortcutInput } from "./terminal-shortcut.js";
 import { createConnectionAlarm, reconnectDelay } from "./socket-retry.js";
 import { forgetCachedTerminal, readCachedProjection, readCachedRawTerminal, rememberProjection, rememberRawTerminal, retainCachedTerminals } from "./terminal-cache.js";
 import {
@@ -1928,6 +1928,16 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       });
     };
     const inputDisposable = term.onData(sendInput);
+    // Alt+Up / Alt+Down reach the PTY as themselves. xterm.js would rewrite
+    // them into Ctrl+Up / Ctrl+Down, which is why Codex's "Alt+↑ to answer"
+    // did nothing; see altArrowSequence. Every event type of the chord is
+    // taken from xterm so it cannot also emit its own version.
+    term.attachCustomKeyEventHandler((event) => {
+      const sequence = altArrowSequence(event);
+      if (!sequence) return true;
+      if (event.type === "keydown") sendInput(sequence);
+      return false;
+    });
     const foregroundQuery = term.parser.registerOscHandler(10, (data) => {
       if (!projectionMode && data.trim() === "?") sendInput(`\x1b]10;${themeRef.current === "light" ? "rgb:1d1d/2727/3838" : "rgb:e5e5/eded/f8f8"}\x1b\\`);
       return true;
@@ -2350,6 +2360,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
             <option value="escape-twice">Esc*2</option>
             <option value="escape">Esc</option>
             <option value="tab">Tab</option>
+            <option value="alt-up">Alt+↑</option>
           </select>
           <KeyInputIcon />
         </label>
