@@ -50,8 +50,8 @@ const SAMPLES: unknown[] = [
   { type: "answers.changed", tabId: "", sequence: 0, delta: { revision: 0, updatedAt: "", total: 0, upserts: [], deletedIds: [] } },
   { type: "index.changed", delta: { from: 0, revision: 0, updatedAt: "", tabs: { revision: 0, updatedAt: "", total: 0, upserts: [], deletedIds: [], order: [] }, groups: { revision: 0, updatedAt: "", total: 0, upserts: [], deletedIds: [] }, ui: { lastSelectedTabId: "" } } },
   // Subscriptions and the small state events.
-  { type: "subscribe", terminalProtocolVersion: 2, tabIds: [""], allTabs: true, snapshots: true, details: true, index: true, indexRevision: 0, snapshotTags: {}, terminals: { "": { mode: "projection", viewportRows: 20, fps: 2, generation: "", revision: 0, sizeEpoch: 0 } } },
-  { type: "terminal.subscription", tabId: "", mode: "projection", streamId: "", viewportRows: 20, fps: 2, writable: true, sequence: 0 },
+  { type: "subscribe", terminalProtocolVersion: 2, tabIds: [""], allTabs: true, snapshots: true, details: true, index: true, indexRevision: 0, snapshotTags: {}, terminals: { "": { mode: "projection", viewportRows: 30, fps: 2, generation: "", revision: 0, sizeEpoch: 0 } } },
+  { type: "terminal.subscription", tabId: "", mode: "projection", streamId: "", viewportRows: 30, fps: 2, writable: true, sequence: 0 },
   { type: "terminal.state", tabId: "", sequence: 0, state: "running", cols: 120, rows: 30 },
   { type: "answer.activity", tabId: "", sequence: 0, answerId: "", completedAt: "", status: "completed", origin: "queue" },
   { type: "error", error: { code: "", message: "" } },
@@ -61,14 +61,14 @@ const SAMPLES: unknown[] = [
   // The tunnel's main flow: a projection frame. Header once, then one row of each kind.
   {
     type: "terminal.screen", tabId: "", generation: "", streamId: "", sequence: 0, revision: 0, full: false,
-    cols: 120, totalRows: 0, viewportTop: 0, viewportRows: 20, alternateScreen: false, sizeEpoch: 0,
+    cols: 120, totalRows: 0, viewportTop: 0, viewportRows: 30, alternateScreen: false, sizeEpoch: 0,
     inputModes: { applicationCursorKeys: false, applicationKeypad: false, bracketedPaste: true, mouseTracking: "none", sendFocus: false },
     cursor: { row: 0, col: 0, visible: true },
     rows: [
       { row: 0, clearToEnd: true, isWrapped: true, runs: [{ text: "", style: { fg: 2, bg: "default", flags: ["bold", "dim", "italic", "underline", "inverse"] } }] },
       { row: 0, clearToEnd: true, runs: [{ text: "", style: STYLE }, { text: "", style: STYLE }] },
     ],
-    scroll: { top: 0, bottom: 19, lines: 1 },
+    scroll: { top: 0, bottom: 29, lines: 1 },
   },
 ];
 
@@ -84,7 +84,7 @@ export const DICTIONARY_D1: Uint8Array = buildDictionary();
  * SHA-256 of DICTIONARY_D1, first 16 bytes, hex. Pinned by a test, and the
  * only thing that crosses the wire about the dictionary.
  */
-export const DICTIONARY_DIGEST = "d1:8727e11cbe99d4b68db641282496cd4f";
+export const DICTIONARY_DIGEST = "d1:8650f5e533a45649b76169b48b50b635";
 
 /** What a client offers, and what a server confirms: the digest, or nothing. */
 export function dictionaryOffered(value: unknown): boolean {

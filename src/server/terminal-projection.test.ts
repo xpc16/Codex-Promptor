@@ -23,6 +23,30 @@ describe("projection screen diffs", () => {
     expect(diff?.rows[0].runs[0].text).toBe("E");
   });
 
+  it("still recognises a scroll longer than ten rows, so a fast log stays incremental", () => {
+    // Twelve lines in one frame -- twenty-four a second at 2 fps, an ordinary
+    // build log. With the shift capped at ten this was not a scroll, and all
+    // thirty rows went out as dirty every frame.
+    const lines = (from: number, count: number) => Array.from({ length: count }, (_, i) => `line ${from + i}`);
+    const previous = snapshot([...lines(0, 27), "STATUS", "footer", "prompt"]);
+    const next = snapshot([...lines(12, 27), "STATUS", "footer", "prompt"], { revision: 2 });
+    const diff = diffTerminalScreens(previous, next);
+    expect(diff).toMatchObject({ full: false, scroll: { top: 0, bottom: 26, lines: 12 } });
+    // Only the twelve rows that actually appeared, not the whole viewport.
+    expect(diff?.rows.map((row) => row.row)).toEqual([15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26]);
+  });
+
+  it("does not invent a long shift out of rows that merely look alike", () => {
+    // Three blank rows at the top and three at the bottom would "match" under
+    // a shift of 27 if matching alone were enough. They are the same content
+    // in the same place, not content that moved.
+    const previous = snapshot(["", "", "", ...Array.from({ length: 24 }, (_, i) => `a${i}`), "", "", ""]);
+    const next = snapshot(["", "", "", ...Array.from({ length: 24 }, (_, i) => `b${i}`), "", "", ""], { revision: 2 });
+    const diff = diffTerminalScreens(previous, next);
+    expect(diff?.scroll).toBeUndefined();
+    expect(diff?.rows).toHaveLength(24);
+  });
+
   it("emits mode/cursor-only frames even when no cell changed", () => {
     const previous = snapshot(["ready"]);
     const next = snapshot(["ready"], {

@@ -1,12 +1,13 @@
 import { createRequire } from "node:module";
 import type { IBufferCell, Terminal as XtermTerminal } from "@xterm/headless";
-import type {
-  TerminalColor,
-  TerminalInputModes,
-  TerminalRunStyle,
-  TerminalScreenCursor,
-  TerminalScreenRow,
-  TerminalStyledRun,
+import {
+  PROJECTION_VIEWPORT_ROWS,
+  type TerminalColor,
+  type TerminalInputModes,
+  type TerminalRunStyle,
+  type TerminalScreenCursor,
+  type TerminalScreenRow,
+  type TerminalStyledRun,
 } from "../shared/terminal-protocol.js";
 
 const require = createRequire(import.meta.url);
@@ -151,7 +152,7 @@ export class TerminalScreenModel {
     });
   }
 
-  async snapshot(requestedRows = 20): Promise<TerminalScreenSnapshot> {
+  async snapshot(requestedRows = PROJECTION_VIEWPORT_ROWS): Promise<TerminalScreenSnapshot> {
     this.sealWriteBatch();
     await this.tail;
     if (this.disposed) throw new Error("TERMINAL_SCREEN_DISPOSED");

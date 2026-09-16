@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import * as pty from "node-pty";
 import { terminateProcessTree } from "./codex.js";
 import { TerminalScreenModel, type TerminalScreenSnapshot } from "./terminal-screen.js";
+import { PROJECTION_VIEWPORT_ROWS } from "../shared/terminal-protocol.js";
 
 export type TerminalEvent =
   | { tabId: string; type: "output"; generation: string; startOffset: number; endOffset: number; dataBase64: string }
@@ -300,7 +301,7 @@ export class PtyManager extends EventEmitter {
     if (!snapshot) return "";
     return snapshot.rows.map((row) => row.runs.map((run) => run.text).join("")).join("\n");
   }
-  async screenSnapshot(tabId: string, viewportRows = 20): Promise<TerminalScreenSnapshot | null> {
+  async screenSnapshot(tabId: string, viewportRows = PROJECTION_VIEWPORT_ROWS): Promise<TerminalScreenSnapshot | null> {
     const screen = this.screens.get(tabId);
     if (!screen) return null;
     try { return await screen.snapshot(viewportRows); }

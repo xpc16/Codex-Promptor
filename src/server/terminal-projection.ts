@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { TerminalScreenFrame, TerminalScreenRow, TerminalScreenScroll } from "../shared/terminal-protocol.js";
+import { PROJECTION_VIEWPORT_ROWS, type TerminalScreenFrame, type TerminalScreenRow, type TerminalScreenScroll } from "../shared/terminal-protocol.js";
 import type { TerminalScreenSnapshot, TerminalScreenSnapshotRow } from "./terminal-screen.js";
 
 export type ProjectionSendResult = "sent" | "backpressured" | "closed";
@@ -25,7 +25,7 @@ export type ProjectionSchedulerConfig = {
 };
 
 export const defaultProjectionSchedulerConfig: ProjectionSchedulerConfig = {
-  defaultViewportRows: 20,
+  defaultViewportRows: PROJECTION_VIEWPORT_ROWS,
   defaultFps: 2,
   interactiveFrameMs: 35,
   interactiveWindowMs: 800,
@@ -361,7 +361,14 @@ export function detectScroll(previous: TerminalScreenSnapshotRow[], next: Termin
   const count = Math.min(previous.length, next.length);
   if (count < 4 || regularDirtyCount < 3) return undefined;
   let best: { scroll: TerminalScreenScroll; dirty: number; matched: number } | undefined;
-  const maxShift = Math.min(10, count - 1);
+  // Any shift that still leaves three rows to prove itself with. A fixed cap
+  // of ten meant that output faster than ten lines a frame -- twenty a second
+  // at 2 fps -- stopped being recognised as a scroll and every row went out as
+  // dirty: measured, a 20-row viewport under a fast log sent 19 rows a frame
+  // where 12 had actually appeared. The guards below (three matched rows,
+  // moved content, fewer dirty rows than without) are what keep a long shift
+  // from being invented; the cap was never doing that work.
+  const maxShift = Math.max(1, count - 3);
   for (let amount = 1; amount <= maxShift; amount += 1) {
     for (const direction of [1, -1] as const) {
       const offset = amount * direction;

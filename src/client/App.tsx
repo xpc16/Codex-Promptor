@@ -22,7 +22,7 @@ import { deriveSessionKey } from "./e2ee-client.js";
 import { KEY_CHANGED_CLOSE_CODE } from "../shared/e2ee-handshake.js";
 import { applyRequirement, attachSocket, e2eeState, gateReceive, gateSend, noteSocketClosed, observeE2ee, useKey, type E2eeState } from "./e2ee-gate.js";
 import type { RuntimeDelta } from "../shared/runtime-delta.js";
-import type { TerminalScreenFrame, TerminalTransportMode } from "../shared/terminal-protocol.js";
+import { PROJECTION_VIEWPORT_ROWS, type TerminalScreenFrame, type TerminalTransportMode } from "../shared/terminal-protocol.js";
 import { DOCUMENT_RAW_CATCH_UP_BYTES } from "../shared/document-protocol.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
 import { completionNoticeExpiresAt, displayedStallSince, latestQueueCompletion, runnerIsWorking, stalledMinutes, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
@@ -1811,7 +1811,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     const initialSize = !projectionMode && runtime.terminal.cols !== null && runtime.terminal.rows !== null
       ? { cols: runtime.terminal.cols, rows: runtime.terminal.rows }
       : null;
-    const term = new Terminal({ ...(initialSize ?? (projectionMode ? { cols: 80, rows: 20 } : {})), cursorBlink: false, cursorStyle: "block", cursorInactiveStyle: "none", fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 14, lineHeight: 1.18, theme: getTerminalTheme(themeRef.current), scrollback: projectionMode ? 0 : 5000, allowProposedApi: false });
+    const term = new Terminal({ ...(initialSize ?? (projectionMode ? { cols: 80, rows: PROJECTION_VIEWPORT_ROWS } : {})), cursorBlink: false, cursorStyle: "block", cursorInactiveStyle: "none", fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 14, lineHeight: 1.18, theme: getTerminalTheme(themeRef.current), scrollback: projectionMode ? 0 : 5000, allowProposedApi: false });
     host.current.classList.toggle("projection", projectionMode);
     const fit = new FitAddon(); term.loadAddon(fit); term.open(host.current); term.blur(); terminal.current = term;
     // A wheel event can become a terminal input event when the running TUI
@@ -2017,7 +2017,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     const currentTerminalSubscription = (boundedCatchUp = false) => projectionMode
       ? {
         mode: "projection",
-        viewportRows: 20,
+        viewportRows: PROJECTION_VIEWPORT_ROWS,
         fps: 2,
         generation: projectionState?.generation ?? null,
         revision: projectionState?.revision ?? null,
@@ -2077,7 +2077,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
           streamId: projectionState?.streamId ?? null,
           revision: projectionState?.revision ?? null,
           sizeEpoch: projectionState?.sizeEpoch ?? null,
-          viewportRows: 20,
+          viewportRows: PROJECTION_VIEWPORT_ROWS,
         }));
       } else {
         gateSend(ws, JSON.stringify({ type: "terminal.sync", tabId, cursor }));

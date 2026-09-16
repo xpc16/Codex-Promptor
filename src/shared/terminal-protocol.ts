@@ -1,5 +1,19 @@
 export const TERMINAL_PROTOCOL_VERSION = 2;
 
+/**
+ * How many rows of the PTY a projection shows: the bottom this many.
+ *
+ * Thirty rather than twenty because the extra rows are close to free. A
+ * delta carries only the rows that changed, and the ten rows added at the
+ * top are the ones that change least; measured through the real diff and
+ * seal, the everyday shapes -- a spinner, a TUI redrawing its footer, a log
+ * at a dozen lines a second -- grew by 1-2%. Only a full frame grows with
+ * the height (+24%), and those are reconnects and resizes.
+ *
+ * Clamped on the server to the PTY's own height and to 60.
+ */
+export const PROJECTION_VIEWPORT_ROWS = 30;
+
 export type TerminalTransportMode = "raw" | "projection";
 
 export type TerminalColor = "default" | number | `#${string}`;
