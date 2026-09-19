@@ -60,6 +60,19 @@
 * { box-sizing: border-box; }
 .sr-only { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+/* On a touch screen a tap is a click and a drag is a scroll; neither may change
+   the page's scale. Two things did. A double tap -- on a row, on the terminal --
+   was the browser's zoom gesture, and every control under 16px made iOS zoom
+   the page to it on focus and leave it there: the terminal's hidden textarea
+   inherits 14px, so a tap on the terminal alone was enough. pan-x pan-y allows
+   scrolling and nothing else (no pinch, no double-tap zoom) wherever the
+   browser honours it; the font floor closes the focus-zoom path on iOS, which
+   ignores much of the viewport meta. The floor is invisible on the helper
+   textarea and a readable size on the rest. */
+@media (pointer: coarse) {
+  html, body, #root { touch-action: pan-x pan-y; }
+  input, textarea, select, .xterm .xterm-helper-textarea { font-size: max(1em, 16px); }
+}
 body { background: var(--page); color: var(--text); }
 button, input, textarea, select { font: inherit; }
 button { border: 0; cursor: pointer; color: inherit; }

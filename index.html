@@ -2,7 +2,12 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- A fixed shell, not a document: taps must never leave the page zoomed and
+         drifted. maximum-scale=1 is what stops iOS zooming to a focused control
+         (pinch still works there; Apple ignores the rest for accessibility);
+         user-scalable=no is what stops Android; interactive-widget makes the
+         layout shrink above the keyboard instead of hiding the composer under it. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Codex Promptor</title>
   </head>
