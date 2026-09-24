@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { inspectCodexSubmission, inspectCursorSubmission, reconcileClaudeTurn, reconcileCodexTurn, transcriptCursor } from "./transcript-reconciliation.js";
+import { inspectClaudeSubmission, inspectCodexSubmission, inspectCursorSubmission, reconcileClaudeTurn, reconcileCodexTurn, transcriptCursor } from "./transcript-reconciliation.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -11,6 +11,21 @@ afterEach(async () => {
 });
 
 describe("provider transcript reconciliation", () => {
+  it("confirms and finishes a Claude prompt pasted with a transport envelope", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-claude-paste-"));
+    temporaryDirectories.push(directory);
+    const file = path.join(directory, "session.jsonl");
+    const wrapped = '\n\n<pasted_content id="5865">\nfirst\nsecond\n</pasted_content id="5865">\n';
+    await fs.writeFile(file, [
+      { type: "user", uuid: "pasted-turn", timestamp: "2026-09-01T09:00:00.000Z", message: { role: "user", content: wrapped } },
+      { type: "assistant", timestamp: "2026-09-01T09:00:05.000Z", message: { role: "assistant", content: [{ type: "text", text: "done" }], stop_reason: "end_turn" } },
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n", "utf8");
+    const cursor = { path: file, offset: 0 };
+    expect(await inspectClaudeSubmission(cursor, "first\nsecond")).toEqual({ state: "accepted", turnId: "pasted-turn" });
+    expect(await reconcileClaudeTurn(cursor, "pasted-turn", "first\nsecond")).toMatchObject({ status: "completed", answer: "done" });
+    expect(await inspectClaudeSubmission(cursor, "first\nother")).toMatchObject({ state: "unknown" });
+  });
+
   it("never uses an earlier or later Claude answer to declare the current prompt finished", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-claude-turn-boundary-"));
     temporaryDirectories.push(directory);

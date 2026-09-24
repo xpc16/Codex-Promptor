@@ -25,7 +25,7 @@ import type { RuntimeDelta } from "../shared/runtime-delta.js";
 import { PROJECTION_VIEWPORT_ROWS, type TerminalScreenFrame, type TerminalTransportMode } from "../shared/terminal-protocol.js";
 import { DOCUMENT_RAW_CATCH_UP_BYTES } from "../shared/document-protocol.js";
 import { reorderPromptIds } from "../shared/prompt-order.js";
-import { completionNoticeExpiresAt, displayedStallSince, latestQueueCompletion, runnerIsWorking, stalledMinutes, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
+import { completionNoticeExpiresAt, displayedStallSince, latestQueueCompletion, runnerHasActiveWork, runnerIsWorking, stalledMinutes, tabVisualState, type TabActivitySummary } from "../shared/tab-activity.js";
 import { EARLIER_ANSWER_PAGE, EARLIER_PROMPT_PAGE, INITIAL_ANSWER_WINDOW, INITIAL_PROMPT_WINDOW } from "../shared/tab-window.js";
 import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
@@ -336,6 +336,7 @@ export function App() {
               runnerState: runnerSection.state,
               desiredState: runnerSection.desiredState,
               activePromptId: runnerSection.activePromptId,
+              activeTurnId: runnerSection.activeTurnId,
               lastQueueCompletedAt: current[tabId]?.lastQueueCompletedAt ?? null,
             },
           }));
@@ -347,6 +348,7 @@ export function App() {
               runnerState: current[tabId]?.runnerState ?? "paused",
               desiredState: current[tabId]?.desiredState ?? "paused",
               activePromptId: current[tabId]?.activePromptId ?? null,
+              activeTurnId: current[tabId]?.activeTurnId ?? null,
               lastQueueCompletedAt: completedAt,
             },
           }));
@@ -431,6 +433,7 @@ export function App() {
         runnerState: bundle.runtime.runner.state,
         desiredState: bundle.runtime.runner.desiredState,
         activePromptId: bundle.runtime.runner.activePromptId,
+        activeTurnId: bundle.runtime.runner.activeTurnId,
         lastQueueCompletedAt: latestQueueCompletion(bundle.prompts.prompts),
       },
     }));
@@ -1440,7 +1443,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     if (!box || disabled || isShell) return;
     box.style.height = `${clampPromptComposerHeight(box.getBoundingClientRect().height + delta, window.innerHeight)}px`;
   };
-  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={activeRoots.length > 0 ? t("a2a.runningHelp", { count: activeRoots.length }) : runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : activeRoots.length > 0 ? "a2a" : runnerIsWorking(runtime.runner.state) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span>{stalledFor !== null && <span className="queue-state stalled" title={t("queue.stalledHelp", { minutes: stalledFor })}><i className="status-dot" /><span>{t("queue.stalled", { minutes: stalledFor })}</span></span>}</>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={showStartPending || undefined} onClick={() => void changeRunner("start")}>{t(showStartPending ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
+  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={activeRoots.length > 0 ? t("a2a.runningHelp", { count: activeRoots.length }) : runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : activeRoots.length > 0 ? "a2a" : runnerHasActiveWork(runtime.runner) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span>{stalledFor !== null && <span className="queue-state stalled" title={t("queue.stalledHelp", { minutes: stalledFor })}><i className="status-dot" /><span>{t("queue.stalled", { minutes: stalledFor })}</span></span>}</>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={showStartPending || undefined} onClick={() => void changeRunner("start")}>{t(showStartPending ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
     {activeRoots.map((root) => <A2aRootBar key={root.rootId} root={root} onError={onError} />)}
     <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t(notebookOnly ? "queue.notebookEmpty" : "queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} executionDisabled={!runnable} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; if (!sourceId) nativeDragTarget.current = null; }} onNativeDragTarget={(targetId) => { if (nativeDragSource.current) nativeDragTarget.current = targetId; }} onNativeDrop={() => { const sourceId = nativeDragSource.current; const targetId = nativeDragTarget.current; nativeDragSource.current = null; nativeDragTarget.current = null; if (sourceId && targetId) void reorder(sourceId, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
@@ -1756,8 +1759,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
   const transportMode: TerminalTransportMode = projectionSupported && !projectionFailed
     ? resolveAutomaticTerminalTransport(location.hostname)
     : "raw";
-  const runnerBusy = runtime.runner.desiredState === "running"
-    || ["starting", "waiting_for_thread", "dispatching", "reconciling", "running", "waiting_for_prompt", "pausing"].includes(runtime.runner.state);
+  const runnerBusy = runnerHasActiveWork(runtime.runner);
   closedRef.current = closed;
   activeRef.current = active;
   themeRef.current = theme;

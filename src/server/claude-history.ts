@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isInjectedClaudePrompt } from "./claude-injected-prompt.js";
+import { unwrapClaudePastedContent } from "./claude-pasted-content.js";
 import type { HistoryReport } from "./history.js";
 import { syncHistory } from "./history.js";
 import type { StorageService } from "./storage.js";
@@ -207,7 +208,7 @@ function humanPrompts(records: TranscriptRecord[]): Array<TranscriptRecord & { _
 }
 
 function normalizedHumanPrompt(record: TranscriptRecord, content: any): string | null {
-  const text = contentText(content).trim();
+  const text = unwrapClaudePastedContent(contentText(content)).trim();
   if (!text) return null;
   const originKind = String(record.origin?.kind ?? "").trim().toLowerCase();
   const promptSource = String(record.promptSource ?? record.prompt_source ?? "").trim().toLowerCase();

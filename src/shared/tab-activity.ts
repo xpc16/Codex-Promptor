@@ -6,6 +6,8 @@ export type TabActivitySummary = {
   runnerState: RuntimeFile["runner"]["state"];
   desiredState: RuntimeFile["runner"]["desiredState"];
   activePromptId: string | null;
+  /** Older running servers omit this from the lightweight bootstrap summary. */
+  activeTurnId?: string | null;
   lastQueueCompletedAt: string | null;
 };
 
@@ -18,11 +20,20 @@ export type TabVisualState = "closed" | "idle" | "running" | "error" | "neutral"
  * turn, so the agent is still working and the indicator must still read as
  * working. What the pause changed is whether the queue keeps rolling, and
  * that is a separate indicator.
+ * "reconciling" only means a submission has no acknowledgement yet; it may
+ * remain there after the CLI has finished an unrelated turn.
  */
-const WORKING_RUNNER_STATES: ReadonlySet<RuntimeFile["runner"]["state"]> = new Set(["dispatching", "reconciling", "running", "pausing"]);
+const WORKING_RUNNER_STATES: ReadonlySet<RuntimeFile["runner"]["state"]> = new Set(["dispatching", "running", "pausing"]);
 
 export function runnerIsWorking(state: RuntimeFile["runner"]["state"]): boolean {
   return WORKING_RUNNER_STATES.has(state);
+}
+
+/** A submission waiting for history confirmation has no proven active turn. */
+export function runnerHasActiveWork(runner: Pick<RuntimeFile["runner"], "state" | "activePromptId" | "activeTurnId">): boolean {
+  if (!runner.activePromptId) return false;
+  if (runner.state === "dispatching") return true;
+  return (runner.state === "running" || runner.state === "pausing") && Boolean(runner.activeTurnId);
 }
 
 /**
@@ -61,8 +72,16 @@ export function settledDesiredState(desired: RuntimeFile["runner"]["desiredState
 }
 
 export function promptIsExecuting(activity: TabActivitySummary | undefined): boolean {
-  if (!activity?.activePromptId) return false;
-  return runnerIsWorking(activity.runnerState);
+  if (activity?.activeTurnId === undefined) {
+    // A rebuilt page can connect while the older backend still owns live
+    // turns. Keep its active runs visible until the next backend restart.
+    return Boolean(activity?.activePromptId && runnerIsWorking(activity.runnerState));
+  }
+  return Boolean(activity && runnerHasActiveWork({
+    state: activity.runnerState,
+    activePromptId: activity.activePromptId,
+    activeTurnId: activity.activeTurnId,
+  }));
 }
 
 export function tabVisualState(sessionState: Session["state"], activity: TabActivitySummary | undefined): TabVisualState {

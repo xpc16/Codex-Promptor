@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import type { SubmitEvidence } from "./prompt-submit.js";
 import { sameSubmittedPrompt } from "./prompt-submit.js";
+import { unwrapClaudePastedContent } from "./claude-pasted-content.js";
 import { readCodexRolloutSlice } from "./codex-history.js";
 
 const MAX_INCREMENT_BYTES = 8 * 1024 * 1024;
@@ -292,7 +293,7 @@ function claudeHumanPrompt(record: any): { text: string; turnId: string } | null
   const origin = String(record?.origin?.kind ?? "").toLowerCase();
   const source = String(record?.promptSource ?? record?.prompt_source ?? "").toLowerCase();
   if ((origin && origin !== "human") || source === "system") return null;
-  const text = contentText(content).trim();
+  const text = unwrapClaudePastedContent(contentText(content)).trim();
   if (!text || /^\s*<(?:task-notification|system-reminder|local-command-(?:caveat|stdout|stderr))\b/i.test(text)) return null;
   if (/^\s*\/compact(?:\s|$)/i.test(text)) return null;
   return { text, turnId: String(record?.promptId ?? record?.prompt_id ?? record?.uuid ?? "") || `claude-turn-${record?.timestamp ?? Date.now()}` };

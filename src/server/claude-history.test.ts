@@ -1,9 +1,51 @@
 import { describe, expect, it } from "vitest";
-import { parseClaudeTranscript } from "./claude-history.js";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { newAttempt, newPrompt } from "../shared/schemas.js";
+import { parseClaudeTranscript, syncClaudeHistory } from "./claude-history.js";
+import { StorageService } from "./storage.js";
 
 const line = (value: unknown) => JSON.stringify(value);
 
 describe("Claude Code transcript parsing", () => {
+  it("relinks a completed pasted turn to its unconfirmed queue prompt on history sync", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "promptor-claude-history-paste-"));
+    try {
+      const storage = new StorageService(root);
+      await storage.ensure();
+      const tab = await storage.createTab("pasted queue");
+      const bundle = await storage.readTab(tab.id);
+      const prompt = newPrompt("queued prompt", "queue");
+      const attempt = newAttempt("queue");
+      Object.assign(attempt, { status: "dispatching", startedAt: "2026-09-01T09:00:00.000Z", clientUserMessageId: "client-pasted" });
+      Object.assign(prompt, { status: "dispatching", threadId: "session-pasted", startedAt: attempt.startedAt, clientUserMessageId: "client-pasted", attempts: [attempt] });
+      bundle.prompts.prompts = [prompt];
+      await storage.writePrompts(tab.id, bundle.prompts);
+      const transcriptPath = path.join(root, "session-pasted.jsonl");
+      await writeFile(transcriptPath, [
+        line({ type: "user", uuid: "u1", parentUuid: null, promptId: "p1", origin: { kind: "human" }, timestamp: "2026-09-01T09:00:00.250Z", message: { role: "user", content: '\n\n<pasted_content id="5865">\nqueued prompt\n</pasted_content id="5865">\n' } }),
+        line({ type: "assistant", uuid: "a1", parentUuid: "u1", timestamp: "2026-09-01T09:00:05.000Z", message: { id: "m1", role: "assistant", content: [{ type: "text", text: "done" }], stop_reason: "end_turn" } }),
+      ].join("\n") + "\n", "utf8");
+      await syncClaudeHistory(storage, tab.id, "session-pasted", transcriptPath);
+      const synced = await storage.readTab(tab.id);
+      expect(synced.prompts.prompts).toHaveLength(1);
+      expect(synced.prompts.prompts[0]).toMatchObject({ id: prompt.id, origin: "queue", status: "completed", codexTurnId: "p1" });
+      expect(synced.answers.answers).toHaveLength(1);
+      expect(synced.answers.answers[0]).toMatchObject({ promptId: prompt.id, finalAnswer: "done" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("imports terminal-pasted prompt text without Claude's wrapper", () => {
+    const transcript = [
+      line({ type: "user", uuid: "u1", parentUuid: null, promptId: "p1", origin: { kind: "human" }, message: { role: "user", content: '\n\n<pasted_content id="5865">\nqueued prompt\n</pasted_content id="5865">\n' } }),
+      line({ type: "assistant", uuid: "a1", parentUuid: "u1", message: { id: "m1", role: "assistant", content: [{ type: "text", text: "done" }], stop_reason: "end_turn" } }),
+    ].join("\n");
+    expect(parseClaudeTranscript(transcript, "session-pasted").turns[0].items[0].text).toBe("queued prompt");
+  });
+
   it("imports distinct typed prompts and their end_turn answers", () => {
     const transcript = [
       line({ type: "user", uuid: "u1", parentUuid: null, promptId: "p1", promptSource: "typed", origin: { kind: "human" }, timestamp: "2026-08-25T01:00:00Z", message: { role: "user", content: "first prompt" } }),

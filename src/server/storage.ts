@@ -367,6 +367,7 @@ export class StorageService {
       runnerState: runtime.runner.state,
       desiredState: runtime.runner.desiredState,
       activePromptId: runtime.runner.activePromptId,
+      activeTurnId: runtime.runner.activeTurnId,
       lastQueueCompletedAt: latestQueueCompletion(prompts.prompts),
     };
   }

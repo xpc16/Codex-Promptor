@@ -47,7 +47,7 @@ describe("Claude Code provider", () => {
     const starting = manager.rpc.startTurn("session-1", "queue prompt", "client-1", directory);
     await expect(manager.rpc.startTurn("session-1", "racing prompt", "client-race", directory)).rejects.toThrow("CLAUDE_PROMPT_SUBMISSION_IN_FLIGHT");
     await vi.waitFor(() => expect(submitted).toEqual(["queue prompt"]));
-    await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-1", prompt_id: "prompt-1", prompt: "queue prompt" });
+    await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-1", prompt_id: "prompt-1", prompt: '\n\n<pasted_content id="5865">\nqueue prompt\n</pasted_content id="5865">\n' });
     const { turnId } = await starting;
     expect(turnId).toBe("prompt-1");
     expect(manager.rpc.activeTurnIds("session-1")).toEqual(["prompt-1"]);

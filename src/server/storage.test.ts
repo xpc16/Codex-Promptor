@@ -3,12 +3,41 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isoNow, newPrompt } from "../shared/schemas.js";
+import { tabVisualState } from "../shared/tab-activity.js";
 import { StorageService, writeFileAtomicWithRetry } from "./storage.js";
 
 const temporaryRoots: string[] = [];
 
 afterEach(async () => {
   await Promise.all(temporaryRoots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+});
+
+describe("conversation activity summary", () => {
+  it.each(["claude", "codex"] as const)("shows an unconfirmed %s submission as idle and a confirmed turn as running", async (provider) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-activity-"));
+    temporaryRoots.push(root);
+    const storage = new StorageService(root);
+    const tab = await storage.createTab(provider);
+    const runtime = await storage.readRuntime(tab.id);
+    runtime.runner = {
+      ...runtime.runner,
+      state: "reconciling",
+      desiredState: "paused",
+      activePromptId: "prompt-1",
+      activeTurnId: null,
+    };
+    await storage.writeRuntime(tab.id, runtime);
+    const uncertain = await storage.readTabActivity(tab.id);
+    expect(uncertain.activeTurnId).toBeNull();
+    expect(tabVisualState("ready", uncertain)).toBe("idle");
+
+    runtime.runner.state = "running";
+    runtime.runner.activeTurnId = "turn-1";
+    await storage.writeRuntime(tab.id, runtime);
+    const confirmed = await storage.readTabActivity(tab.id);
+    expect(confirmed.activeTurnId).toBe("turn-1");
+    expect(tabVisualState("ready", confirmed)).toBe("running");
+  });
 });
 
 describe("atomic JSON writes", () => {

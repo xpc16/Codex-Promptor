@@ -5,6 +5,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { isInjectedClaudePrompt } from "./claude-injected-prompt.js";
+import { unwrapClaudePastedContent } from "./claude-pasted-content.js";
 import { CLAUDE_EXIT_MARKER, type PtyManager, type TerminalTheme } from "./pty.js";
 import type { QueueBinding, QueueRpc } from "./queue.js";
 import {
@@ -297,7 +298,7 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
   }
 
   private acceptPrompt(payload: any, sessionId: string): void {
-    const prompt = String(payload?.prompt ?? payload?.user_prompt ?? "");
+    const prompt = unwrapClaudePastedContent(String(payload?.prompt ?? payload?.user_prompt ?? ""));
     // Claude fires this hook for text it injects itself. Returning before the
     // submission slot is read leaves a queued prompt waiting for its own hook
     // rather than having a notification consume it.

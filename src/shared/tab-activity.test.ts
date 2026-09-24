@@ -5,6 +5,7 @@ import {
   displayedStallSince,
   latestQueueCompletion,
   promptIsExecuting,
+  runnerHasActiveWork,
   runnerIsWorking,
   settledDesiredState,
   tabVisualState,
@@ -15,6 +16,7 @@ const activity = (patch: Partial<TabActivitySummary> = {}): TabActivitySummary =
   runnerState: "paused",
   desiredState: "paused",
   activePromptId: null,
+  activeTurnId: null,
   lastQueueCompletedAt: null,
   ...patch,
 });
@@ -23,9 +25,15 @@ describe("tab activity", () => {
   it("distinguishes closed, idle, and actively running prompt states", () => {
     expect(tabVisualState("closed", activity())).toBe("closed");
     expect(tabVisualState("ready", activity())).toBe("idle");
-    expect(tabVisualState("ready", activity({ runnerState: "running", desiredState: "running", activePromptId: "prompt-1" }))).toBe("running");
+    expect(tabVisualState("ready", activity({ runnerState: "running", desiredState: "running", activePromptId: "prompt-1", activeTurnId: "turn-1" }))).toBe("running");
     expect(tabVisualState("ready", activity({ runnerState: "waiting_for_thread", desiredState: "running" }))).toBe("idle");
     expect(promptIsExecuting(activity({ runnerState: "dispatching", activePromptId: "prompt-1" }))).toBe(true);
+    expect(tabVisualState("ready", activity({ runnerState: "reconciling", desiredState: "paused", activePromptId: "prompt-1" }))).toBe("idle");
+    expect(promptIsExecuting(activity({ runnerState: "running", activePromptId: "prompt-1" }))).toBe(false);
+    expect(promptIsExecuting(activity({ runnerState: "running", activePromptId: "prompt-1", activeTurnId: undefined }))).toBe(true);
+    expect(promptIsExecuting(activity({ runnerState: "reconciling", activePromptId: "prompt-1", activeTurnId: undefined }))).toBe(false);
+    expect(promptIsExecuting(activity({ runnerState: "pausing", activePromptId: "prompt-1", activeTurnId: "turn-1" }))).toBe(true);
+    expect(runnerHasActiveWork({ state: "reconciling", activePromptId: "prompt-1", activeTurnId: null })).toBe(false);
   });
 
   it("finds the latest successful queue completion only", () => {
@@ -50,7 +58,7 @@ describe("what counts as the agent working", () => {
     // still running, so the indicator must not go dark yet.
     expect(runnerIsWorking("pausing")).toBe(true);
     expect(runnerIsWorking("dispatching")).toBe(true);
-    expect(runnerIsWorking("reconciling")).toBe(true);
+    expect(runnerIsWorking("reconciling")).toBe(false);
     expect(runnerIsWorking("running")).toBe(true);
   });
 
