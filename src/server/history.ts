@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { isoNow, type AnswerRecord, type Origin, type PromptRecord, newPrompt, type TabBundle } from "../shared/schemas.js";
 import { isSlashCommandPrompt, sameSubmittedPrompt } from "./prompt-submit.js";
+import { unwrapClaudePastedContent } from "./claude-pasted-content.js";
 import { StorageService } from "./storage.js";
 
 const normalizeType = (value: unknown) => String(value ?? "").replace(/[_-]/g, "").toLowerCase();
@@ -715,11 +716,21 @@ export async function syncHistory(storage: StorageService, tabId: string, thread
       if (!input || !final) { report.ignored += 1; continue; }
       recordedAnswerTurnIds.add(turnId);
       const recovery = recoverableSubmissionForTurn(bundle.prompts.prompts, threadId, turn, input.text);
-      const supersededPromptIds = new Set(recovery ? linkedTurnPrompts
+      // Older Claude history imports kept the paste envelope as a separate
+      // manual prompt. A prior sync may already have linked the real queue
+      // attempt, so recovery alone is no longer available to remove it.
+      const linkedQueueAttempt = bundle.tab.session.provider === "claude"
+        && linkedTurnPrompts.some((candidate) => (candidate.origin === "queue" || candidate.origin === "timer")
+          && candidate.attempts.some((attempt) => attempt.delivery === "turn")
+          && promptWasSubmittedAs(candidate, input.text));
+      const supersededPromptIds = new Set(linkedTurnPrompts
         .filter((candidate) => (candidate.origin === "manual" || candidate.origin === "imported")
           && candidate.attempts.length === 0
-          && sameSubmittedPrompt(candidate.text, input.text))
-        .map((candidate) => candidate.id) : []);
+          && ((recovery && sameSubmittedPrompt(candidate.text, input.text))
+            || (linkedQueueAttempt
+              && unwrapClaudePastedContent(candidate.text) !== candidate.text
+              && sameSubmittedPrompt(unwrapClaudePastedContent(candidate.text), input.text))))
+        .map((candidate) => candidate.id));
       if (supersededPromptIds.size) {
         bundle.prompts.prompts = bundle.prompts.prompts.filter((candidate) => !supersededPromptIds.has(candidate.id));
         promptChanges += supersededPromptIds.size;

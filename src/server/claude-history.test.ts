@@ -15,6 +15,7 @@ describe("Claude Code transcript parsing", () => {
       const storage = new StorageService(root);
       await storage.ensure();
       const tab = await storage.createTab("pasted queue");
+      await storage.updateTab(tab.id, (current) => ({ ...current, session: { ...current.session, provider: "claude" } }));
       const bundle = await storage.readTab(tab.id);
       const prompt = newPrompt("queued prompt", "queue");
       const attempt = newAttempt("queue");
@@ -33,6 +34,21 @@ describe("Claude Code transcript parsing", () => {
       expect(synced.prompts.prompts[0]).toMatchObject({ id: prompt.id, origin: "queue", status: "completed", codexTurnId: "p1" });
       expect(synced.answers.answers).toHaveLength(1);
       expect(synced.answers.answers[0]).toMatchObject({ promptId: prompt.id, finalAnswer: "done" });
+
+      // A previous Promptor version could also have imported the wrapped
+      // transcript entry as a second manual prompt. A later sync must remove
+      // it even though the queue attempt has already been completed.
+      const duplicate = newPrompt('\n\n<pasted_content id="5865">\nqueued prompt\n</pasted_content id="5865">\n', "manual");
+      Object.assign(duplicate, { status: "completed", threadId: "session-pasted", codexTurnId: "p1", startedAt: "2026-09-01T09:00:00.250Z", completedAt: "2026-09-01T09:00:05.000Z" });
+      synced.prompts.prompts.push(duplicate);
+      synced.answers.answers[0].metadata = { promptIds: [prompt.id, duplicate.id] };
+      await storage.writePrompts(tab.id, synced.prompts);
+      await storage.writeAnswers(tab.id, synced.answers);
+      await syncClaudeHistory(storage, tab.id, "session-pasted", transcriptPath);
+      const repaired = await storage.readTab(tab.id);
+      expect(repaired.prompts.prompts.map((item) => item.id)).toEqual([prompt.id]);
+      expect(repaired.answers.answers).toHaveLength(1);
+      expect(repaired.answers.answers[0]).toMatchObject({ promptId: prompt.id, metadata: { promptIds: [prompt.id] } });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
