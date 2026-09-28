@@ -738,7 +738,7 @@ export function buildCodexTuiLaunch(
   bypassHookTrust = false,
 ): AgentProcessLaunch {
   const args = launch.mode === "resume" ? ["resume", launch.sessionId] : [];
-  args.push("--no-alt-screen", "-C", cwd, "-c", "check_for_update_on_startup=false", "-c", buildCodexHookOverride(hookScriptPath, nodePath));
+  args.push("--no-alt-screen", "-C", cwd, "-c", "check_for_update_on_startup=false", "-c", "tui.raw_output_mode=true", "-c", buildCodexHookOverride(hookScriptPath, nodePath));
   if (bypassHookTrust) args.push("--dangerously-bypass-hook-trust");
   return { executable: "codex", args };
 }

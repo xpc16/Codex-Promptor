@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { terminalInputDisposition, terminalSubscriptionWanted } from "./terminal-visibility.js";
+import { terminalInputDisposition, terminalScrollbackWheelLines, terminalSubscriptionWanted } from "./terminal-visibility.js";
+
+describe("local terminal wheel scrolling", () => {
+  it("scrolls terminal history for pixel, line, and page gestures", () => {
+    expect(terminalScrollbackWheelLines(-80, 0, 24)).toBe(-2);
+    expect(terminalScrollbackWheelLines(3, 1, 24)).toBe(3);
+    expect(terminalScrollbackWheelLines(-1, 2, 24)).toBe(-24);
+    expect(terminalScrollbackWheelLines(0, 0, 24)).toBe(0);
+  });
+});
 
 describe("whether a terminal stream should be subscribed", () => {
   const base = { hidden: false, documentVisible: false, active: true };

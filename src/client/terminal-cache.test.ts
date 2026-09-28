@@ -46,6 +46,19 @@ describe("raw terminal memory", () => {
     cache.rememberRaw("tab", "g1", 9, new Uint8Array(), false);
     expect(cache.readRaw("tab")).toMatchObject({ nextOffset: 9 });
   });
+
+  it("keeps a rendered checkpoint for instant restoration and invalidates it on a new PTY", () => {
+    const cache = createTerminalCache();
+    cache.rememberRaw("tab", "g1", 5, bytes("hello"), true);
+    cache.rememberRendered("tab", { generation: "g1", nextOffset: 5, cols: 80, rows: 20, ansi: "hello" });
+    cache.rememberRaw("tab", "g1", 10, bytes("world"), false);
+    expect(cache.readRendered("tab")).toMatchObject({ generation: "g1", nextOffset: 5, ansi: "hello" });
+    cache.rememberRendered("tab", { generation: "g1", nextOffset: 10, cols: 80, rows: 20, ansi: "hello world" });
+    cache.rememberRendered("tab", { generation: "g1", nextOffset: 5, cols: 80, rows: 20, ansi: "stale" });
+    expect(cache.readRendered("tab")?.ansi).toBe("hello world");
+    cache.rememberRaw("tab", "g2", 4, bytes("new!"), true);
+    expect(cache.readRendered("tab")).toBeNull();
+  });
 });
 
 describe("projection memory", () => {

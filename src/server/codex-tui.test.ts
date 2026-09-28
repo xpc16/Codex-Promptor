@@ -180,6 +180,7 @@ describe("Codex native PTY/hooks provider", () => {
     expect(launch.executable).toBe("codex");
     expect(launch.args.slice(0, 2)).toEqual(["resume", "00000000-0000-4000-8000-000000000001"]);
     expect(launch.args).toContain("D:\\work dir");
+    expect(launch.args).toContain("tui.raw_output_mode=true");
     expect(launch.args).not.toContain("--remote");
     expect(launch.args).not.toContain("--dangerously-bypass-hook-trust");
     expect(launch.args.at(-1)).toBe(override);

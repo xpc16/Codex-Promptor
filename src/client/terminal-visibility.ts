@@ -40,6 +40,13 @@ export function terminalSubscriptionWanted(input: {
  */
 export type TerminalInputDisposition = "send" | "hold" | "hold-and-resubscribe" | "drop";
 
+/** Convert a browser wheel gesture to xterm scrollback rows, regardless of pixel/line/page units. */
+export function terminalScrollbackWheelLines(deltaY: number, deltaMode: number, rows: number): number {
+  if (!Number.isFinite(deltaY) || deltaY === 0) return 0;
+  const units = deltaMode === 1 ? deltaY : deltaMode === 2 ? deltaY * rows : deltaY / 40;
+  return Math.sign(units) * Math.max(1, Math.ceil(Math.abs(units)));
+}
+
 export function terminalInputDisposition(input: {
   subscribed: boolean;
   /** Whether this page should be subscribed at all right now. */

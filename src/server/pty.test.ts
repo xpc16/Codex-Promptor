@@ -6,6 +6,7 @@ describe("remote Codex terminal command", () => {
     const command = buildRemoteCodexCommand("ws://127.0.0.1:4500", { mode: "resume", threadId: "01a00000-0000-7000-8000-000000000001" }, "C:\\Users\\Tester Workspace", "dark");
     expect(command).toContain("Set-Location -LiteralPath 'C:\\Users\\Tester Workspace'");
     expect(command).toContain("codex resume 01a00000-0000-7000-8000-000000000001 --remote ws://127.0.0.1:4500 --no-alt-screen -C 'C:\\Users\\Tester Workspace'");
+    expect(command).toContain("-c tui.raw_output_mode=true");
     expect(command).toContain('$Host.UI.RawUI.BackgroundColor = "Black"');
     expect(command).toContain("check_for_update_on_startup=false");
     expect(command).toContain("__CODEX_PROMPTOR_EXIT__:");

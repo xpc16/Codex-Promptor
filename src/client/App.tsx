@@ -30,8 +30,9 @@ import { EARLIER_ANSWER_PAGE, EARLIER_PROMPT_PAGE, INITIAL_ANSWER_WINDOW, INITIA
 import { createPortal } from "react-dom";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { SerializeAddon } from "@xterm/addon-serialize";
 import { sameTerminalSize, TerminalCursorQuietScheduler, TerminalResizeScheduler } from "./terminal-resize.js";
-import { terminalInputDisposition, terminalSubscriptionWanted } from "./terminal-visibility.js";
+import { terminalInputDisposition, terminalScrollbackWheelLines, terminalSubscriptionWanted } from "./terminal-visibility.js";
 import { TERMINAL_INPUT_COMPACT_TYPE, terminalInputHandle, terminalInputIsPlain } from "../shared/terminal-input.js";
 import { loadTabWithRetry, retainRecentTabIds } from "./tab-load.js";
 import { MOBILE_PANES, type MobilePane } from "./mobile-pane.js";
@@ -51,7 +52,7 @@ import { applyProjectionFrame, projectionScreenToAnsi, type ProjectionScreenStat
 import { resolveAutomaticTerminalTransport } from "./terminal-preference.js";
 import { altArrowSequence, terminalShortcutInput } from "./terminal-shortcut.js";
 import { createConnectionAlarm, reconnectDelay } from "./socket-retry.js";
-import { forgetCachedTerminal, readCachedProjection, readCachedRawTerminal, rememberProjection, rememberRawTerminal, retainCachedTerminals } from "./terminal-cache.js";
+import { forgetCachedTerminal, readCachedProjection, readCachedRawTerminal, readCachedRenderedTerminal, rememberProjection, rememberRawTerminal, rememberRenderedTerminal, retainCachedTerminals } from "./terminal-cache.js";
 import {
   createI18n,
   I18nContext,
@@ -1782,12 +1783,16 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     const alarm = createConnectionAlarm();
     const projectionMode = transportMode === "projection";
     // Reconnecting with no cursor makes the server resend the whole scroll
-    // buffer. What this page already received is still good, so the cursor and
-    // the bytes are restored first and the socket asks only for the remainder.
+    // buffer. Prefer the last parsed terminal checkpoint; raw bytes remain a
+    // fallback until the first checkpoint has been captured.
     const remembered = transportMode === "projection" ? null : readCachedRawTerminal(tabId);
-    const cursor: { generation: string | null; nextOffset: number | null } = remembered
-      ? { generation: remembered.generation, nextOffset: remembered.nextOffset }
+    const rendered = transportMode === "projection" ? null : readCachedRenderedTerminal(tabId);
+    const restore = rendered && (!remembered || rendered.generation === remembered.generation) ? rendered : null;
+    const cached = restore ?? remembered;
+    const cursor: { generation: string | null; nextOffset: number | null } = cached
+      ? { generation: cached.generation, nextOffset: cached.nextOffset }
       : { generation: null, nextOffset: null };
+    if (restore) rememberRawTerminal(tabId, restore.generation, restore.nextOffset, new Uint8Array(), true);
     let projectionState: ProjectionScreenState | null = transportMode === "projection" ? readCachedProjection(tabId) : null;
     let projectionRenderPending = 0;
     let rawLeaseWritable = true;
@@ -1811,24 +1816,39 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     // forget what was typed at it, not accumulate it.
     const heldInput: string[] = [];
     const pendingProjectionInput: string[] = [];
-    const initialSize = !projectionMode && runtime.terminal.cols !== null && runtime.terminal.rows !== null
-      ? { cols: runtime.terminal.cols, rows: runtime.terminal.rows }
-      : null;
-    const term = new Terminal({ ...(initialSize ?? (projectionMode ? { cols: 80, rows: PROJECTION_VIEWPORT_ROWS } : {})), cursorBlink: false, cursorStyle: "block", cursorInactiveStyle: "none", fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 14, lineHeight: 1.18, theme: getTerminalTheme(themeRef.current), scrollback: projectionMode ? 0 : 5000, allowProposedApi: false });
+    const initialSize = restore
+      ? { cols: restore.cols, rows: restore.rows }
+      : !projectionMode && runtime.terminal.cols !== null && runtime.terminal.rows !== null
+        ? { cols: runtime.terminal.cols, rows: runtime.terminal.rows }
+        : null;
+    const term = new Terminal({ ...(initialSize ?? (projectionMode ? { cols: 80, rows: PROJECTION_VIEWPORT_ROWS } : {})), cursorBlink: false, cursorStyle: "block", cursorInactiveStyle: "none", fontFamily: "Cascadia Code, Consolas, monospace", fontSize: 14, lineHeight: 1.18, theme: getTerminalTheme(themeRef.current), scrollback: projectionMode ? 0 : 5000, allowProposedApi: true });
     host.current.classList.toggle("projection", projectionMode);
-    const fit = new FitAddon(); term.loadAddon(fit); term.open(host.current); term.blur(); terminal.current = term;
-    // A wheel event can become a terminal input event when the running TUI
-    // enables mouse tracking, when xterm is in its alternate buffer, or in
-    // projection mode where there is no local scrollback. Keep command history
-    // keyboard-only: ordinary raw-buffer scrolling is still handled locally.
+    const hostElement = host.current;
+    const fit = new FitAddon(); const serializer = new SerializeAddon();
+    term.loadAddon(fit); term.loadAddon(serializer); term.open(hostElement); term.blur(); terminal.current = term;
+    // In raw mode xterm either scrolls its main buffer or forwards the wheel
+    // to a mouse-aware TUI. Blocking both paths left long CLI conversations
+    // stuck at the visible window even though their history was available.
     term.attachCustomWheelEventHandler((event) => {
-      const mouseTrackingActive = term.modes.mouseTrackingMode !== "none";
-      const alternateBufferActive = term.buffer.active.type === "alternate";
-      if (!projectionMode && !mouseTrackingActive && !alternateBufferActive) return true;
+      if (!projectionMode) {
+        if (term.buffer.active.type === "normal" && term.buffer.active.baseY > 0) {
+          const lines = terminalScrollbackWheelLines(event.deltaY, event.deltaMode, term.rows);
+          if (lines) {
+            term.scrollLines(lines);
+            event.preventDefault();
+            event.stopPropagation();
+            return false;
+          }
+        }
+        return true;
+      }
       event.preventDefault();
       event.stopPropagation();
       return false;
     });
+    let paintedGeneration: string | null = null;
+    let paintedOffset = 0;
+    let checkpointValid = true;
     const cursorQuietScheduler = new TerminalCursorQuietScheduler((suppressed) => {
       host.current?.classList.toggle("terminal-updating", suppressed);
     });
@@ -1846,20 +1866,37 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       if (sequence !== terminalWriteSequence) return;
       cursorQuietScheduler.finishWrite();
     };
-    const queueTerminalWrite = (fresh: Uint8Array, sequence: number, epoch: number) => {
+    const queueTerminalWrite = (fresh: Uint8Array, sequence: number, epoch: number, checkpoint?: { generation: string; nextOffset: number }, reveal = false) => {
       const owned = fresh.slice();
       terminalWriteQueue = terminalWriteQueue.then(async () => {
         if (disposed || epoch !== terminalWriteEpoch) { finishTerminalUpdate(sequence); return; }
         const chunkBytes = owned.length >= 64 * 1024 ? 32 * 1024 : Math.max(1, owned.length);
+        let wroteChunk = false;
         for (let offset = 0; offset < owned.length; offset += chunkBytes) {
-          if (disposed || epoch !== terminalWriteEpoch) { finishTerminalUpdate(sequence); return; }
+          if (disposed || epoch !== terminalWriteEpoch) {
+            if (wroteChunk) checkpointValid = false;
+            finishTerminalUpdate(sequence);
+            return;
+          }
           const chunk = owned.subarray(offset, Math.min(owned.length, offset + chunkBytes));
           await new Promise<void>((resolve) => term.write(chunk, resolve));
+          wroteChunk = true;
+          if (disposed || epoch !== terminalWriteEpoch) {
+            checkpointValid = false;
+            finishTerminalUpdate(sequence);
+            return;
+          }
           if (offset + chunkBytes < owned.length) await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
         }
+        if (checkpoint) { paintedGeneration = checkpoint.generation; paintedOffset = checkpoint.nextOffset; }
+        if (reveal) hostElement.classList.remove("terminal-restoring");
         term.options.cursorBlink = false;
         finishTerminalUpdate(sequence);
-      }).catch(() => finishTerminalUpdate(sequence));
+      }).catch(() => {
+        checkpointValid = false;
+        if (reveal) hostElement.classList.remove("terminal-restoring");
+        finishTerminalUpdate(sequence);
+      });
     };
     const protocol = location.protocol === "https:" ? "wss" : "ws";
     const inputHandle = terminalInputHandle(tabId);
@@ -2097,18 +2134,27 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       const endOffset = Number(message.endOffset);
       if (!generation || !Number.isSafeInteger(startOffset) || !Number.isSafeInteger(endOffset) || endOffset < startOffset) return;
       let updateSequence: number | null = null;
+      let resetApplied = false;
       if (message.reset || cursor.generation !== generation || cursor.nextOffset === null) {
         terminalWriteEpoch += 1;
         updateSequence = beginTerminalUpdate();
+        hostElement.classList.add("terminal-restoring");
         term.reset();
         term.options.cursorBlink = false;
         cursor.generation = generation;
         cursor.nextOffset = startOffset;
+        paintedGeneration = generation;
+        paintedOffset = startOffset;
+        resetApplied = true;
         setHasOutput(false);
       }
       if (cursor.generation !== generation) { if (updateSequence !== null) finishTerminalUpdate(updateSequence); requestSync(); return; }
       if (startOffset > cursor.nextOffset!) { if (updateSequence !== null) finishTerminalUpdate(updateSequence); requestSync(); return; }
-      if (endOffset <= cursor.nextOffset!) { if (updateSequence !== null) finishTerminalUpdate(updateSequence); return; }
+      if (endOffset <= cursor.nextOffset!) {
+        if (resetApplied) hostElement.classList.remove("terminal-restoring");
+        if (updateSequence !== null) finishTerminalUpdate(updateSequence);
+        return;
+      }
       const bytes = Uint8Array.from(atob(String(message.dataBase64 ?? "")), (char) => char.charCodeAt(0));
       const overlap = Math.max(0, cursor.nextOffset! - startOffset);
       const fresh = bytes.subarray(Math.min(overlap, bytes.length));
@@ -2118,9 +2164,10 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
         updateSequence ??= beginTerminalUpdate();
         setHasOutput(true);
         const sequence = updateSequence;
-        queueTerminalWrite(fresh, sequence, terminalWriteEpoch);
+        queueTerminalWrite(fresh, sequence, terminalWriteEpoch, { generation, nextOffset: endOffset }, resetApplied);
       } else {
         if (endOffset > 0) setHasOutput(true);
+        if (updateSequence !== null) hostElement.classList.remove("terminal-restoring");
         if (updateSequence !== null) finishTerminalUpdate(updateSequence);
       }
     };
@@ -2154,13 +2201,15 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       const state = result.state;
       const bytes = new TextEncoder().encode(projectionScreenToAnsi(state));
       terminalWriteEpoch += 1;
+      hostElement.classList.add("terminal-restoring");
       term.reset();
       term.options.cursorBlink = false;
       cursor.generation = message.generation;
       cursor.nextOffset = rawNextOffset;
+      paintedGeneration = null;
       rememberRawTerminal(tabId, message.generation, rawNextOffset, bytes, true);
       setHasOutput(true);
-      queueTerminalWrite(bytes, beginTerminalUpdate(), terminalWriteEpoch);
+      queueTerminalWrite(bytes, beginTerminalUpdate(), terminalWriteEpoch, { generation: message.generation, nextOffset: rawNextOffset }, true);
       sendSubscription(true, false, true);
       scheduleSize();
     };
@@ -2262,11 +2311,16 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       });
     };
     reconnect.current = scheduleConnect;
-    // Repaint from memory immediately: the reader sees the terminal they left
-    // rather than a blank pane waiting on a socket, and nothing is refetched.
-    if (remembered?.data.length) {
+    // Repaint from memory before reconnecting. A parsed checkpoint avoids
+    // visually fast-forwarding through a long TUI's old repaint stream.
+    if (restore?.ansi) {
+      hostElement.classList.add("terminal-restoring");
       setHasOutput(true);
-      queueTerminalWrite(remembered.data, beginTerminalUpdate(), terminalWriteEpoch);
+      queueTerminalWrite(new TextEncoder().encode(restore.ansi), beginTerminalUpdate(), terminalWriteEpoch, { generation: restore.generation, nextOffset: restore.nextOffset }, true);
+    } else if (remembered?.data.length) {
+      hostElement.classList.add("terminal-restoring");
+      setHasOutput(true);
+      queueTerminalWrite(remembered.data, beginTerminalUpdate(), terminalWriteEpoch, { generation: remembered.generation, nextOffset: remembered.nextOffset }, true);
     } else if (projectionState) {
       setHasOutput(true);
       queueProjectionWrite(projectionState, beginTerminalUpdate(), terminalWriteEpoch, true);
@@ -2291,7 +2345,24 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       inputDisposable.dispose(); foregroundQuery.dispose(); backgroundQuery.dispose(); colorSchemeQuery.dispose(); cursorBlinkOn.dispose(); cursorBlinkOff.dispose();
       inputCoalescer.flush(); inputCoalescer.dispose();
       if (terminalInput.current === sendInput) terminalInput.current = () => undefined;
-      closeSocketQuietly(socket.current); term.dispose(); terminal.current = null; socket.current = null;
+      closeSocketQuietly(socket.current); terminal.current = null; socket.current = null;
+      // Save the parsed terminal, not the raw TUI repaint stream. A later tab
+      // selection restores one bounded screen/scrollback checkpoint and asks
+      // the server only for bytes emitted after the last painted offset.
+      void terminalWriteQueue.finally(() => {
+        if (!projectionMode && checkpointValid && paintedGeneration) {
+          try {
+            rememberRenderedTerminal(tabId, {
+              generation: paintedGeneration,
+              nextOffset: paintedOffset,
+              cols: term.cols,
+              rows: term.rows,
+              ansi: serializer.serialize({ scrollback: 1000 }),
+            });
+          } catch { /* fall back to the byte cache if the terminal was reset */ }
+        }
+        term.dispose();
+      });
     };
   }, [tabId, transportMode]);
   useEffect(() => {

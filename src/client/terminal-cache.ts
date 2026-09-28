@@ -9,21 +9,24 @@ import type { ProjectionScreenState } from "./terminal-projection.js";
  * megabyte -- every single time the reader comes back to the tab, which over a
  * tunnel is by far the largest repeated transfer in the app.
  *
- * Holding the bytes and the cursor here turns that into: repaint locally from
- * what we already have, then ask the server only for what arrived while we
- * were away, which is usually nothing.
+ * Holding the cursor and a parsed xterm checkpoint here turns that into one
+ * local restore, then a request for only what arrived while we were away.
+ * A short raw-byte fallback covers tabs that have not been checkpointed yet.
  */
 export const MAX_CACHED_TERMINAL_BYTES = 256 * 1024;
 export const MAX_CACHED_TERMINALS = 4;
 
 export type RawTerminalMemory = { generation: string; nextOffset: number; data: Uint8Array };
+export type RenderedTerminalMemory = { generation: string; nextOffset: number; cols: number; rows: number; ansi: string };
 
 type RawEntry = { generation: string; nextOffset: number; chunks: Uint8Array[]; bytes: number };
-type Entry = { raw: RawEntry | null; projection: ProjectionScreenState | null };
+type Entry = { raw: RawEntry | null; rendered: RenderedTerminalMemory | null; projection: ProjectionScreenState | null };
 
 export type TerminalCache = {
   readRaw(tabId: string): RawTerminalMemory | null;
   rememberRaw(tabId: string, generation: string, nextOffset: number, fresh: Uint8Array, reset: boolean): void;
+  readRendered(tabId: string): RenderedTerminalMemory | null;
+  rememberRendered(tabId: string, state: RenderedTerminalMemory): void;
   readProjection(tabId: string): ProjectionScreenState | null;
   rememberProjection(tabId: string, state: ProjectionScreenState): void;
   forget(tabId: string): void;
@@ -38,7 +41,7 @@ export function createTerminalCache(
   const entries = new Map<string, Entry>();
 
   const touch = (tabId: string): Entry => {
-    const existing = entries.get(tabId) ?? { raw: null, projection: null };
+    const existing = entries.get(tabId) ?? { raw: null, rendered: null, projection: null };
     entries.delete(tabId);
     entries.set(tabId, existing);
     while (entries.size > Math.max(1, limit)) {
@@ -63,6 +66,7 @@ export function createTerminalCache(
       const entry = touch(tabId);
       if (reset || !entry.raw || entry.raw.generation !== generation) {
         entry.raw = { generation, nextOffset, chunks: [], bytes: 0 };
+        if (entry.rendered?.generation !== generation) entry.rendered = null;
       }
       const raw = entry.raw;
       raw.nextOffset = nextOffset;
@@ -76,6 +80,15 @@ export function createTerminalCache(
       while (raw.bytes > byteLimit && raw.chunks.length > 1) {
         const dropped = raw.chunks.shift();
         raw.bytes -= dropped?.length ?? 0;
+      }
+    },
+
+    readRendered(tabId) { return entries.get(tabId)?.rendered ?? null; },
+    rememberRendered(tabId, state) {
+      const entry = touch(tabId);
+      if (entry.raw?.generation === state.generation && state.nextOffset <= entry.raw.nextOffset
+        && (!entry.rendered || state.nextOffset >= entry.rendered.nextOffset)) {
+        entry.rendered = { ...state };
       }
     },
 
@@ -96,6 +109,12 @@ export function readCachedRawTerminal(tabId: string, cache: TerminalCache = page
 }
 export function rememberRawTerminal(tabId: string, generation: string, nextOffset: number, fresh: Uint8Array, reset: boolean, cache: TerminalCache = pageTerminals): void {
   cache.rememberRaw(tabId, generation, nextOffset, fresh, reset);
+}
+export function readCachedRenderedTerminal(tabId: string, cache: TerminalCache = pageTerminals): RenderedTerminalMemory | null {
+  return cache.readRendered(tabId);
+}
+export function rememberRenderedTerminal(tabId: string, state: RenderedTerminalMemory, cache: TerminalCache = pageTerminals): void {
+  cache.rememberRendered(tabId, state);
 }
 export function readCachedProjection(tabId: string, cache: TerminalCache = pageTerminals): ProjectionScreenState | null {
   return cache.readProjection(tabId);

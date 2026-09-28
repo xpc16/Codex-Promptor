@@ -395,8 +395,8 @@ export function buildRemoteCodexCommand(remoteUrl: string, launch: TerminalLaunc
   const background = theme === "light" ? "White" : "Black";
   const ansi = theme === "light" ? "30;47" : "37;40";
   const invocation = launch.mode === "resume"
-    ? `& codex resume ${quoteArg(launch.threadId)} --remote ${quoteArg(remoteUrl)} --no-alt-screen -C ${quoteArg(cwd)} -c check_for_update_on_startup=false`
-    : `& codex --remote ${quoteArg(remoteUrl)} --no-alt-screen -C ${quoteArg(cwd)} -c check_for_update_on_startup=false`;
+    ? `& codex resume ${quoteArg(launch.threadId)} --remote ${quoteArg(remoteUrl)} --no-alt-screen -C ${quoteArg(cwd)} -c check_for_update_on_startup=false -c tui.raw_output_mode=true`
+    : `& codex --remote ${quoteArg(remoteUrl)} --no-alt-screen -C ${quoteArg(cwd)} -c check_for_update_on_startup=false -c tui.raw_output_mode=true`;
   return `$env:NO_COLOR = \"1\"; Set-Location -LiteralPath ${quoteArg(cwd)}; $Host.UI.RawUI.ForegroundColor = \"${foreground}\"; $Host.UI.RawUI.BackgroundColor = \"${background}\"; $promptorEsc = [char]27; Write-Host -NoNewline \"$promptorEsc[${ansi}m\"; Clear-Host; ${invocation}; $promptorCodexOk = $?; $promptorCodexExit = $LASTEXITCODE; if ($null -eq $promptorCodexExit) { if ($promptorCodexOk) { $promptorCodexExit = 0 } else { $promptorCodexExit = 1 } }; Write-Output \"${exitMarker}$promptorCodexExit\"`;
 }
 
