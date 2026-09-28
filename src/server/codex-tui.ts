@@ -130,6 +130,7 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
       activeTurnIds: (threadId) => this.activeTurnIds(threadId),
       waitForThreadIdle: (threadId, timeoutMs) => this.waitForThreadIdle(threadId, timeoutMs),
       startTurn: (threadId, text, clientUserMessageId) => this.startTurn(threadId, text, clientUserMessageId),
+      startInitialTurn: (text, clientUserMessageId) => this.startInitialTurn(text, clientUserMessageId),
       steerTurn: (threadId, turnId, text, clientUserMessageId) => this.steerTurn(threadId, turnId, text, clientUserMessageId),
       interruptTurn: (threadId, turnId) => this.interruptTurn(threadId, turnId),
       interruptPendingSubmission: (threadId) => this.interruptPendingSubmission(threadId),
@@ -308,7 +309,7 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
       return;
     }
     if (eventName === "Stop") {
-      this.finishTurn(payload, sessionId, "completed");
+      await this.finishTurn(payload, sessionId, "completed");
       return;
     }
     if (eventName === "PostCompact") {
@@ -360,6 +361,17 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
     return { turnId: await submission.accepted.promise };
   }
 
+  /** The first queue prompt creates the Codex session; no thread id exists yet. */
+  private async startInitialTurn(text: string, clientUserMessageId: string): Promise<{ threadId: string; turnId: string }> {
+    if (!this.launchReady || this.launchError || this.attached) throw new Error("SESSION_NOT_READY");
+    const submission = await this.reserveSubmission("turn", text, clientUserMessageId, null);
+    if (!this.pty.submitPrompt(this.tabId, text)) this.rejectSubmission(submission, new Error("CODEX_TERMINAL_NOT_RUNNING"));
+    const turnId = await submission.accepted.promise;
+    const threadId = this.session?.sessionId;
+    if (!threadId) throw new Error("CODEX_SESSION_START_NOT_OBSERVED");
+    return { threadId, turnId };
+  }
+
   private async steerTurn(threadId: string, turnId: string, text: string, clientUserMessageId: string): Promise<void> {
     this.assertAttached(threadId);
     if (!this.turns.has(turnId)) throw new Error("CODEX_TURN_NOT_ACTIVE");
@@ -381,7 +393,8 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
   }
 
   private async interruptPendingSubmission(threadId: string): Promise<boolean> {
-    this.assertAttached(threadId);
+    if (threadId) this.assertAttached(threadId);
+    else if (this.attached) throw new Error("SESSION_NOT_READY");
     const submission = this.submission;
     if (!submission) {
       if (!this.reservationInFlight) return false;
@@ -421,7 +434,7 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
   }
 
   private async waitForThreadIdle(threadId: string, timeoutMs = 24 * 60 * 60 * 1000): Promise<void> {
-    await waitForNativeThreadIdle(this, () => this.activeTurnIds(threadId).length > 0, async () => {
+    await waitForNativeThreadIdle(this, () => this.activeTurnIds(threadId).length > 0 || Boolean(this.submission) || this.reservationInFlight, async () => {
       for (const turn of [...this.turns.values()]) {
         if (turn.threadId === threadId) await this.reconcileTurn(turn);
       }
@@ -430,7 +443,10 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
 
   private async reconcileTurn(active: TurnState): Promise<void> {
     const recovered = await reconcileCodexTurn(active.recordCursor, active.threadId, active.turnId, active.prompt);
-    if (recovered) this.completeTurn(active, recovered.status, recovered.answer, "Codex turn ended without a completion hook.", recovered.completedAt);
+    if (recovered) {
+      await this.settleSteerAtTurnEnd(active);
+      this.completeTurn(active, recovered.status, recovered.answer, "Codex turn ended without a completion hook.", recovered.completedAt);
+    }
   }
 
   private acceptPrompt(payload: any, sessionId: string): void {
@@ -462,14 +478,24 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
     this.createTurn(hookTurnId, sessionId, prompt || submission?.prompt || "[non-text input]", submission);
   }
 
-  private finishTurn(payload: any, sessionId: string, status: "completed" | "failed"): void {
+  private async finishTurn(payload: any, sessionId: string, status: "completed" | "failed"): Promise<void> {
     const requestedId = String(payload?.turn_id ?? payload?.turnId ?? "");
     const turn = (requestedId ? this.turns.get(requestedId) : null)
       ?? [...this.turns.values()].find((candidate) => candidate.threadId === sessionId);
     if (!turn) return;
+    await this.settleSteerAtTurnEnd(turn);
     const answer = String(payload?.last_assistant_message ?? payload?.lastAssistantMessage ?? "");
     const error = String(payload?.error ?? payload?.message ?? "Codex failed before a final answer was produced.");
     this.completeTurn(turn, status, answer, error);
+  }
+
+  private async settleSteerAtTurnEnd(turn: TurnState): Promise<void> {
+    const pending = this.submission;
+    if (pending?.kind !== "steer" || pending.logicalTurnId !== turn.turnId) return;
+    const evidence = await inspectCodexSubmission(this.submissionCursor(pending), pending.prompt, turn.threadId);
+    if (this.submission !== pending) return;
+    if (evidence.state === "accepted") this.acceptRecoveredSubmission(pending, evidence);
+    else this.rejectSubmission(pending, new Error("CODEX_STEER_NOT_CONFIRMED_BEFORE_TURN_END"));
   }
 
   private completeTurn(
@@ -480,6 +506,10 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
     recoveredCompletedAt?: string | null,
   ): void {
     if (!this.turns.delete(turn.turnId)) return;
+    const pending = this.submission;
+    if (pending?.kind === "steer" && pending.logicalTurnId === turn.turnId) {
+      this.rejectSubmission(pending, new Error("CODEX_STEER_NOT_CONFIRMED_BEFORE_TURN_END"));
+    }
     const completedAt = recoveredCompletedAt ?? new Date().toISOString();
     const items: any[] = [{
       type: "userMessage",
@@ -521,6 +551,10 @@ export class CodexTuiManager extends EventEmitter implements QueueBinding {
         resend: () => { this.pty.submitEnter(this.tabId); },
         accept: (evidence) => this.acceptRecoveredSubmission(submission, evidence),
         unconfirmed: (evidence) => {
+          if (!this.attached) {
+            this.rejectSubmission(submission, new Error("CODEX_SESSION_START_NOT_OBSERVED"));
+            return;
+          }
           if (isSlashCommandPrompt(prompt)) {
             this.rejectSubmission(submission, new Error(SLASH_COMMAND_NO_TURN));
             return;

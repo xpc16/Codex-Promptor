@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -93,6 +93,71 @@ describe("Codex hook identity", () => {
 });
 
 describe("Codex native PTY/hooks provider", () => {
+  it("lets the first queued prompt establish a new native session", async () => {
+    const submitted: string[] = [];
+    const manager = new CodexTuiManager("tab-first-prompt", {
+      submitPrompt: (_tabId: string, prompt: string) => { submitted.push(prompt); return true; },
+      write: () => undefined,
+    } as any);
+    try {
+      await manager.beginLaunch({ cwd: "D:\\work", launch: { mode: "new" }, hookScriptPath: "scripts/codex-hook.mjs" });
+      const starting = manager.rpc.startInitialTurn!("first queue prompt", "client-first", "D:\\work");
+      await vi.waitFor(() => expect(submitted).toEqual(["first queue prompt"]));
+      await manager.handleHook({ hook_event_name: "SessionStart", session_id: "new-session", cwd: "D:\\work" });
+      await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "new-session", turn_id: "first-turn", prompt: "first queue prompt" });
+      await expect(starting).resolves.toEqual({ threadId: "new-session", turnId: "first-turn" });
+      await manager.handleHook({ hook_event_name: "Stop", session_id: "new-session", turn_id: "first-turn", last_assistant_message: "done" });
+      expect((await manager.rpc.waitForTurn("first-turn")).turn.status).toBe("completed");
+    } finally { await manager.stop(); }
+  });
+
+  it("releases an unconfirmed steer when its turn ends instead of blocking later prompts", async () => {
+    const submitted: string[] = [];
+    const manager = new CodexTuiManager("tab-steer-stop", {
+      submitPrompt: (_tabId: string, prompt: string) => { submitted.push(prompt); return true; },
+      write: () => undefined,
+    } as any);
+    try {
+      await manager.beginLaunch({ cwd: "D:\\work", launch: { mode: "new" }, hookScriptPath: "scripts/codex-hook.mjs" });
+      await manager.handleHook({ hook_event_name: "SessionStart", session_id: "session-steer", cwd: "D:\\work" });
+      await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-steer", turn_id: "turn-1", prompt: "manual first" });
+      const steering = manager.rpc.steerTurn("session-steer", "turn-1", "queued steer", "client-steer");
+      const rejected = expect(steering).rejects.toThrow("CODEX_STEER_NOT_CONFIRMED_BEFORE_TURN_END");
+      await vi.waitFor(() => expect(submitted).toEqual(["queued steer"]));
+      await manager.handleHook({ hook_event_name: "Stop", session_id: "session-steer", turn_id: "turn-1", last_assistant_message: "done" });
+      await rejected;
+      const next = manager.rpc.startTurn("session-steer", "next prompt", "client-next", "D:\\work");
+      await vi.waitFor(() => expect(submitted).toEqual(["queued steer", "next prompt"]));
+      await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-steer", turn_id: "turn-2", prompt: "next prompt" });
+      await expect(next).resolves.toEqual({ turnId: "turn-2" });
+    } finally { await manager.stop(); }
+  });
+
+  it("recovers a steer from an individual rollout user message before a missing hook's Stop", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "promptor-steer-recovery-"));
+    const file = path.join(root, "rollout.jsonl");
+    const row = (payload: object) => JSON.stringify({ timestamp: "2026-09-28T01:00:00.000Z", payload }) + "\n";
+    const submitted: string[] = [];
+    const manager = new CodexTuiManager("tab-steer-recovery", {
+      submitPrompt: (_tabId: string, prompt: string) => { submitted.push(prompt); return true; },
+      write: () => undefined,
+    } as any);
+    try {
+      await writeFile(file, JSON.stringify({ type: "session_meta", payload: { id: "session-recovery", source: "cli" } }) + "\n"
+        + row({ type: "task_started", turn_id: "turn-recovery" })
+        + row({ type: "item_completed", turn_id: "turn-recovery", item: { type: "UserMessage", content: [{ type: "input_text", text: "manual" }] } }));
+      await manager.beginLaunch({ cwd: root, launch: { mode: "new" }, hookScriptPath: "scripts/codex-hook.mjs" });
+      await manager.handleHook({ hook_event_name: "SessionStart", session_id: "session-recovery", cwd: root, transcript_path: file });
+      await manager.handleHook({ hook_event_name: "UserPromptSubmit", session_id: "session-recovery", turn_id: "turn-recovery", prompt: "manual" });
+      const steering = manager.rpc.steerTurn("session-recovery", "turn-recovery", "queued steer", "client-steer");
+      await vi.waitFor(() => expect(submitted).toEqual(["queued steer"]));
+      await appendFile(file, row({ type: "item_completed", turn_id: "turn-recovery", item: { type: "UserMessage", content: [{ type: "input_text", text: "queued steer" }] } })
+        + row({ type: "task_complete", turn_id: "turn-recovery", last_agent_message: "done" }));
+      await manager.handleHook({ hook_event_name: "Stop", session_id: "session-recovery", turn_id: "turn-recovery", last_assistant_message: "done" });
+      await expect(steering).resolves.toBeUndefined();
+    } finally { await manager.stop(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it("builds per-run hooks and keeps every Codex argument in an argv slot", () => {
     const hookPath = "D:\\promptor\\scripts\\codex-hook.mjs";
     const nodePath = "C:\\PROGRA~1\\nodejs\\node.exe";

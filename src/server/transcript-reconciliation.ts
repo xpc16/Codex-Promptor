@@ -118,8 +118,8 @@ export async function inspectCodexSubmission(
   try {
     const slice = await readCodexRolloutSlice(cursor.path, threadId, cursor.offset);
     for (const turn of slice.turns) {
-      const candidate = turnPrompt(turn.items);
-      if (candidate && sameSubmittedPrompt(candidate, prompt)) {
+      const candidates = turn.userTexts?.length ? turn.userTexts : [turnPrompt(turn.items)];
+      if (candidates.some((candidate) => candidate && sameSubmittedPrompt(candidate, prompt))) {
         return { state: "accepted", turnId: turn.id, turn, items: turn.items };
       }
     }
@@ -142,7 +142,8 @@ export async function reconcileCodexTurn(
   try {
     const slice = await readCodexRolloutSlice(cursor.path, threadId, cursor.offset);
     const turn = slice.turns.find((candidate) => candidate.id === turnId)
-      ?? slice.turns.find((candidate) => sameSubmittedPrompt(turnPrompt(candidate.items), prompt));
+      ?? slice.turns.find((candidate) => (candidate.userTexts?.length ? candidate.userTexts : [turnPrompt(candidate.items)])
+        .some((text) => sameSubmittedPrompt(text, prompt)));
     if (!turn || turn.status === "running") return null;
     return {
       turnId: turn.id,

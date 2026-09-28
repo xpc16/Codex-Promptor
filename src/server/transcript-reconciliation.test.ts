@@ -66,6 +66,21 @@ describe("provider transcript reconciliation", () => {
     });
   });
 
+  it("confirms a queued steer when Codex puts manual and queued prompts in one turn", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-rollout-steer-"));
+    temporaryDirectories.push(directory);
+    const file = path.join(directory, "rollout-session.jsonl");
+    const records = [
+      { timestamp: "2026-09-28T01:00:00.000Z", payload: { type: "task_started", turn_id: "turn-steer" } },
+      { timestamp: "2026-09-28T01:00:01.000Z", payload: { type: "item_completed", turn_id: "turn-steer", item: { type: "UserMessage", content: [{ type: "input_text", text: "manual prompt" }] } } },
+      { timestamp: "2026-09-28T01:00:02.000Z", payload: { type: "item_completed", turn_id: "turn-steer", item: { type: "UserMessage", content: [{ type: "input_text", text: "queued steer" }] } } },
+      { timestamp: "2026-09-28T01:00:03.000Z", payload: { type: "task_complete", turn_id: "turn-steer", last_agent_message: "done" } },
+    ];
+    await fs.writeFile(file, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+    await expect(inspectCodexSubmission({ path: file, offset: 0 }, "queued steer", "session"))
+      .resolves.toMatchObject({ state: "accepted", turnId: "turn-steer" });
+  });
+
   it("confirms a Codex submission when the native terminal drops smart double quotes", async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-rollout-smart-quotes-"));
     temporaryDirectories.push(directory);

@@ -14,6 +14,8 @@ export type QueueRpc = {
   waitForThreadIdle(threadId: string, timeoutMs?: number): Promise<void>;
   /** `attachments` are absolute paths; providers that cannot carry files ignore them. */
   startTurn(threadId: string, text: string, clientUserMessageId: string, cwd: string, attachments?: readonly string[]): Promise<{ turnId: string }>;
+  /** Only the new Codex native TUI needs this: its first prompt creates the thread. */
+  startInitialTurn?(text: string, clientUserMessageId: string, cwd: string): Promise<{ threadId: string; turnId: string }>;
   steerTurn(threadId: string, turnId: string, text: string, clientUserMessageId: string): Promise<unknown>;
   interruptTurn(threadId: string, turnId: string): Promise<unknown>;
   /** Interrupt a PTY submission before its hook/record has yielded a turn id. */
@@ -164,12 +166,12 @@ export class QueueRunner extends EventEmitter {
     if (editedText !== undefined && !replacementText) throw new Error("PROMPT_EMPTY");
     const initial = await this.storage.readTab(this.tabId);
     const threadId = initial.tab.session.threadId;
-    if (initial.tab.session.state !== "ready" || !threadId || !initial.tab.session.workingDirectory) throw new Error("SESSION_NOT_READY");
+    if (initial.tab.session.state !== "ready" || (!threadId && !this.agent().rpc.startInitialTurn) || !initial.tab.session.workingDirectory) throw new Error("SESSION_NOT_READY");
     const prompt = initial.prompts.prompts.find((item) => item.id === promptId);
     if (!prompt) throw new Error("PROMPT_NOT_FOUND");
     if (prompt.status !== "pending" || (prompt.threadId && prompt.threadId !== threadId)) throw new Error("PROMPT_NOT_PENDING");
 
-    const activeTurnIds = this.agent().rpc.activeTurnIds(threadId);
+    const activeTurnIds = threadId ? this.agent().rpc.activeTurnIds(threadId) : [];
     const activeTurnId = initial.runtime.runner.activeTurnId && activeTurnIds.includes(initial.runtime.runner.activeTurnId)
       ? initial.runtime.runner.activeTurnId
       : activeTurnIds.at(-1) ?? null;
@@ -177,7 +179,7 @@ export class QueueRunner extends EventEmitter {
     // CLI commands belong in the terminal composer, never inside an existing
     // model turn. Steering /compact or /status makes the provider wait for a
     // turn/final-answer lifecycle those commands intentionally do not have.
-    if (activeTurnId && !isSlashCommandPrompt(effectiveText)) {
+    if (threadId && activeTurnId && !isSlashCommandPrompt(effectiveText)) {
       if (options.steerable === false) throw new Error("PROMPT_NOT_STEERABLE");
       try {
         await this.steerPendingPrompt(promptId, threadId, activeTurnId, replacementText);
@@ -251,8 +253,8 @@ export class QueueRunner extends EventEmitter {
       }
     }
     if (!threadId || !turnId) {
-      if (threadId && bundle.runtime.runner.activePromptId && interruptPendingSubmission) {
-        const interrupted = await interruptPendingSubmission(threadId).catch(() => false);
+      if (bundle.runtime.runner.activePromptId && interruptPendingSubmission) {
+        const interrupted = await interruptPendingSubmission(threadId ?? "").catch(() => false);
         if (interrupted) {
           let loopSettled = !activeLoop;
           if (activeLoop) {
@@ -298,7 +300,8 @@ export class QueueRunner extends EventEmitter {
         }
         const threadId = bundle.tab.session.threadId;
         const workingDirectory = bundle.tab.session.workingDirectory;
-        if (!threadId || !workingDirectory || bundle.tab.session.state !== "ready") {
+        const startingNewCodexThread = !threadId && bundle.tab.session.provider === "codex" && Boolean(this.agent().rpc.startInitialTurn);
+        if ((!threadId && !startingNewCodexThread) || !workingDirectory || bundle.tab.session.state !== "ready") {
           await this.failRunner("SESSION_NOT_READY", "先连接或恢复一个编程代理对话。");
           return;
         }
@@ -317,7 +320,7 @@ export class QueueRunner extends EventEmitter {
           continue;
         }
         if (bundle.runtime.runner.state !== "waiting_for_thread") await this.setRunnerState("waiting_for_thread");
-        try { await this.agent().rpc.waitForThreadIdle(threadId, 120_000); } catch (error) {
+        try { if (threadId) await this.agent().rpc.waitForThreadIdle(threadId, 120_000); } catch (error) {
           if (this.stopping || generation !== this.loopGeneration) return;
           const current = await this.storage.readTab(this.tabId);
           if (!this.keepsRunning(current.runtime)) { await this.setRunnerState("paused"); return; }
@@ -348,6 +351,10 @@ export class QueueRunner extends EventEmitter {
           if (await this.armIfEmpty(generation)) return;
           continue;
         }
+        if (startingNewCodexThread && prompt.a2a) {
+          await this.failRunner("A2A_SESSION_NOT_READY", "A2A needs an established Codex session before its first queue prompt.");
+          return;
+        }
         const dispatched = await this.prepareDispatch(prompt.id, generation);
         if (!dispatched) continue;
         const failed = await this.dispatch(threadId, workingDirectory, dispatched, generation);
@@ -358,7 +365,8 @@ export class QueueRunner extends EventEmitter {
             return;
           }
         } else {
-          await this.waitAfterCompletedPrompt(dispatched.prompt.id, threadId, generation);
+          const currentThreadId = (await this.storage.getTabMeta(this.tabId)).session.threadId;
+          if (currentThreadId) await this.waitAfterCompletedPrompt(dispatched.prompt.id, currentThreadId, generation);
         }
       }
     } catch (error) {
@@ -415,7 +423,7 @@ export class QueueRunner extends EventEmitter {
       const bundle = await this.storage.readTab(this.tabId);
       if (!this.keepsRunning(bundle.runtime)) return null;
       const threadId = bundle.tab.session.threadId;
-      if (!threadId) return null;
+      if (!threadId && !this.agent().rpc.startInitialTurn) return null;
       const prompt = bundle.prompts.prompts.find((item) => item.id === promptId
         && item.status === "pending"
         && (!item.threadId || item.threadId === threadId));
@@ -428,7 +436,7 @@ export class QueueRunner extends EventEmitter {
       // Frozen here, before the prompt file is written: what the CLI receives,
       // what a submit confirmation matches, and what a retry re-sends are then
       // one string, while prompt.text stays the reader's own words.
-      const prepared = this.prepareSubmission
+      const prepared = threadId && this.prepareSubmission
         ? await this.prepareSubmission({ tabId: this.tabId, prompt, attemptId: attempt.attemptId, threadId }).catch(() => null)
         : null;
       if (prepared) {
@@ -455,7 +463,7 @@ export class QueueRunner extends EventEmitter {
     });
   }
 
-  private async startPendingPromptNow(promptId: string, threadId: string, replacementText?: string): Promise<InsertNowResult> {
+  private async startPendingPromptNow(promptId: string, threadId: string | null, replacementText?: string): Promise<InsertNowResult> {
     const continueQueue = await this.storage.withTabLock(this.tabId, async () => {
       const bundle = await this.storage.readTab(this.tabId);
       if (bundle.tab.session.state !== "ready" || bundle.tab.session.threadId !== threadId) throw new Error("SESSION_NOT_READY");
@@ -584,14 +592,27 @@ export class QueueRunner extends EventEmitter {
     if (answer) this.emit("answer", answer);
   }
 
-  private async dispatch(threadId: string, cwd: string, dispatched: { prompt: PromptRecord; clientUserMessageId: string; submittedText: string; attachments: readonly string[] }, generation: number): Promise<boolean> {
+  private async dispatch(threadId: string | null, cwd: string, dispatched: { prompt: PromptRecord; clientUserMessageId: string; submittedText: string; attachments: readonly string[] }, generation: number): Promise<boolean> {
     await this.setRunnerState("dispatching", dispatched.prompt.id, null);
     let turnId = "";
+    let actualThreadId = threadId;
     try {
       // The CLI gets submittedText; every record below keeps prompt.text.
-      const result = await this.agent().rpc.startTurn(threadId, dispatched.submittedText, dispatched.clientUserMessageId, cwd, dispatched.attachments);
-      turnId = result.turnId;
+      if (threadId) {
+        const result = await this.agent().rpc.startTurn(threadId, dispatched.submittedText, dispatched.clientUserMessageId, cwd, dispatched.attachments);
+        turnId = result.turnId;
+      } else {
+        const result = await this.agent().rpc.startInitialTurn!(dispatched.submittedText, dispatched.clientUserMessageId, cwd);
+        turnId = result.turnId;
+        actualThreadId = result.threadId;
+        if (!actualThreadId) throw new Error("CODEX_SESSION_START_NOT_OBSERVED");
+        await this.storage.updateTab(this.tabId, (tab) => {
+          if (tab.session.state !== "ready" || (tab.session.threadId && tab.session.threadId !== actualThreadId)) throw new Error("SESSION_SWITCHED_DURING_SUBMISSION");
+          return { ...tab, session: { ...tab.session, threadId: actualThreadId, sessionId: actualThreadId }, updatedAt: isoNow() };
+        });
+      }
       await this.updateAttempt(dispatched.prompt.id, dispatched.clientUserMessageId, (prompt, attempt) => {
+        prompt.threadId = actualThreadId;
         prompt.status = "running";
         prompt.codexTurnId = turnId;
         prompt.updatedAt = isoNow();
@@ -599,7 +620,7 @@ export class QueueRunner extends EventEmitter {
         attempt.codexTurnId = turnId;
       });
       const startedAnswer = await recordTurnStarted(this.storage, this.tabId, {
-        threadId,
+        threadId: actualThreadId!,
         turnId,
         promptId: dispatched.prompt.id,
         promptText: dispatched.prompt.text,
@@ -608,14 +629,14 @@ export class QueueRunner extends EventEmitter {
       });
       if (startedAnswer) this.emit("answer", startedAnswer);
       if (generation !== this.loopGeneration) {
-        try { await this.agent().rpc.interruptTurn(threadId, turnId); } catch { /* the detached turn may already be settling */ }
-        await this.finalizeInterruptedTurn(threadId, turnId);
+        try { await this.agent().rpc.interruptTurn(actualThreadId!, turnId); } catch { /* the detached turn may already be settling */ }
+        await this.finalizeInterruptedTurn(actualThreadId!, turnId);
         return false;
       }
       await this.setRunnerState("running", dispatched.prompt.id, turnId);
       const completed = await this.agent().rpc.waitForTurn(turnId);
       const resultRecord = await recordTurn(this.storage, this.tabId, {
-        threadId,
+        threadId: actualThreadId!,
         turn: completed.turn,
         items: completed.items,
         origin: dispatched.prompt.origin,
@@ -657,7 +678,8 @@ export class QueueRunner extends EventEmitter {
         return false;
       }
       if (!turnId && message === "PROMPT_SUBMISSION_INTERRUPTED") {
-        await this.finalizeInterruptedSubmission(threadId, dispatched.prompt.id, dispatched.clientUserMessageId);
+        if (actualThreadId) await this.finalizeInterruptedSubmission(actualThreadId, dispatched.prompt.id, dispatched.clientUserMessageId);
+        else await this.markFailure(dispatched.prompt.id, dispatched.clientUserMessageId, "TURN_START_FAILED", message, null);
         return false;
       }
       await this.markFailure(dispatched.prompt.id, dispatched.clientUserMessageId, turnId ? "TURN_FAILED" : "TURN_START_FAILED", message, turnId || null);
@@ -679,7 +701,7 @@ export class QueueRunner extends EventEmitter {
       const bundle = await this.storage.readTab(this.tabId);
       if (bundle.runtime.runner.desiredState !== "running") return true;
       const threadId = bundle.tab.session.threadId;
-      if (threadId && bundle.prompts.prompts.some((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId))) return false;
+      if (bundle.prompts.prompts.some((item) => item.status === "pending" && (!item.threadId || item.threadId === threadId))) return false;
       const runtime: RuntimeFile = {
         ...bundle.runtime,
         revision: bundle.runtime.revision + 1,
@@ -996,7 +1018,7 @@ export class QueueRunner extends EventEmitter {
     });
   }
 
-  private async discardUnavailableOneShots(threadId: string): Promise<void> {
+  private async discardUnavailableOneShots(threadId: string | null): Promise<void> {
     const unavailable = new Set(this.oneShotPromptIds);
     await this.storage.withTabLock(this.tabId, async () => {
       const bundle = await this.storage.readTab(this.tabId);

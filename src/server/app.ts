@@ -3052,8 +3052,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         const lastDurableThreadId = session && await isDurableThread(session.sessionId, session.transcriptPath).catch(() => false) ? session.sessionId : null;
         // A new conversation has no thread yet: Codex creates one when the
         // first prompt is submitted, and the SessionStart hook that follows is
-        // what binds it here. Recording null rather than inventing an id keeps
-        // the queue honestly disabled until there is something to queue onto.
+        // what binds it here. Recording null rather than inventing an id lets
+        // the native queue use its initial-turn path to create and bind it.
         await storage.updateTab(tabId, (current) => ({
           ...current,
           session: {
@@ -3345,7 +3345,8 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         const bundle = await storage.readTab(tabId);
         assertQueueUsable(bundle);
         armed = bundle.tab.session.state === "ready"
-          && Boolean(bundle.tab.session.threadId)
+          && (Boolean(bundle.tab.session.threadId)
+            || (bundle.tab.session.provider === "codex" && codexConnectionMode === "pty-hooks"))
           && bundle.runtime.runner.desiredState === "armed";
         const next = newPrompt(text, "queue");
         if (prefix.kind === "a2a") next.a2a = { rootId: next.id, skill: prefix.skill, depth: 0, fromTabId: null, fromPromptId: null };

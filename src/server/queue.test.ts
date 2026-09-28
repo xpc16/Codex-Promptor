@@ -20,6 +20,46 @@ class HookedStorage extends StorageService {
 }
 
 describe("queue pause boundary", () => {
+  it("binds the first queue prompt to the session created by native Codex", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-first-turn-"));
+    const storage = new StorageService(root);
+    try {
+      await storage.ensure();
+      const tab = await storage.createTab("new native conversation");
+      await storage.updateTab(tab.id, (current) => ({
+        ...current,
+        session: { ...current.session, provider: "codex", state: "ready", workingDirectory: root, threadId: null, sessionId: null },
+      }));
+      const bundle = await storage.readTab(tab.id);
+      bundle.prompts.prompts.push(newPrompt("first queue prompt", "queue"));
+      await storage.writePrompts(tab.id, bundle.prompts);
+      const calls: string[] = [];
+      const runner = new QueueRunner(tab.id, storage, { rpc: {
+        activeTurnIds: () => [],
+        waitForThreadIdle: async () => undefined,
+        startTurn: async () => { throw new Error("the initial prompt must not use startTurn"); },
+        startInitialTurn: async (text: string) => { calls.push(text); return { threadId: "new-thread", turnId: "first-turn" }; },
+        steerTurn: async () => undefined,
+        interruptTurn: async () => undefined,
+        waitForTurn: async () => ({
+          turn: { id: "first-turn", status: "completed" },
+          items: [
+            { type: "userMessage", text: "first queue prompt" },
+            { type: "agentMessage", phase: "final_answer", text: "first answer" },
+          ],
+        }),
+      } }, 5_000, 0);
+      await runner.start();
+      await waitUntil(async () => (await storage.readTab(tab.id)).prompts.prompts[0]?.status === "completed");
+      const saved = await storage.readTab(tab.id);
+      expect(calls).toEqual(["first queue prompt"]);
+      expect(saved.tab.session.threadId).toBe("new-thread");
+      expect(saved.prompts.prompts[0].threadId).toBe("new-thread");
+      expect(saved.answers.answers[0]).toMatchObject({ threadId: "new-thread" });
+      await runner.stop();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("does not dispatch when pause is persisted immediately before the locked dispatch step", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "codex-promptor-queue-"));
     const storage = new HookedStorage(root);

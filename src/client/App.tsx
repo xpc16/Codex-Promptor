@@ -582,7 +582,7 @@ export function App() {
       {Boolean(error) && <div className="toast error-toast">{i18n.errorText(error)}<button onClick={() => setError(null)}>×</button></div>}
       {notice && <div className="toast notice-toast" role="status">{notice}<button onClick={() => setNotice(null)}>×</button></div>}
       {e2ee.required && !e2ee.proved && kdf && <E2eeUnlock state={e2ee} kdf={kdf} onError={setError} />}
-      {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} encryptionTabId={encryptionTabId} onBundleChanged={applyTabBundle} onError={setError} onNotice={setNotice} />)}
+      {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} codexNativeTui={service?.codexConnectionMode === "pty-hooks"} encryptionTabId={encryptionTabId} onBundleChanged={applyTabBundle} onError={setError} onNotice={setNotice} />)}
       {!selected && <Welcome onCreate={() => void createTab()} />}
     </main>
     <nav className="mobile-pane-bar" aria-label={t("aria.paneSwitcher")}>
@@ -874,7 +874,7 @@ function LoadEarlier({ shown, busy, label, busyLabel, onReveal }: { shown: boole
   return <button type="button" className="load-earlier" disabled={busy} onClick={onReveal}>{busy ? busyLabel : label}</button>;
 }
 
-function TabView({ tab, active, refreshNonce, theme, projectionSupported, encryptionTabId, onBundleChanged, onError, onNotice }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; projectionSupported: boolean; encryptionTabId: string | null; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void; onNotice: (message: string) => void }) {
+function TabView({ tab, active, refreshNonce, theme, projectionSupported, codexNativeTui, encryptionTabId, onBundleChanged, onError, onNotice }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; projectionSupported: boolean; codexNativeTui: boolean; encryptionTabId: string | null; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void; onNotice: (message: string) => void }) {
   const i18n = useI18n();
   const { t } = i18n;
   // Re-selecting a conversation paints from what this page already downloaded
@@ -1112,7 +1112,8 @@ function TabView({ tab, active, refreshNonce, theme, projectionSupported, encryp
   };
   if (!bundle) return <div className={`tab-view ${active ? "" : "tab-view-hidden"}`} aria-hidden={!active}><div className="loading-pane">{loadError ? <><strong>{t("conversation.loadFailed")}</strong><span>{i18n.errorText(loadError)}</span><button className="ghost" onClick={() => void load()}>{t("action.retry")}</button></> : <><div className="spinner" />{t("conversation.loading")}</>}</div></div>;
   const closed = bundle.tab.session.state === "closed";
-  const runnable = bundle.tab.session.state === "ready" && Boolean(bundle.tab.session.threadId);
+  const runnable = bundle.tab.session.state === "ready"
+    && (Boolean(bundle.tab.session.threadId) || (bundle.tab.session.provider === "codex" && codexNativeTui));
   const reopen = async () => {
     if (reopening) return;
     setReopening(true);

@@ -22,6 +22,8 @@ export type CodexRolloutTurn = {
   startedAt: string | null;
   completedAt: string | null;
   items: Array<Record<string, unknown>>;
+  /** Separate PTY submissions within one turn; `items` keeps the combined history view. */
+  userTexts?: string[];
 };
 
 type Draft = {
@@ -226,7 +228,7 @@ function createRolloutParser(threadId: string): RolloutParser {
       // last commentary so the card shows what was produced, tagged as partial.
       if (draft.finalAnswer) items.push({ type: "agentMessage", phase: "final_answer", text: draft.finalAnswer });
       else if (draft.lastAgentText && draft.status !== "running") items.push({ type: "agentMessage", phase: "partial_answer", text: draft.lastAgentText });
-      turns.push({ id: draft.id, status: draft.status, startedAt: draft.startedAt, completedAt: draft.completedAt, items });
+      turns.push({ id: draft.id, status: draft.status, startedAt: draft.startedAt, completedAt: draft.completedAt, items, userTexts: draft.userTexts });
     }
     return { id: threadId, sessionId: threadId, turns };
   };
