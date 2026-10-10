@@ -43,7 +43,7 @@ import { clampPaneSize, CONSOLE_WIDTH, conversationSplit, queueTerminalSplit, re
 import { onPaneDragEnd, PaneDrag, paneDragActive } from "./pane-drag.js";
 import { bufferedWheelHandoff, isAtBottom, isNearTop, settleAtTail, wheelDeltaPixels, type WheelHandoffBufferState } from "./scroll-anchor.js";
 import { clearPromptDraft, readPromptDraft, readSessionFormDraft, writePromptDraft, writeSessionFormDraft } from "./prompt-draft.js";
-import { clampPromptComposerHeight, draggedPromptComposerHeight } from "./prompt-composer-resize.js";
+import { clampPromptComposerHeight, draggedPromptComposerHeight, rememberPromptComposerHeight, rememberedPromptComposerHeight } from "./prompt-composer-resize.js";
 import { promptActionsNeedOwnRow } from "./prompt-row-layout.js";
 import { autoSizedHeight, readTextareaMetrics } from "./textarea-autosize.js";
 import { createInputCoalescer } from "./input-coalescer.js";
@@ -1422,9 +1422,13 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     setCommonOpen(false);
     requestAnimationFrame(() => { composer.current?.focus(); composer.current?.setSelectionRange(inserted.cursor, inserted.cursor); });
   };
+  // Resizing is a layout gesture, not an editing one: it stays available on a
+  // conversation that is closed, or a terminal that has no queue at all. The
+  // composer below is disabled there -- there is nothing to type into -- but
+  // the reader still wants to give the list above it more or less room.
   const beginComposerResize = (event: PointerEvent<HTMLDivElement>) => {
     const box = composerBox.current;
-    if (!box || disabled || isShell || event.button !== 0) return;
+    if (!box || event.button !== 0) return;
     event.preventDefault();
     event.currentTarget.setPointerCapture(event.pointerId);
     composerResize.current = { pointerId: event.pointerId, startY: event.clientY, startHeight: box.getBoundingClientRect().height };
@@ -1433,7 +1437,9 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     const drag = composerResize.current;
     const box = composerBox.current;
     if (!drag || !box || drag.pointerId !== event.pointerId) return;
-    box.style.height = `${draggedPromptComposerHeight(drag.startHeight, drag.startY, event.clientY, window.innerHeight)}px`;
+    const height = draggedPromptComposerHeight(drag.startHeight, drag.startY, event.clientY, window.innerHeight);
+    box.style.height = `${height}px`;
+    rememberPromptComposerHeight(height);
   };
   const endComposerResize = (event: PointerEvent<HTMLDivElement>) => {
     if (composerResize.current?.pointerId !== event.pointerId) return;
@@ -1442,15 +1448,24 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   };
   const nudgeComposerHeight = (delta: number) => {
     const box = composerBox.current;
-    if (!box || disabled || isShell) return;
-    box.style.height = `${clampPromptComposerHeight(box.getBoundingClientRect().height + delta, window.innerHeight)}px`;
+    if (!box) return;
+    const height = clampPromptComposerHeight(box.getBoundingClientRect().height + delta, window.innerHeight);
+    box.style.height = `${height}px`;
+    rememberPromptComposerHeight(height);
   };
+  // Restored before the first paint, so opening a conversation -- which
+  // remounts this queue -- does not snap the composer back to its default.
+  useLayoutEffect(() => {
+    const box = composerBox.current;
+    const remembered = rememberedPromptComposerHeight(window.innerHeight);
+    if (box && remembered !== null) box.style.height = `${remembered}px`;
+  }, []);
   return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={activeRoots.length > 0 ? t("a2a.runningHelp", { count: activeRoots.length }) : runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : activeRoots.length > 0 ? "a2a" : runnerHasActiveWork(runtime.runner) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span>{stalledFor !== null && <span className="queue-state stalled" title={t("queue.stalledHelp", { minutes: stalledFor })}><i className="status-dot" /><span>{t("queue.stalled", { minutes: stalledFor })}</span></span>}</>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={showStartPending || undefined} onClick={() => void changeRunner("start")}>{t(showStartPending ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
     {activeRoots.map((root) => <A2aRootBar key={root.rootId} root={root} onError={onError} />)}
     <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t(notebookOnly ? "queue.notebookEmpty" : "queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} executionDisabled={!runnable} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; if (!sourceId) nativeDragTarget.current = null; }} onNativeDragTarget={(targetId) => { if (nativeDragSource.current) nativeDragTarget.current = targetId; }} onNativeDrop={() => { const sourceId = nativeDragSource.current; const targetId = nativeDragTarget.current; nativeDragSource.current = null; nativeDragTarget.current = null; if (sourceId && targetId) void reorder(sourceId, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}
-    <div className="add-prompt"><div className="prompt-composer" ref={composerBox}><textarea ref={composer} disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><div className="prompt-composer-resizer" role="separator" aria-orientation="horizontal" aria-label={t("queue.resizeInput")} title={t("queue.resizeInput")} tabIndex={disabled || isShell ? -1 : 0} onPointerDown={beginComposerResize} onPointerMove={moveComposerResize} onPointerUp={endComposerResize} onPointerCancel={endComposerResize} onLostPointerCapture={() => { composerResize.current = null; }} onKeyDown={(event) => { if (event.key === "ArrowUp" || event.key === "ArrowDown") { event.preventDefault(); nudgeComposerHeight(event.key === "ArrowUp" ? 20 : -20); } }} /></div><div className="compose-tools"><button className="compose-tool" disabled={!runnable} title={t(runnable ? "queue.timers" : "queue.connectForTimers")} aria-label={t("queue.timers")} onClick={() => { if (!runnable) return; setTimerMounted(true); setTimerOpen(true); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3 4 6M17 3l3 3M5.5 11a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm6.5-3v3.5l2.2 1.4M8 19l-1.5 2M16 19l1.5 2" /></svg></button><button className="compose-tool" title={t("queue.commonPrompts")} aria-label={t("queue.commonPrompts")} onClick={openCommonPrompts}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></svg></button></div><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
+    <div className="add-prompt"><div className="prompt-composer" ref={composerBox}><textarea ref={composer} disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><div className="prompt-composer-resizer" role="separator" aria-orientation="horizontal" aria-label={t("queue.resizeInput")} title={t("queue.resizeInput")} tabIndex={0} onPointerDown={beginComposerResize} onPointerMove={moveComposerResize} onPointerUp={endComposerResize} onPointerCancel={endComposerResize} onLostPointerCapture={() => { composerResize.current = null; }} onKeyDown={(event) => { if (event.key === "ArrowUp" || event.key === "ArrowDown") { event.preventDefault(); nudgeComposerHeight(event.key === "ArrowUp" ? 20 : -20); } }} /></div><div className="compose-tools"><button className="compose-tool" disabled={!runnable} title={t(runnable ? "queue.timers" : "queue.connectForTimers")} aria-label={t("queue.timers")} onClick={() => { if (!runnable) return; setTimerMounted(true); setTimerOpen(true); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3 4 6M17 3l3 3M5.5 11a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm6.5-3v3.5l2.2 1.4M8 19l-1.5 2M16 19l1.5 2" /></svg></button><button className="compose-tool" title={t("queue.commonPrompts")} aria-label={t("queue.commonPrompts")} onClick={openCommonPrompts}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></svg></button></div><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
     {timerMounted && <LazyDialogBoundary open={timerOpen} label={t("queue.timers")} onClose={() => setTimerOpen(false)}><Suspense fallback={timerOpen ? <LazyDialogFallback label={t("queue.timers")} /> : null}><TimerDialog open={timerOpen} tabId={tabId} sessionReady={runnable && !isShell} currentThreadId={bundle.tab.session.threadId} provider={bundle.tab.session.provider} onClose={() => setTimerOpen(false)} onError={onError} /></Suspense></LazyDialogBoundary>}
     {commonMounted && <LazyDialogBoundary open={commonOpen} label={t("queue.commonPrompts")} onClose={() => setCommonOpen(false)}><Suspense fallback={commonOpen ? <LazyDialogFallback label={t("queue.commonPrompts")} /> : null}><CommonPromptDialog open={commonOpen} canInsert={!disabled && !isShell} onClose={() => setCommonOpen(false)} onInsert={insertFromLibrary} onError={onError} /></Suspense></LazyDialogBoundary>}
   </div>;
