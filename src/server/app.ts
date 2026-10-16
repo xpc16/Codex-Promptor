@@ -1,5 +1,5 @@
 import { resolveTerminalInputHandle, TERMINAL_INPUT_COMPACT_TYPE } from "../shared/terminal-input.js";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
@@ -82,6 +82,9 @@ import { InitialTuiThreadGate, type TuiThreadSelection, type TuiThreadSelectionH
 import { TuiProxyPool } from "./tui-proxy.js";
 import { DEFAULT_UI_GRACE_MS, UiLifecycle } from "./ui-lifecycle.js";
 import { loadTrustedBrowserHosts } from "./trusted-hosts.js";
+import { executeHttp, openLocalSocket } from "./federation/executor.js";
+import { registerFederationRoutes } from "./federation/routes.js";
+import { FederationService } from "./federation/service.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -194,6 +197,7 @@ export type PromptorApp = FastifyInstance & {
     chatgpt: ChatGptPool;
     browser: BrowserPool;
     a2a: A2aService;
+    federation: FederationService;
     /** The per-conversation credential a launched CLI is given. Exposed so A2A can be exercised without one. */
     issueHookLease: (provider: "codex" | "claude" | "cursor", tabId: string) => { nonce: string; secret: string };
     token: string;
@@ -299,6 +303,19 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   await storage.ensure();
   const trustedHosts = await loadTrustedBrowserHosts(rootDir, process.env.CODEX_PROMPTOR_TRUSTED_HOSTS);
   const documents = await DocumentService.create(rootDir, storage);
+  /**
+   * Several machines behind one hostname (docs/MULTI_DEVICE_FEDERATION_IMPLEMENTATION.md).
+   * Off unless this machine was made a hub or joined one. A request another
+   * machine forwards here is injected into this very app with a reserved Host,
+   * so it runs through the same routes as a remote page's would.
+   */
+  const federation = await FederationService.create({
+    dataDir: storage.dataDir,
+    version: `0.1.0+${await clientBuildId(rootDir)}`,
+    executeLocal: (head, body) => executeHttp(app, token, head, body),
+    openLocal: () => openLocalSocket(app, token),
+    record: (direction, kind, bytes) => recordTraffic(direction, "ws", kind, bytes, { scope: "federation" }),
+  });
   /**
    * The bundle a page gets. The collaboration summary is projected here rather
    * than stored per tab: its authority is the root records, and a participant
@@ -633,6 +650,15 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     previousIndex = index;
   };
   storage.onIndexChanged(broadcastIndex);
+  // The device list rides the navigation socket of this machine's own pages.
+  // A page on another machine that watches us through a relay has its own
+  // list from its own machine, so it is not sent ours.
+  federation.on("changed", () => {
+    const view = federation.view();
+    for (const client of clients) {
+      if (client.wantsIndex && client.scope !== "federation") sendClient(client, { type: "federation.changed", federation: view }, "state");
+    }
+  });
   storage.onTabChanged((tabId, tab) => emit(tabId, { type: "tab.changed", tab }, true));
   storage.onPromptsChanged((tabId, delta) => emit(tabId, { type: "prompts.changed", delta }, true));
   storage.onAnswersChanged((tabId, delta) => {
@@ -2001,7 +2027,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   // hiding it inside `payloadOut` would make the overhead invisible.
   const pingIdleConnections = (): void => {
     for (const client of clients) {
-      if (client.scope === "local" || client.socket.readyState !== 1) continue;
+      // In-process sockets for another machine's page have no intermediary to
+      // keep awake; the federation link carries its own heartbeat.
+      if (client.scope === "local" || client.scope === "federation" || client.socket.readyState !== 1) continue;
       try {
         client.socket.ping();
         recordTraffic("out", "ws", "ping", 2, { scope: client.scope });
@@ -2011,8 +2039,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   const keepaliveTimer = websocketKeepaliveMs > 0 ? setInterval(pingIdleConnections, websocketKeepaliveMs) : null;
   keepaliveTimer?.unref?.();
 
-  app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, chatgpt, browser: browserPool, a2a, issueHookLease, token, restoreOpenSessions, importDiscoveredSessions, close: async () => {
+  app.promptor = { storage, codex, codexTui, codexConnectionMode, claude, cursor, pty, runners, timers, ui, traffic, documents, chatgpt, browser: browserPool, a2a, federation, issueHookLease, token, restoreOpenSessions, importDiscoveredSessions, close: async () => {
     clearInterval(stallTimer);
+    federation.close();
     if (trafficFlushTimer) clearInterval(trafficFlushTimer);
     if (trafficPruneTimer) clearInterval(trafficPruneTimer);
     if (keepaliveTimer) clearInterval(keepaliveTimer);
@@ -2226,6 +2255,9 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       } : false,
     },
   });
+
+  await registerFederationRoutes(app, { federation, apiAuth, isLocalBrowserRequest });
+  app.addHook("onReady", async () => { await federation.start(); });
 
   // Native CLI hooks use a per-terminal nonce plus a short-lived bearer secret.
   // The secret is inherited only by that child process and never appears in a
@@ -4046,6 +4078,20 @@ function sendRevalidatable(request: FastifyRequest, reply: FastifyReply, data: u
   reply.header("etag", etag);
   if (ifNoneMatchSatisfied(request.headers["if-none-match"], etag)) return reply.code(304).send();
   return reply.type("application/json; charset=utf-8").send(body);
+}
+
+/**
+ * Which client build this machine serves, for telling apart two devices that
+ * run different releases. The hashed asset names in index.html change with
+ * every build, so a digest of it is a build id without a build step.
+ */
+async function clientBuildId(rootDir: string): Promise<string> {
+  try {
+    const html = await fs.readFile(path.join(rootDir, "dist", "client", "index.html"));
+    return createHash("sha256").update(html).digest("hex").slice(0, 8);
+  } catch {
+    return "dev";
+  }
 }
 
 function boundedInteger(value: unknown, min: number, max: number, fallback: number): number {

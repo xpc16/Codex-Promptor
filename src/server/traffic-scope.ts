@@ -17,9 +17,18 @@
  *     capacity planning -- never an access-control decision.
  */
 
-export type NetworkScope = "local" | "tunnel" | "remote";
+import { FEDERATION_HOST } from "../shared/federation-protocol.js";
 
-export const NETWORK_SCOPES: readonly NetworkScope[] = ["local", "tunnel", "remote"];
+/**
+ * `federation` is a request another Promptor forwarded here on behalf of one
+ * of its pages (docs/MULTI_DEVICE_FEDERATION_IMPLEMENTATION.md). It is told
+ * apart by the reserved Host the forwarding code always sets, and it is as
+ * remote as anything gets: every access decision in this server compares
+ * against `local`, so a new non-local value can only ever be stricter.
+ */
+export type NetworkScope = "local" | "tunnel" | "remote" | "federation";
+
+export const NETWORK_SCOPES: readonly NetworkScope[] = ["local", "tunnel", "remote", "federation"];
 
 const LOOPBACK = /^(?:::1|::ffff:127\.\d+\.\d+\.\d+|127\.\d+\.\d+\.\d+)$/;
 
@@ -46,6 +55,9 @@ export function classifyNetworkScope(
   remoteAddress: string | undefined | null,
   host: string | undefined | null,
 ): NetworkScope {
+  // Checked first: a forwarded request is injected in-process and has no real
+  // peer address, and it must not be filed as remote traffic of this link.
+  if (hostname(host) === FEDERATION_HOST) return "federation";
   if (!isLoopbackAddress(remoteAddress)) return "remote";
   // Reached loopback under a name that is not loopback: something on this
   // machine forwarded it here, which for capacity purposes is remote traffic.

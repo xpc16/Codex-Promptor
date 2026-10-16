@@ -17,7 +17,12 @@ const shutdown = async (reason?: string) => {
   process.exit(0);
 };
 if (process.env.CODEX_PROMPTOR_AUTO_EXIT !== "0") {
-  app.promptor.ui.on("idle", () => void shutdown("Last browser page closed; Codex Promptor stopped."));
+  app.promptor.ui.on("idle", () => {
+    // A machine in a multi-device workspace has to stay reachable with no page
+    // of its own open: other machines' pages are using it.
+    if (app.promptor.federation.mode() !== "off") return;
+    void shutdown("Last browser page closed; Codex Promptor stopped.");
+  });
 }
 
 await app.listen({ host: "127.0.0.1", port });
@@ -27,6 +32,7 @@ const actualPort = typeof address === "object" && address ? address.port : port;
 const url = `http://127.0.0.1:${actualPort}/`;
 console.log(`Codex Promptor ready: ${url}`);
 console.log(`Data directory: ${app.promptor.storage.dataDir}`);
+if (app.promptor.federation.mode() !== "off") console.log(`Multi-device: ${app.promptor.federation.mode()} (stays running with no page open)`);
 void restorePromise.then(async ({ restored, failed, timings }) => {
   if (restored.length) console.log(`Restored ${restored.length} previously open coding-agent conversation(s).`);
   for (const line of timings) console.log(line);
