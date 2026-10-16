@@ -113,6 +113,14 @@ export class PtyManager extends EventEmitter {
     envPatch: Record<string, string> = {},
     theme: TerminalTheme = "light",
   ): Promise<void> {
+    // Typed into the shell on Windows, where ConPTY holds the input until
+    // PowerShell reads it. A Unix pty does not: 180 ms in, pwsh is still
+    // starting, the tty echoes the text and turns its Enter into a line feed,
+    // and PSReadLine then leaves the whole command unsent at its first prompt.
+    // Handed over as -Command it runs before that prompt instead.
+    if (process.platform !== "win32") {
+      return this.startTerminal(tabId, cwd, ["-NoLogo", "-NoExit", "-NoProfile", "-Command", command], agentLabel, exitMarker, envPatch, theme);
+    }
     return this.startTerminal(tabId, cwd, ["-NoLogo", "-NoExit", "-NoProfile"], agentLabel, exitMarker, envPatch, theme, (child) => {
       child.write(`${command}\r`);
     });
