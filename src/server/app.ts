@@ -3579,14 +3579,20 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     // Loopback is where the passphrase was typed; it has nothing to prove.
     let pending: PendingHandshake | null = null;
     let verified = client.scope === "local";
+    let decided = verified;
+    const undecided: Buffer[] = [];
     if (!verified) {
       void encryptionState().then((encryption) => {
-        if (!encryption) { verified = true; return; }
-        pending = startHandshake(encryption.master, encryption.fingerprint);
-        // Offered, not imposed: the client answers with the one it also holds,
-        // or with nothing, and the frames say per message which was used.
-        const offer: HandshakeChallenge = { ...pending.message, ...(heldDictionaries.length ? { dictionaries: heldDictionaries } : {}) };
-        if (socket.readyState === 1) socket.send(JSON.stringify(offer));
+        if (!encryption) verified = true;
+        else {
+          pending = startHandshake(encryption.master, encryption.fingerprint);
+          // Offered, not imposed: the client answers with the one it also holds,
+          // or with nothing, and the frames say per message which was used.
+          const offer: HandshakeChallenge = { ...pending.message, ...(heldDictionaries.length ? { dictionaries: heldDictionaries } : {}) };
+          if (socket.readyState === 1) socket.send(JSON.stringify(offer));
+        }
+        decided = true;
+        for (const raw of undecided.splice(0)) void onMessage(raw);
       }).catch(() => { socket.close(1011, "Encryption unavailable"); });
     }
     socket.on("close", (code: number) => {
@@ -3607,7 +3613,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       traffic.unregister(client.id);
       ui.disconnect();
     });
-    socket.on("message", async (raw: Buffer) => {
+    const onMessage = async (raw: Buffer) => {
       try {
         // A sealed connection reads its frames here and nowhere else. A frame
         // that does not open is dropped without a word: it is either a
@@ -3877,6 +3883,14 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       } catch {
         sendClient(client, wsError("INVALID_WS_MESSAGE", "Invalid WebSocket message."), "error");
       }
+    };
+    // Until it is known whether this connection must prove a key, nothing
+    // it sends can be judged -- and dropping it would lose the subscribe of
+    // any client fast enough to beat the check, which an in-process relay
+    // always is. Held instead, and replayed in order once decided.
+    socket.on("message", (raw: Buffer) => {
+      if (!decided) { if (undecided.length < 64) undecided.push(raw); return; }
+      void onMessage(raw);
     });
   });
 
