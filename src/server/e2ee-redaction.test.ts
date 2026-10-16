@@ -122,7 +122,15 @@ describe("the passphrase over a real connection", () => {
     // the point is that the passphrase is absent from what a reader holding
     // the key can see, not merely from what the relay can.
     const master = await deriveMasterKey(PASSPHRASE, Buffer.from(decodeBase64(E2EE_SALT)), 600_000);
-    for (const url of ["/api/bootstrap", `/api/tabs/${tabId}`]) {
+    // Bootstrap stays readable without a key, so it no longer lists the
+    // conversations at all over the tunnel; the list comes from
+    // /api/navigation, sealed, once the page holds the key.
+    const bootstrap = await fetchAs(REMOTE_HOST, "/api/bootstrap");
+    expect(bootstrap.statusCode).toBe(200);
+    expect(bootstrap.body).not.toContain(PASSPHRASE);
+    expect(bootstrap.body).not.toContain(tabId);
+    expect(bootstrap.json().data.index).toBeNull();
+    for (const url of ["/api/navigation", `/api/tabs/${tabId}`]) {
       const local = await fetchAs("127.0.0.1:4317", url);
       expect(local.statusCode, url).toBe(200);
       expect(local.body, `${url} on loopback`).toContain(PASSPHRASE);

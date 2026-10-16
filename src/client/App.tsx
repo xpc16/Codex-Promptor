@@ -237,23 +237,37 @@ export function App() {
     setDialog((current) => dialogSurvivesIndex(current, tabIds, groupIds) ? current : null);
   }, []);
 
+  const adoptNavigation = useCallback((navigation: { index: IndexFile; activities: Record<string, TabActivitySummary> }) => {
+    adoptIndex(navigation.index);
+    setActivities(navigation.activities);
+    for (const [tabId, activity] of Object.entries(navigation.activities)) {
+      markRecentCompletion(tabId, activity.lastQueueCompletedAt, false);
+    }
+  }, [adoptIndex, markRecentCompletion]);
+
   const refresh = useCallback(async () => {
     try {
-      const data = await api<{ index: IndexFile; activities: Record<string, TabActivitySummary>; app: any; e2ee?: { required: boolean; fingerprint?: string; salt?: string; iterations?: number } }>("/api/bootstrap");
+      const data = await api<{ index: IndexFile | null; activities: Record<string, TabActivitySummary> | null; app: any; e2ee?: { required: boolean; fingerprint?: string; salt?: string; iterations?: number } }>("/api/bootstrap");
       await applyRequirement(data.e2ee);
       setE2ee(e2eeState());
       setKdf(data.e2ee?.required ? { salt: data.e2ee.salt ?? "", iterations: data.e2ee.iterations ?? 0 } : null);
-      adoptIndex(data.index);
-      setActivities(data.activities);
-      for (const [tabId, activity] of Object.entries(data.activities)) {
-        markRecentCompletion(tabId, activity.lastQueueCompletedAt, false);
-      }
+      // A page that must prove a key is not sent the conversation list in the
+      // clear; it arrives sealed once the key is proved (the effect below).
+      if (data.index && data.activities) adoptNavigation({ index: data.index, activities: data.activities });
+      else if (e2eeState().proved) adoptNavigation(await api("/api/navigation"));
       setService(data.app);
       setError(null);
     } catch (reason) { setError(reason); }
-  }, [adoptIndex, markRecentCompletion]);
+  }, [adoptNavigation]);
 
   useEffect(() => { void refresh(); }, [refresh]);
+  // The moment a key is proved, read what bootstrap withheld. The navigation
+  // socket also replays the index then, but the queue lights have only this.
+  useEffect(() => {
+    if (!e2ee.required || !e2ee.proved) return;
+    api<{ index: IndexFile; activities: Record<string, TabActivitySummary> }>("/api/navigation")
+      .then(adoptNavigation, (reason) => setError(reason));
+  }, [e2ee.required, e2ee.proved, adoptNavigation]);
   // Off the critical path, but not left until the reader scrolls to an
   // answer: asked for once the page is painted and usable.
   useEffect(() => { preloadMarkdownView(); }, []);
@@ -545,6 +559,8 @@ export function App() {
     {error ? <div className="startup-error-mark" aria-hidden="true">!</div> : <div className="orb" />}
     <p role={error ? "alert" : undefined}>{error ? i18n.errorText(error) : t("app.loading")}</p>
     <button onClick={() => void refresh()}>{t("action.retry")}</button>
+    {/* Nothing to show until the key is proved: the list itself is sealed. */}
+    {e2ee.required && !e2ee.proved && kdf && <E2eeUnlock state={e2ee} kdf={kdf} onError={setError} />}
   </div></I18nContext.Provider>;
 
   return <I18nContext.Provider value={i18n}><div className="app-shell" ref={appShellRef} data-mobile-pane={mobilePane}>

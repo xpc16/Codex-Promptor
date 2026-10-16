@@ -2538,13 +2538,24 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     return reply.send({ data: traffic.snapshot() });
   });
 
-  app.get("/api/bootstrap", async (request, reply) => {
+  /** The sidebar: every conversation and the state of its queue. */
+  const readNavigation = async (): Promise<{ index: IndexFile; activities: Record<string, TabActivitySummary> }> => {
     const index = await storage.readIndex();
     const activities: Record<string, TabActivitySummary> = {};
     await Promise.all(index.tabs.map(async (tab) => {
       try { activities[tab.id] = await storage.readTabActivity(tab.id); }
       catch { /* a concurrently deleted or incomplete tab is omitted */ }
     }));
+    return { index, activities };
+  };
+
+  /**
+   * What bootstrap carries, for a page that has just proved its key. An
+   * ordinary /api/ route, so its answer is sealed like every other.
+   */
+  app.get("/api/navigation", async (_request, reply) => reply.send({ data: await readNavigation() }));
+
+  app.get("/api/bootstrap", async (request, reply) => {
     // Cleartext on purpose: a page cannot be asked for a key it does not know
     // it needs. The salt is here because without it the far end can derive
     // nothing, and neither it nor the fingerprint is secret.
@@ -2555,9 +2566,13 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     // would sit behind its own prompt forever.
     const mustProve = Boolean(encryption)
       && classifyNetworkScope(request.raw.socket?.remoteAddress, request.headers.host) !== "local";
+    // And because it is cleartext, it carries no conversation names when a key
+    // is required: they used to go out here in the clear with only the
+    // passphrase taken out. Such a page reads /api/navigation once unlocked.
+    const navigation = mustProve ? null : await readNavigation();
     return reply.send({ data: {
-      index,
-      activities,
+      index: navigation?.index ?? null,
+      activities: navigation?.activities ?? null,
       // The salt is here because the far end derives nothing without it, and
       // it is not a secret: its job is to make a precomputed table useless,
       // not to be unknown.
