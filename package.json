@@ -38,6 +38,10 @@
     "ws": "^8.18.0",
     "zod": "^4.0.0"
   },
+  "allowScripts": {
+    "node-pty": true,
+    "esbuild": true
+  },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/react": "^19.1.0",

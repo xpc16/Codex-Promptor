@@ -1,5 +1,8 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { accessSync, chmodSync, constants as fsConstants } from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
 import * as pty from "node-pty";
 import { terminateProcessTree } from "./codex.js";
 import { TerminalScreenModel, type TerminalScreenSnapshot } from "./terminal-screen.js";
@@ -62,6 +65,27 @@ const EXIT_SCAN_OVERLAP = 32;
 // agent TUI has a separate read to commit the paste before the key arrives.
 const SUBMIT_ENTER_DELAY_MS = 90;
 const MAX_BUFFER_BYTES = 1_000_000;
+
+let spawnHelperChecked = false;
+
+/**
+ * node-pty 1.1.0 ships its macOS prebuilds with `spawn-helper` lacking the
+ * execute bit, and nothing in its install sets it, so every spawn failed with
+ * "posix_spawnp failed". Checked once, before the first terminal, in each
+ * place node-pty may load the helper from. Windows has no helper.
+ */
+function ensureSpawnHelperExecutable(): void {
+  if (spawnHelperChecked || process.platform === "win32") return;
+  spawnHelperChecked = true;
+  try {
+    const root = path.dirname(createRequire(import.meta.url).resolve("node-pty/package.json"));
+    for (const dir of ["build/Release", "build/Debug", `prebuilds/${process.platform}-${process.arch}`]) {
+      const helper = path.join(root, dir, "spawn-helper");
+      try { accessSync(helper, fsConstants.X_OK); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "EACCES") chmodSync(helper, 0o755); }
+    }
+  } catch { /* the spawn itself reports whatever is still wrong */ }
+}
 
 export class PtyManager extends EventEmitter {
   private readonly sessions = new Map<string, Session>();
@@ -147,6 +171,7 @@ export class PtyManager extends EventEmitter {
       // that size avoids loading a long history at 80x12 and immediately
       // forcing Codex to repaint the entire history at a second size.
       const initialSize = this.requestedSizes.get(tabId) ?? { cols: 80, rows: 12 };
+      ensureSpawnHelperExecutable();
       const child = pty.spawn(shell, shellArgs, {
         name: "xterm-256color",
         cols: initialSize.cols,
