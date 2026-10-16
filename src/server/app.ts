@@ -4087,7 +4087,10 @@ function sendRevalidatable(request: FastifyRequest, reply: FastifyReply, data: u
  */
 async function clientBuildId(rootDir: string): Promise<string> {
   try {
-    const html = await fs.readFile(path.join(rootDir, "dist", "client", "index.html"));
+    // Line endings are normalized first: a checkout with core.autocrlf gives
+    // index.html CRLFs, and the same build on two machines must not read as
+    // two versions. The assets it names carry their own content hashes.
+    const html = (await fs.readFile(path.join(rootDir, "dist", "client", "index.html"), "utf8")).replace(/\r\n/g, "\n");
     return createHash("sha256").update(html).digest("hex").slice(0, 8);
   } catch {
     return "dev";

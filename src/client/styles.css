@@ -216,14 +216,16 @@ input, textarea, select { color: var(--text); }
 .empty-sidebar span { color: var(--faint); font-size: 12px; }
 
 .sidebar-footer { flex: none; display: grid; padding: 6px 2px 0; border-top: 1px solid var(--border); }
-.footer-bottom-row { min-width: 0; display: grid; grid-template-columns: 26px 26px minmax(0, 1fr) 50px; align-items: center; gap: 3px; }
-.footer-compact-button { height: 26px; display: flex; align-items: center; justify-content: center; padding: 0; }
-.theme-icon-toggle, .refresh-icon-button { width: 26px; }
+/* One row however many icon buttons there are: the multi-device button only
+   exists on the machine's own page, so a fixed column grid wrapped there. */
+.footer-bottom-row { min-width: 0; display: flex; align-items: center; gap: 3px; }
+.footer-compact-button { flex: none; height: 26px; display: flex; align-items: center; justify-content: center; padding: 0; }
+.theme-icon-toggle, .refresh-icon-button, .devices-icon-button { width: 26px; }
 .theme-icon-toggle svg, .refresh-icon-button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.locale-toggle { gap: 2px; padding: 0 4px; font-size: 10px; font-weight: 600; white-space: nowrap; }
+.locale-toggle { width: 50px; gap: 2px; padding: 0 4px; font-size: 10px; font-weight: 600; white-space: nowrap; }
 .locale-toggle span { color: var(--faint); }
 .locale-toggle span.active { color: var(--primary); font-weight: 800; }
-.service-status { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 3px; color: var(--muted); font-size: 9px; }
+.service-status { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; justify-content: center; gap: 3px; color: var(--muted); font-size: 9px; }
 .service-status time { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .muted { margin-left: auto; color: var(--faint); }
 

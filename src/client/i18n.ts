@@ -829,7 +829,7 @@ export function createI18n(locale: Locale): I18n {
     formatTime: (value) => value
       ? new Date(value).toLocaleString(dateLocale, { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
       : t("time.unknown"),
-    formatClock: (value) => value.toLocaleString(dateLocale, { hour12: false, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }),
+    formatClock: (value) => value.toLocaleTimeString(dateLocale, { hour12: false, hour: "2-digit", minute: "2-digit" }),
     errorText,
   };
 }
