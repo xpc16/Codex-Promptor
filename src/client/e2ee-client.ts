@@ -181,18 +181,35 @@ async function transact<T>(mode: IDBTransactionMode, run: (store: IDBObjectStore
   }
 }
 
+/**
+ * One record per key, by fingerprint. A page can be talking to several
+ * machines, each with its own passphrase (docs/MULTI_DEVICE_FEDERATION_IMPLEMENTATION.md
+ * §10), and remembering one must not forget another. The single record older
+ * pages wrote under KEY_RECORD is still read, so an upgrade asks for nothing.
+ */
 export async function rememberKey(key: SessionKey): Promise<void> {
-  await transact("readwrite", (store) => store.put(key as never, KEY_RECORD) as IDBRequest<unknown>);
+  await transact("readwrite", (store) => store.put(key as never, `fp:${key.fingerprint}`) as IDBRequest<unknown>);
 }
 
 export async function recallKey(fingerprint: string | null): Promise<SessionKey | null> {
-  const stored = await transact<SessionKey>("readonly", (store) => store.get(KEY_RECORD) as IDBRequest<SessionKey>);
-  if (!stored?.master || typeof stored.fingerprint !== "string") return null;
+  const usable = (stored: SessionKey | null) => Boolean(stored?.master) && typeof stored?.fingerprint === "string";
+  if (fingerprint) {
+    const byFingerprint = await transact<SessionKey>("readonly", (store) => store.get(`fp:${fingerprint}`) as IDBRequest<SessionKey>);
+    if (byFingerprint && usable(byFingerprint)) return byFingerprint;
+  }
+  const legacy = await transact<SessionKey>("readonly", (store) => store.get(KEY_RECORD) as IDBRequest<SessionKey>);
+  if (!legacy || !usable(legacy)) return null;
   // A key from before a rotation is not this key. Dropping it here is what
   // turns "the page is broken" into "it asks for the passphrase again".
-  return fingerprint && stored.fingerprint !== fingerprint ? null : stored;
+  return fingerprint && legacy.fingerprint !== fingerprint ? null : legacy;
 }
 
-export async function forgetKey(): Promise<void> {
-  await transact("readwrite", (store) => store.delete(KEY_RECORD) as IDBRequest<undefined>);
+export async function forgetKey(fingerprint: string | null = null): Promise<void> {
+  if (fingerprint) await transact("readwrite", (store) => store.delete(`fp:${fingerprint}`) as IDBRequest<undefined>);
+  // The legacy record goes too when it is the key being forgotten, or when no
+  // fingerprint was given -- the old behaviour.
+  const legacy = await transact<SessionKey>("readonly", (store) => store.get(KEY_RECORD) as IDBRequest<SessionKey>);
+  if (legacy && (!fingerprint || legacy.fingerprint === fingerprint)) {
+    await transact("readwrite", (store) => store.delete(KEY_RECORD) as IDBRequest<undefined>);
+  }
 }

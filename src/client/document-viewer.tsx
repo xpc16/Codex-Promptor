@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 
 import { extractDocumentTarget } from "../shared/document-link.js";
 import type { DocumentOpenRequest } from "../shared/document-protocol.js";
-import { DocumentLoader, type DocumentViewerState } from "./document-loader.js";
+import { DocumentLoader, browserDocumentTransport, type DocumentTransport, type DocumentViewerState } from "./document-loader.js";
 import { planMarkdownHeadingIds } from "./markdown-headings.js";
 import { MarkdownView } from "./markdown-view.js";
 import { useI18n } from "./i18n.js";
@@ -12,8 +12,10 @@ export type DocumentOpenIntent = {
   request: DocumentOpenRequest;
 };
 
-export function useDocumentViewer(intent: DocumentOpenIntent | null, active: boolean) {
-  const loader = useMemo(() => new DocumentLoader(), []);
+export function useDocumentViewer(intent: DocumentOpenIntent | null, active: boolean, transport: DocumentTransport = browserDocumentTransport) {
+  // One loader per view; a view never changes device, so the transport it
+  // started with is the right one for its whole life.
+  const loader = useMemo(() => new DocumentLoader(transport), []); // eslint-disable-line react-hooks/exhaustive-deps
   const [state, setState] = useState<DocumentViewerState>(loader.state);
   const handledIntent = useRef<number | null>(null);
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Timer, TimerFile, TimerPromptTemplate } from "../shared/schemas.js";
-import { apiResponse } from "./api-client.js";
+import { useDevice } from "./device.js";
 import { useI18n } from "./i18n.js";
 import { ModalShell } from "./modal-shell.js";
 
@@ -36,6 +36,11 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
   onClose: () => void;
   onError: (error: unknown) => void;
 }) {
+  const device = useDevice();
+  const { apiResponse } = device;
+  // Drafts are per conversation per machine: two machines can hold the same
+  // tab id when a data folder was copied.
+  const draftScope = device.cacheKey(tabId);
   const i18n = useI18n();
   const c = i18n.locale === "zh-CN" ? zh : en;
   const [file, setFile] = useState<TimerFile | null>(null);
@@ -49,14 +54,14 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
   const runKeys = useRef(new Map<string, string>());
 
   const selectTimer = useCallback((timer: Timer) => {
-    const draft = timerEditorDrafts.get(timerDraftKey(tabId, timer.id));
-    timerEditorSelections.set(tabId, timer.id);
+    const draft = timerEditorDrafts.get(timerDraftKey(draftScope, timer.id));
+    timerEditorSelections.set(draftScope, timer.id);
     setEditor(draft ?? editorFromTimer(timer));
     setDirty(Boolean(draft));
   }, [tabId]);
   const selectNew = useCallback(() => {
-    const draft = timerEditorDrafts.get(timerDraftKey(tabId, null));
-    timerEditorSelections.set(tabId, null);
+    const draft = timerEditorDrafts.get(timerDraftKey(draftScope, null));
+    timerEditorSelections.set(draftScope, null);
     setEditor(draft ?? newEditor());
     setDirty(Boolean(draft));
   }, [tabId]);
@@ -69,8 +74,8 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
       });
       if (response.data) {
         setFile(response.data);
-        const hasSelection = timerEditorSelections.has(tabId);
-        const selectedId = timerEditorSelections.get(tabId);
+        const hasSelection = timerEditorSelections.has(draftScope);
+        const selectedId = timerEditorSelections.get(draftScope);
         const current = selectedId ? response.data.timers.find((timer) => timer.id === selectedId) : undefined;
         if (current) selectTimer(current);
         else if (hasSelection && selectedId === null) selectNew();
@@ -86,8 +91,8 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
   const patch = (value: Partial<Editor>) => {
     setEditor((current) => {
       const next = { ...current, ...value };
-      timerEditorDrafts.set(timerDraftKey(tabId, current.id), next);
-      timerEditorSelections.set(tabId, current.id);
+      timerEditorDrafts.set(timerDraftKey(draftScope, current.id), next);
+      timerEditorSelections.set(draftScope, current.id);
       return next;
     });
     setDirty(true);
@@ -130,7 +135,7 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
         body: JSON.stringify(body),
       });
       if (response.data) {
-        timerEditorDrafts.delete(timerDraftKey(tabId, editor.id));
+        timerEditorDrafts.delete(timerDraftKey(draftScope, editor.id));
         setFile(response.data.file);
         selectTimer(response.data.timer);
       }
@@ -144,7 +149,7 @@ export function TimerDialog({ open, tabId, sessionReady, currentThreadId, provid
     try {
       const response = await apiResponse(`/api/tabs/${tabId}/timers/${editor.id}`, { method: "DELETE", headers: { "If-Match": etag } });
       const remaining = file?.timers.filter((timer) => timer.id !== editor.id) ?? [];
-      timerEditorDrafts.delete(timerDraftKey(tabId, editor.id));
+      timerEditorDrafts.delete(timerDraftKey(draftScope, editor.id));
       setFile((current) => current ? { ...current, timers: remaining } : current);
       if (response.etag) setEtag(response.etag);
       if (remaining[0]) selectTimer(remaining[0]); else selectNew();

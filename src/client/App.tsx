@@ -68,6 +68,8 @@ import { api, jsonBody, promptorToken as token } from "./api-client.js";
 import { downloadConversationMarkdown } from "./conversation-export.js";
 import { MarkdownView, preloadMarkdownView } from "./markdown-view.js";
 import { DocumentView, useDocumentViewer, type DocumentOpenIntent } from "./document-viewer.js";
+import { documentTransportFor } from "./document-loader.js";
+import { useDevice } from "./device.js";
 import { insertCommonPrompt, type DraftSelection } from "./prompt-insertion.js";
 import { placeGroupAfter, placeTab } from "./navigation-placement.js";
 import { LazyDialogBoundary } from "./lazy-dialog-boundary.js";
@@ -892,17 +894,20 @@ function LoadEarlier({ shown, busy, label, busyLabel, onReveal }: { shown: boole
 }
 
 function TabView({ tab, active, refreshNonce, theme, projectionSupported, codexNativeTui, encryptionTabId, onBundleChanged, onError, onNotice }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; projectionSupported: boolean; codexNativeTui: boolean; encryptionTabId: string | null; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void; onNotice: (message: string) => void }) {
+  // The machine that owns this conversation; every call below goes there.
+  const device = useDevice();
+  const { api } = device;
   const i18n = useI18n();
   const { t } = i18n;
   // Re-selecting a conversation paints from what this page already downloaded
   // instead of showing a spinner and fetching the same records again; the load
   // below still runs, but as a revalidation the server answers with a 304.
-  const cached = readCachedTab(tab.id);
+  const cached = readCachedTab(device.cacheKey(tab.id));
   const [bundle, setBundle] = useState<TabBundle | null>(cached?.bundle ?? null);
   const [loadError, setLoadError] = useState<unknown | null>(null);
   // The persisted tab layout is only the starting point for a browser that has
   // never been resized here; after that this screen keeps its own split.
-  const splitSpec = useMemo(() => workspaceSplit(tab.id, tab.layout.leftWidthPercent), [tab.id, tab.layout.leftWidthPercent]);
+  const splitSpec = useMemo(() => workspaceSplit(device.cacheKey(tab.id), tab.layout.leftWidthPercent), [device, tab.id, tab.layout.leftWidthPercent]);
   // Both workspace splits are written to the DOM rather than held in state: one
   // changes the terminal's columns and the other its rows, so a render per
   // pointer event became an xterm resize per frame. See pane-drag.ts.
@@ -919,12 +924,12 @@ function TabView({ tab, active, refreshNonce, theme, projectionSupported, codexN
   }, [applyLeftWidth]);
   // How tall the session card is, in this browser only. Null until dragged, so
   // an untouched conversation keeps sizing the card to its own content.
-  const sessionSpec = useMemo(() => conversationSplit(tab.id), [tab.id]);
+  const sessionSpec = useMemo(() => conversationSplit(device.cacheKey(tab.id)), [device, tab.id]);
   const [sessionHeight, setSessionHeight] = useState<number | null>(() => readStoredPaneSize(sessionSpec));
   const conversation = useRef<HTMLElement>(null);
   // The queue/terminal balance belongs to this browser origin. In particular,
   // dragging it through a tunnel cannot overwrite the loopback layout.
-  const queueTerminalSpec = useMemo(() => queueTerminalSplit(tab.id), [tab.id]);
+  const queueTerminalSpec = useMemo(() => queueTerminalSplit(device.cacheKey(tab.id)), [device, tab.id]);
   const queueHeightRef = useRef(readPaneSize(queueTerminalSpec));
   const queuePane = useRef<HTMLElement | null>(null);
   const queueSplitter = useRef<HTMLDivElement | null>(null);
@@ -955,7 +960,7 @@ function TabView({ tab, active, refreshNonce, theme, projectionSupported, codexN
   const keepBundle = useCallback((next: TabBundle) => {
     bundleRef.current = next;
     windowDepth.current = windowLimits(next);
-    rememberTab(next);
+    rememberTab(next, device.cacheKey(next.tab.id));
   }, []);
   const applyBundle = useCallback((next: TabBundle) => {
     initialBundleApplied.current = true;
@@ -1147,7 +1152,7 @@ function TabView({ tab, active, refreshNonce, theme, projectionSupported, codexN
     const target = extractDocumentTarget(href);
     if (target.kind !== "local-file") return;
     const request = { href, tabId: tab.id, answerId };
-    if (!isLoopbackHostname(location.hostname)) {
+    if (!device.native) {
       setDocumentIntent({ id: ++documentIntentId.current, request });
       return;
     }
@@ -1171,7 +1176,7 @@ function TabView({ tab, active, refreshNonce, theme, projectionSupported, codexN
     <section className="conversation-pane" ref={conversation}>{active && <><SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} encryptionElsewhere={encryptionTabId !== null && encryptionTabId !== tab.id} onReopen={reopen} onSyncHistory={async () => { await api(`/api/tabs/${tab.id}/history/sync`, { method: "POST" }); await load(); }} onBundle={applyBundle} onError={onError} onNotice={onNotice} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
     <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) splitDrag.current = new PaneDrag(leftWidthRef.current, applyLeftWidth, (value) => writePaneSize(splitSpec, value)); }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
     <section className="queue-pane" ref={queuePaneRef}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" ref={queueSplitterRef} role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} />{bundle.tab.session.provider === "chatgpt"
-      ? <ChatGptPanel bundle={bundle} localControls={projectionSupported} onError={onError} />
+      ? <ChatGptPanel bundle={bundle} localControls={device.native} onError={onError} />
       : <TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} projectionSupported={projectionSupported} onBundle={applySnapshot} onMessage={applyRealtimeMessage} onError={onError} />}</section>
   </div></div>;
 }
@@ -1181,10 +1186,13 @@ function orderedTabIds(tabs: TabMeta[], groupId: string | null): string[] {
 }
 
 function SessionPanel({ bundle, height, reopening, encryptionElsewhere, onReopen, onSyncHistory, onBundle, onError, onNotice }: { bundle: TabBundle; height: number | null; reopening: boolean; encryptionElsewhere: boolean; onReopen: () => Promise<void>; onSyncHistory: () => Promise<void>; onBundle: (bundle: TabBundle) => void; onError: (error: unknown) => void; onNotice: (message: string) => void }) {
+  // The machine that owns this conversation; every call below goes there.
+  const device = useDevice();
+  const { api } = device;
   const i18n = useI18n();
   const { t } = i18n;
   const session = bundle.tab.session;
-  const initialDraft = useRef(readSessionFormDraft(bundle.tab.id, {
+  const initialDraft = useRef(readSessionFormDraft(device.cacheKey(bundle.tab.id), {
     provider: session.state === "unconfigured" ? "codex" : session.provider,
     mode: "new",
     workingDirectory: session.state === "unconfigured" ? "" : session.workingDirectory ?? "",
@@ -1200,9 +1208,11 @@ function SessionPanel({ bundle, height, reopening, encryptionElsewhere, onReopen
   const [browsing, setBrowsing] = useState(false);
   const restoring = session.state === "connecting" && Boolean(session.threadId && session.workingDirectory);
   const connected = session.state === "ready" || session.state === "closed" || restoring;
-  const localFolderPicker = isLoopbackHostname(location.hostname);
+  // The native dialog runs on the machine that owns the conversation, so only
+  // that machine's own page may open it.
+  const localFolderPicker = device.native;
   useEffect(() => {
-    writeSessionFormDraft(bundle.tab.id, { provider, mode, workingDirectory: cwd, resumeId });
+    writeSessionFormDraft(device.cacheKey(bundle.tab.id), { provider, mode, workingDirectory: cwd, resumeId });
   }, [bundle.tab.id, cwd, mode, provider, resumeId]);
   const connect = async () => {
     setBusy(true);
@@ -1319,13 +1329,17 @@ function AnswerHistory({ answers, total, hasEarlier, onLoadEarlier, onDocumentLi
 }
 
 function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runnable, onChanged, onError }: { bundle: TabBundle; total: number; hasEarlier: boolean; onLoadEarlier: () => Promise<number>; disabled: boolean; runnable: boolean; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
+  // The machine that owns this conversation; every call below goes there.
+  const device = useDevice();
+  const { api } = device;
   const i18n = useI18n();
   const { t } = i18n;
   // The composer holds unsaved work, so it is restored from this browser rather
   // than reset every time the queue remounts (switching conversations, a reload,
   // or the tab falling out of the retained set).
   const tabId = bundle.tab.id;
-  const [newText, setNewText] = useState(() => readPromptDraft(tabId));
+  const draftKey = device.cacheKey(tabId);
+  const [newText, setNewText] = useState(() => readPromptDraft(draftKey));
   const draftVersion = useRef(0);
   const composer = useRef<HTMLTextAreaElement>(null);
   const composerBox = useRef<HTMLDivElement>(null);
@@ -1335,7 +1349,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   const [timerMounted, setTimerMounted] = useState(false);
   const [commonOpen, setCommonOpen] = useState(false);
   const [commonMounted, setCommonMounted] = useState(false);
-  const editDraft = (text: string) => { draftVersion.current += 1; setNewText(text); writePromptDraft(tabId, text); };
+  const editDraft = (text: string) => { draftVersion.current += 1; setNewText(text); writePromptDraft(draftKey, text); };
   const [adding, setAdding] = useState(false);
   const [runnerAction, setRunnerAction] = useState<"start" | "pause" | "interrupt" | null>(null);
   const nativeDragSource = useRef<string | null>(null);
@@ -1397,7 +1411,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     setAdding(true);
     // Only drop the draft once the prompt is safely on the list; a failed add
     // must leave the text exactly where the user can retry it.
-    try { const echo = await api(`/api/tabs/${bundle.tab.id}/prompts`, jsonBody({ text })); setNewText(""); clearPromptDraft(tabId); followPromptTail(); onChanged(echo); }
+    try { const echo = await api(`/api/tabs/${bundle.tab.id}/prompts`, jsonBody({ text })); setNewText(""); clearPromptDraft(draftKey); followPromptTail(); onChanged(echo); }
     catch (reason) { onError(reason); }
     finally { setAdding(false); }
   };
@@ -1434,7 +1448,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     const inserted = insertCommonPrompt(newText, text, commonSelection.current, draftVersion.current);
     draftVersion.current += 1;
     setNewText(inserted.value);
-    writePromptDraft(tabId, inserted.value);
+    writePromptDraft(draftKey, inserted.value);
     setCommonOpen(false);
     requestAnimationFrame(() => { composer.current?.focus(); composer.current?.setSelectionRange(inserted.cursor, inserted.cursor); });
   };
@@ -1496,6 +1510,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
  * ticks locally instead of asking the server.
  */
 function A2aRootBar({ root, onError }: { root: A2aRootSummary; onError: (error: unknown) => void }) {
+  const { api } = useDevice();
   const { t } = useI18n();
   const [busy, setBusy] = useState<"finish" | "stop" | null>(null);
   const [, tick] = useReducer((count: number) => count + 1, 0);
@@ -1664,6 +1679,7 @@ function handoffPromptTextareaWheel(event: ReactWheelEvent<HTMLDivElement>) {
 }
 
 function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, onNativeDragStart, onNativeDragTarget, onNativeDrop, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; executionDisabled: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragTarget: (targetId: string) => void; onNativeDrop: () => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
+  const { api } = useDevice();
   const i18n = useI18n();
   const { t } = i18n;
   const editable = !locked && !["completed", "running", "dispatching"].includes(prompt.status);
@@ -1726,6 +1742,7 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
  * your own browser is the remote equivalent of looking at the window.
  */
 function ChatGptPanel({ bundle, localControls, onError }: { bundle: TabBundle; localControls: boolean; onError: (error: unknown) => void }) {
+  const { api } = useDevice();
   const { t } = useI18n();
   const [busy, setBusy] = useState(false);
   const session = bundle.tab.session;
@@ -1770,6 +1787,13 @@ function ChatGptPanel({ bundle, localControls, onError }: { bundle: TabBundle; l
 }
 
 function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, projectionSupported, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; projectionSupported: boolean; onBundle: (partial: Partial<TabBundle>) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {
+  // Sockets, keys and caches all belong to the machine that owns this
+  // conversation (docs/MULTI_DEVICE_FEDERATION_IMPLEMENTATION.md §9).
+  const device = useDevice();
+  const cacheKey = device.cacheKey(tabId);
+  const gateSend = (socket: WebSocket, text: string) => device.gate.send(socket, text);
+  const gateReceive = (socket: WebSocket, data: unknown) => device.gate.receive(socket, data);
+  const attachSocket = (socket: WebSocket, onReady: () => void) => device.gate.attachSocket(socket, onReady);
   const i18n = useI18n();
   const { t } = i18n;
   const host = useRef<HTMLDivElement>(null);
@@ -1784,13 +1808,16 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
   const providerRef = useRef(provider);
   const callbacks = useRef({ onBundle, onMessage, onError });
   const subscriptionController = useRef<((includeTerminal: boolean) => void) | null>(null);
-  const { loader: documentLoader, state: documentState, visible: documentVisible } = useDocumentViewer(documentIntent, active);
+  const { loader: documentLoader, state: documentState, visible: documentVisible } = useDocumentViewer(documentIntent, active, documentTransportFor(device));
   const documentVisibleRef = useRef(documentVisible);
   const [connected, setConnected] = useState(false);
   const [hasOutput, setHasOutput] = useState(false);
   const [projectionFailed, setProjectionFailed] = useState(false);
+  // The full raw stream only for the machine serving a loopback page; any
+  // conversation reached through another machine gets projection, even from
+  // localhost (docs/MULTI_DEVICE_FEDERATION_IMPLEMENTATION.md §9.5).
   const transportMode: TerminalTransportMode = projectionSupported && !projectionFailed
-    ? resolveAutomaticTerminalTransport(location.hostname)
+    ? (device.native ? resolveAutomaticTerminalTransport(location.hostname) : "projection")
     : "raw";
   const runnerBusy = runnerHasActiveWork(runtime.runner);
   closedRef.current = closed;
@@ -1816,15 +1843,15 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     // Reconnecting with no cursor makes the server resend the whole scroll
     // buffer. Prefer the last parsed terminal checkpoint; raw bytes remain a
     // fallback until the first checkpoint has been captured.
-    const remembered = transportMode === "projection" ? null : readCachedRawTerminal(tabId);
-    const rendered = transportMode === "projection" ? null : readCachedRenderedTerminal(tabId);
+    const remembered = transportMode === "projection" ? null : readCachedRawTerminal(cacheKey);
+    const rendered = transportMode === "projection" ? null : readCachedRenderedTerminal(cacheKey);
     const restore = rendered && (!remembered || rendered.generation === remembered.generation) ? rendered : null;
     const cached = restore ?? remembered;
     const cursor: { generation: string | null; nextOffset: number | null } = cached
       ? { generation: cached.generation, nextOffset: cached.nextOffset }
       : { generation: null, nextOffset: null };
-    if (restore) rememberRawTerminal(tabId, restore.generation, restore.nextOffset, new Uint8Array(), true);
-    let projectionState: ProjectionScreenState | null = transportMode === "projection" ? readCachedProjection(tabId) : null;
+    if (restore) rememberRawTerminal(cacheKey, restore.generation, restore.nextOffset, new Uint8Array(), true);
+    let projectionState: ProjectionScreenState | null = transportMode === "projection" ? readCachedProjection(cacheKey) : null;
     let projectionRenderPending = 0;
     let rawLeaseWritable = true;
     let awaitingRawOneShot = false;
@@ -2190,7 +2217,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       const overlap = Math.max(0, cursor.nextOffset! - startOffset);
       const fresh = bytes.subarray(Math.min(overlap, bytes.length));
       cursor.nextOffset = endOffset;
-      rememberRawTerminal(tabId, generation, endOffset, fresh, Boolean(message.reset) || updateSequence !== null);
+      rememberRawTerminal(cacheKey, generation, endOffset, fresh, Boolean(message.reset) || updateSequence !== null);
       if (fresh.length) {
         updateSequence ??= beginTerminalUpdate();
         setHasOutput(true);
@@ -2213,7 +2240,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       const reset = message.full;
       if (reset) terminalWriteEpoch += 1;
       projectionState = result.state;
-      rememberProjection(tabId, result.state);
+      rememberProjection(cacheKey, result.state);
       const sequence = beginTerminalUpdate();
       setHasOutput(true);
       queueProjectionWrite(result.state, sequence, terminalWriteEpoch, reset);
@@ -2238,7 +2265,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       cursor.generation = message.generation;
       cursor.nextOffset = rawNextOffset;
       paintedGeneration = null;
-      rememberRawTerminal(tabId, message.generation, rawNextOffset, bytes, true);
+      rememberRawTerminal(cacheKey, message.generation, rawNextOffset, bytes, true);
       setHasOutput(true);
       queueTerminalWrite(bytes, beginTerminalUpdate(), terminalWriteEpoch, { generation: message.generation, nextOffset: rawNextOffset }, true);
       sendSubscription(true, false, true);
@@ -2246,7 +2273,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     };
     const connect = () => {
       if (disposed || closedRef.current || !activeRef.current || socket.current?.readyState === WebSocket.OPEN || socket.current?.readyState === WebSocket.CONNECTING) return;
-      const ws = new WebSocket(`${protocol}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ""}`);
+      const ws = new WebSocket(device.wsUrl());
       socket.current = ws;
       // Encrypted frames are binary; without this they arrive as Blobs.
       ws.binaryType = "arraybuffer";
@@ -2383,7 +2410,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       void terminalWriteQueue.finally(() => {
         if (!projectionMode && checkpointValid && paintedGeneration) {
           try {
-            rememberRenderedTerminal(tabId, {
+            rememberRenderedTerminal(cacheKey, {
               generation: paintedGeneration,
               nextOffset: paintedOffset,
               cols: term.cols,

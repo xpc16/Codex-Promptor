@@ -19,7 +19,7 @@ export const MAX_CACHED_TABS = 8;
 
 export type TabCache = {
   get(tabId: string): CachedTab | null;
-  remember(bundle: TabBundle): CachedTab;
+  remember(bundle: TabBundle, key?: string): CachedTab;
   forget(tabId: string): void;
   retain(validIds: ReadonlySet<string>): void;
   size(): number;
@@ -56,9 +56,9 @@ export function createTabCache(limit = MAX_CACHED_TABS): TabCache {
       touch(tabId, entry);
       return entry;
     },
-    remember(bundle) {
+    remember(bundle, key = bundle.tab.id) {
       const entry: CachedTab = { bundle, ...windowLimits(bundle) };
-      touch(bundle.tab.id, entry);
+      touch(key, entry);
       return entry;
     },
     forget(tabId) { entries.delete(tabId); },
@@ -72,6 +72,7 @@ export function createTabCache(limit = MAX_CACHED_TABS): TabCache {
 const pageCache = createTabCache();
 
 export function readCachedTab(tabId: string, cache: TabCache = pageCache): CachedTab | null { return cache.get(tabId); }
-export function rememberTab(bundle: TabBundle, cache: TabCache = pageCache): void { cache.remember(bundle); }
+/** `key` is the device's cache key for the tab: the plain id at home, `<deviceId>/<tabId>` elsewhere. */
+export function rememberTab(bundle: TabBundle, key: string = bundle.tab.id, cache: TabCache = pageCache): void { cache.remember(bundle, key); }
 export function forgetCachedTab(tabId: string, cache: TabCache = pageCache): void { cache.forget(tabId); }
 export function retainCachedTabs(validIds: ReadonlySet<string>, cache: TabCache = pageCache): void { cache.retain(validIds); }

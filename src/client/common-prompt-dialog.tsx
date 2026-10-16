@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { CommonPrompt, CommonPromptFile } from "../shared/schemas.js";
-import { apiResponse } from "./api-client.js";
+import { useDevice } from "./device.js";
 import { useI18n } from "./i18n.js";
 import { ModalShell } from "./modal-shell.js";
 
@@ -13,6 +13,8 @@ export function CommonPromptDialog({ open, canInsert, onClose, onInsert, onError
 }) {
   const { locale } = useI18n();
   const c = locale === "zh-CN" ? zh : en;
+  // The library of the machine that owns the conversation being edited.
+  const { apiResponse } = useDevice();
   const [file, setFile] = useState<CommonPromptFile | null>(null);
   const [etag, setEtag] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);

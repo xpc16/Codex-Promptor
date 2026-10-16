@@ -7,7 +7,7 @@ import {
   documentChunkRange,
 } from "../shared/document-protocol.js";
 import { PromptorApiError } from "./i18n.js";
-import { api, jsonBody, promptorApiHeaders } from "./api-client.js";
+import { api, jsonBody, promptorApiHeaders, type ApiClient } from "./api-client.js";
 import { MarkdownBlockAssembler } from "./markdown-blocks.js";
 
 export type DocumentViewerStatus = "closed" | "opening" | "open" | "loading" | "error";
@@ -277,10 +277,21 @@ export class DocumentLoader {
   }
 }
 
-export const browserDocumentTransport: DocumentTransport = {
-  open: (request, signal) => api<DocumentOpenMetadata>("/api/documents/open", { ...jsonBody(request), cache: "no-store", signal }),
-  chunk: async (metadata, index, signal) => {
-    const response = await fetch(`/api/documents/${encodeURIComponent(metadata.docId)}/chunks/${index}?rev=${encodeURIComponent(metadata.revision)}`, {
+/**
+ * Documents of the machine that owns the conversation. `prefix` is "" at home
+ * and `/d/<deviceId>` for another machine; a docId is only meaningful to the
+ * machine that issued it, so open and chunks always go to the same one.
+ */
+export function documentTransportFor(device: { prefix: string; api: ApiClient["api"] }): DocumentTransport {
+  return {
+    open: (request, signal) => device.api<DocumentOpenMetadata>("/api/documents/open", { ...jsonBody(request), cache: "no-store", signal }),
+    chunk: (metadata, index, signal) => fetchChunk(device.prefix, metadata, index, signal),
+  };
+}
+
+async function fetchChunk(prefix: string, metadata: DocumentOpenMetadata, index: number, signal: AbortSignal): Promise<Uint8Array> {
+  {
+    const response = await fetch(`${prefix}/api/documents/${encodeURIComponent(metadata.docId)}/chunks/${index}?rev=${encodeURIComponent(metadata.revision)}`, {
       method: "GET",
       headers: promptorApiHeaders(),
       cache: "default",
@@ -297,8 +308,10 @@ export const browserDocumentTransport: DocumentTransport = {
       );
     }
     return new Uint8Array(await response.arrayBuffer());
-  },
-};
+  }
+}
+
+export const browserDocumentTransport: DocumentTransport = documentTransportFor({ prefix: "", api });
 
 function isAbort(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
