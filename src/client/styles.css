@@ -116,6 +116,43 @@ input, textarea, select { color: var(--text); }
 .console-drag { color: var(--faint); cursor: grab; user-select: none; }
 .group-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 700; letter-spacing: .02em; }
 .group-heading em { margin-left: auto; color: var(--faint); font-size: 12px; font-style: normal; }
+/* Device sections (docs/MULTI_DEVICE_FEDERATION_IMPLEMENTATION.md §9.3): one per
+   machine, only when there is more than one. A level above the groups, so it
+   reads as a heading over them rather than another group. */
+.device-section { margin: 2px 0 12px; }
+.device-section + .device-section { padding-top: 8px; border-top: 1px solid var(--border); }
+.device-heading { min-height: 30px; display: flex; align-items: center; gap: 6px; padding: 2px 4px; color: var(--text); user-select: none; }
+.device-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 800; letter-spacing: .02em; }
+.device-badge, .device-status { flex: none; padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.device-badge { background: var(--primary-soft); color: var(--primary); }
+.device-status { background: var(--panel-strong); color: var(--muted); }
+.device-status.locked { border: 0; cursor: pointer; background: color-mix(in srgb, var(--notice) 14%, var(--panel)); color: var(--notice); }
+.device-status.version { background: color-mix(in srgb, var(--notice) 12%, var(--panel)); color: var(--notice); }
+.device-new { flex: none; width: 24px; height: 24px; margin-left: auto; display: grid; place-items: center; border-radius: 6px; background: transparent; color: var(--muted); font-size: 16px; line-height: 1; }
+.device-new:hover:not(:disabled) { background: var(--primary-soft); color: var(--primary); }
+.device-section.offline .group, .device-section.offline .device-name { opacity: .62; }
+.device-placeholder { padding: 6px 10px 8px 32px; color: var(--faint); font-size: 12px; }
+.device-offline-banner { flex: none; margin-bottom: 10px; padding: 9px 11px; border: 1px solid color-mix(in srgb, var(--notice) 40%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--notice) 9%, var(--panel)); color: var(--text); font-size: 12px; line-height: 1.5; }
+.devices-icon-button.active { color: var(--primary); }
+.federation-dialog { display: flex; flex-direction: column; gap: 10px; }
+.federation-dialog input, .federation-dialog textarea { width: 100%; margin-top: 5px; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--panel-soft); color: var(--text); font: inherit; font-size: 13px; }
+.federation-dialog textarea { resize: vertical; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; }
+.federation-dialog code { font-size: 12px; overflow-wrap: anywhere; }
+.federation-block { display: flex; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; }
+.federation-block h3 { margin: 0; font-size: 14px; }
+.federation-block .field-label { margin: 4px 0 0; }
+.federation-block > button { align-self: flex-start; margin-top: 4px; }
+.federation-devices { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+.federation-device { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; align-items: center; gap: 10px; padding: 8px 12px; font-size: 13px; }
+.federation-device + .federation-device { border-top: 1px solid var(--border); }
+.federation-device-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+.federation-device-state { color: var(--muted); font-size: 12px; }
+.federation-device-state.online { color: var(--success); }
+.federation-device-version { color: var(--faint); font-size: 11px; }
+.federation-device-actions { display: flex; gap: 8px; }
+.federation-join-code { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.federation-join-code > button { align-self: flex-start; }
+.federation-link { display: flex; align-items: center; gap: 7px; margin: 0; font-size: 13px; font-weight: 700; }
 .ungrouped-group .group-heading { margin-top: 2px; }
 
 .tab-row { width: 100%; min-height: 28px; display: grid; grid-template-columns: 16px minmax(0, 1fr) 26px; align-items: center; gap: 2px; padding: 1px 3px 1px 24px; border-radius: 8px; color: var(--muted); user-select: none; }

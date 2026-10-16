@@ -69,7 +69,9 @@ import { downloadConversationMarkdown } from "./conversation-export.js";
 import { MarkdownView, preloadMarkdownView } from "./markdown-view.js";
 import { DocumentView, useDocumentViewer, type DocumentOpenIntent } from "./document-viewer.js";
 import { documentTransportFor } from "./document-loader.js";
-import { useDevice } from "./device.js";
+import { DeviceContext, deviceFor, homeDevice, setHomeDeviceId, splitTabKey, useDevice, type Device } from "./device.js";
+import { RemoteDeviceSync, initialRemoteState, unlockWithPassphrase, type RemoteDeviceState } from "./remote-device.js";
+import { FEDERATION_OFF_VIEW, type DirectoryDevice, type FederationView } from "../shared/federation-protocol.js";
 import { insertCommonPrompt, type DraftSelection } from "./prompt-insertion.js";
 import { placeGroupAfter, placeTab } from "./navigation-placement.js";
 import { LazyDialogBoundary } from "./lazy-dialog-boundary.js";
@@ -79,6 +81,7 @@ const HELD_INPUT_KEYSTROKES = 32;
 
 const TimerDialog = lazy(async () => ({ default: (await import("./timer-dialog.js")).TimerDialog }));
 const CommonPromptDialog = lazy(async () => ({ default: (await import("./common-prompt-dialog.js")).CommonPromptDialog }));
+const FederationDialog = lazy(async () => ({ default: (await import("./federation-dialog.js")).FederationDialog }));
 
 /**
  * Sockets this screen closed on purpose -- leaving a tab, switching transport,
@@ -135,12 +138,24 @@ async function playPromptCompletionSound(): Promise<void> {
   tone(1_046.5, .072, .15, .04);
 }
 
-type AppDialog =
-  | { kind: "group" }
+/** Dialogs about one machine's navigation. No `deviceId` means the machine serving this page. */
+type TreeDialog =
   | { kind: "rename-tab"; tabId: string; initialValue: string }
   | { kind: "rename-group"; groupId: string; initialValue: string }
   | { kind: "delete-tab"; tabId: string; name: string }
   | { kind: "delete-group"; groupId: string; name: string; tabCount: number };
+type AppDialog = ({ kind: "group" } | TreeDialog) & { deviceId?: string };
+
+const COLLAPSED_DEVICES_KEY = "promptor.devices.collapsed";
+
+/** Which device sections this browser folded. A per-browser convenience, so it may be absent. */
+function readCollapsedDevices(): Record<string, boolean> {
+  try { return JSON.parse(localStorage.getItem(COLLAPSED_DEVICES_KEY) ?? "{}") ?? {}; } catch { return {}; }
+}
+
+function writeCollapsedDevices(value: Record<string, boolean>): void {
+  try { localStorage.setItem(COLLAPSED_DEVICES_KEY, JSON.stringify(value)); } catch { /* storage unavailable */ }
+}
 
 export function App() {
   const [index, setIndex] = useState<IndexFile | null>(null);
@@ -191,8 +206,17 @@ export function App() {
   // cannot roll the sidebar back to an older shape.
   const appliedRevision = useRef(-1);
   const navigationBusy = useRef(false);
-  const dragItem = useRef<{ type: "group" | "tab"; id: string } | null>(null);
-  const [navigationDropTarget, setNavigationDropTarget] = useState<string | null>(null);
+  // Other machines in this workspace (docs/MULTI_DEVICE_FEDERATION_IMPLEMENTATION.md §9).
+  // Off means a list of none, and everything below renders as it always has.
+  const [federation, setFederation] = useState<FederationView>(FEDERATION_OFF_VIEW);
+  const [remoteStates, setRemoteStates] = useState<Record<string, RemoteDeviceState>>({});
+  const [collapsedDevices, setCollapsedDevices] = useState<Record<string, boolean>>(readCollapsedDevices);
+  const [unlockDeviceId, setUnlockDeviceId] = useState<string | null>(null);
+  const [federationDialog, setFederationDialog] = useState<"unmounted" | "open" | "closed">("unmounted");
+  const applyFederation = useCallback((view: FederationView) => {
+    setHomeDeviceId(view.selfId);
+    setFederation(view);
+  }, []);
   const completionTimers = useRef(new Map<string, number>());
   const completionExpiries = useRef(new Map<string, number>());
   const locale: Locale = index?.ui.locale ?? "zh-CN";
@@ -235,8 +259,8 @@ export function App() {
     setIndex(next);
     const tabIds = next.tabs.map((tab) => tab.id);
     const groupIds = next.groups.map((group) => group.id);
-    setSelectedId((current) => nextSelectedTabId(current, tabIds));
-    setDialog((current) => dialogSurvivesIndex(current, tabIds, groupIds) ? current : null);
+    setSelectedId((current) => current && splitTabKey(current).deviceId ? current : nextSelectedTabId(current, tabIds));
+    setDialog((current) => current?.deviceId || dialogSurvivesIndex(current, tabIds, groupIds) ? current : null);
   }, []);
 
   const adoptNavigation = useCallback((navigation: { index: IndexFile; activities: Record<string, TabActivitySummary> }) => {
@@ -259,8 +283,10 @@ export function App() {
       else if (e2eeState().proved) adoptNavigation(await api("/api/navigation"));
       setService(data.app);
       setError(null);
+      // A server without federation answers 404 here; that is the same as off.
+      try { applyFederation(await api<FederationView>("/api/federation")); } catch { /* off */ }
     } catch (reason) { setError(reason); }
-  }, [adoptNavigation]);
+  }, [adoptNavigation, applyFederation]);
 
   useEffect(() => { void refresh(); }, [refresh]);
   // The moment a key is proved, read what bootstrap withheld. The navigation
@@ -290,7 +316,16 @@ export function App() {
     completionExpiries.current.clear();
   }, []);
 
-  const tabIdsKey = useMemo(() => (index?.tabs ?? []).map((tab) => tab.id).sort().join(","), [index]);
+  // Every conversation this page knows, on every machine: the plain id at
+  // home, `<deviceId>/<tabId>` elsewhere. Caches and retained views are
+  // pruned against this, so a removed machine takes its caches with it.
+  const tabIdsKey = useMemo(() => {
+    const keys = (index?.tabs ?? []).map((tab) => tab.id);
+    for (const [deviceId, state] of Object.entries(remoteStates)) {
+      for (const tab of state.index?.tabs ?? []) keys.push(`${deviceId}/${tab.id}`);
+    }
+    return keys.sort().join(",");
+  }, [index, remoteStates]);
   useEffect(() => {
     const validIds = new Set(tabIdsKey ? tabIdsKey.split(",") : []);
     // Cached conversation records outlive the mounted views, so a deleted
@@ -370,6 +405,8 @@ export function App() {
             },
           }));
           markRecentCompletion(tabId, completedAt, true);
+        } else if (message.type === "federation.changed" && message.federation) {
+          applyFederation(message.federation as FederationView);
         } else if (message.type === "service.changed") {
           setService((current: any) => ({ ...(current ?? {}), codex: message.codex }));
         } else if (message.type === "index.changed") {
@@ -405,7 +442,7 @@ export function App() {
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       socket?.close();
     };
-  }, [adoptIndex, markRecentCompletion, refresh]);
+  }, [adoptIndex, applyFederation, markRecentCompletion, refresh]);
   useEffect(() => {
     const timer = window.setInterval(() => setClock(new Date()), 30_000);
     return () => window.clearInterval(timer);
@@ -436,7 +473,118 @@ export function App() {
     // Refs and module-level helpers only: the drag listeners never need rebinding.
   }, []);
 
-  const selected = index?.tabs.find((tab) => tab.id === selectedId) ?? null;
+  /** A tab key back to its machine and conversation, or null if this page does not know it (yet). */
+  const resolveTab = (key: string | null): { key: string; device: Device; tab: TabMeta } | null => {
+    if (!key) return null;
+    const { deviceId, tabId } = splitTabKey(key);
+    if (!deviceId) {
+      const tab = index?.tabs.find((entry) => entry.id === tabId);
+      return tab ? { key, device: homeDevice(), tab } : null;
+    }
+    const tab = remoteStates[deviceId]?.index?.tabs.find((entry) => entry.id === tabId);
+    return tab ? { key, device: deviceFor(deviceId), tab } : null;
+  };
+  const selectedEntry = resolveTab(selectedId);
+  const selected = selectedEntry?.tab ?? null;
+  const devicesListed = federation.devices;
+  const multiDevice = devicesListed.length > 1;
+  const remoteDevices = useMemo(() => devicesListed.filter((device) => device.id !== federation.selfId), [devicesListed, federation.selfId]);
+  const homeVersion = devicesListed.find((device) => device.id === federation.selfId)?.version ?? null;
+  // A machine that leaves the list takes its state with it.
+  useEffect(() => {
+    const listed = new Set(devicesListed.map((device) => device.id));
+    setRemoteStates((current) => {
+      const kept = Object.entries(current).filter(([id]) => listed.has(id));
+      return kept.length === Object.keys(current).length ? current : Object.fromEntries(kept);
+    });
+  }, [devicesListed]);
+  // A machine that comes back refreshes the views open on it: what they show
+  // was read before it went away, and nothing else tells them to look again.
+  const previouslyOnline = useRef<Record<string, boolean>>({});
+  useEffect(() => {
+    const revived = new Set<string>();
+    for (const device of devicesListed) {
+      if (previouslyOnline.current[device.id] === false && device.online) revived.add(device.id);
+      previouslyOnline.current[device.id] = device.online;
+    }
+    if (!revived.size) return;
+    setViewRefreshNonces((current) => {
+      const next = { ...current };
+      for (const key of retainedTabIds) {
+        const { deviceId } = splitTabKey(key);
+        if (deviceId && revived.has(deviceId)) next[key] = (next[key] ?? 0) + 1;
+      }
+      return next;
+    });
+  }, [devicesListed, retainedTabIds]);
+  const updateRemote = useCallback((deviceId: string, change: (current: RemoteDeviceState) => RemoteDeviceState) => {
+    setRemoteStates((current) => ({ ...current, [deviceId]: change(current[deviceId] ?? initialRemoteState(deviceFor(deviceId))) }));
+  }, []);
+  // One handler per machine for the life of the page: a view's callbacks
+  // depend on it, and a new function each render would reload the view.
+  const remoteBundleHandlers = useRef(new Map<string, (bundle: TabBundle) => void>());
+  const remoteBundleHandler = (deviceId: string) => {
+    let handler = remoteBundleHandlers.current.get(deviceId);
+    if (!handler) {
+      handler = (bundle: TabBundle) => updateRemote(deviceId, (current) => {
+        if (!current.index) return current;
+        const existing = current.index.tabs.find((tab) => tab.id === bundle.tab.id);
+        const tabs = existing && existing.updatedAt !== bundle.tab.updatedAt
+          ? current.index.tabs.map((tab) => tab.id === bundle.tab.id ? bundle.tab : tab)
+          : current.index.tabs;
+        return {
+          ...current,
+          index: tabs === current.index.tabs ? current.index : { ...current.index, tabs },
+          activities: {
+            ...current.activities,
+            [bundle.tab.id]: {
+              runnerState: bundle.runtime.runner.state,
+              desiredState: bundle.runtime.runner.desiredState,
+              activePromptId: bundle.runtime.runner.activePromptId,
+              activeTurnId: bundle.runtime.runner.activeTurnId,
+              lastQueueCompletedAt: latestQueueCompletion(bundle.prompts.prompts),
+            },
+          },
+        };
+      });
+      remoteBundleHandlers.current.set(deviceId, handler);
+    }
+    return handler;
+  };
+  /** Every machine still waiting for a key, with what is needed to derive one for it. */
+  const lockedDevices = () => {
+    const list: Array<{ device: Device; kdf: { salt: string; iterations: number } | null }> = [];
+    if (e2ee.required && !e2ee.proved) list.push({ device: homeDevice(), kdf });
+    for (const entry of remoteDevices) {
+      const state = remoteStates[entry.id];
+      if (state?.e2ee.required && !state.e2ee.proved) list.push({ device: deviceFor(entry.id), kdf: state.kdf });
+    }
+    return list;
+  };
+  const unlockAll = async (passphrase: string) => (await unlockWithPassphrase(passphrase, lockedDevices())) > 0;
+  const unlockTarget = unlockDeviceId ? remoteStates[unlockDeviceId] : null;
+  useEffect(() => {
+    if (unlockDeviceId && (!unlockTarget || unlockTarget.e2ee.proved || !unlockTarget.e2ee.required)) setUnlockDeviceId(null);
+  }, [unlockDeviceId, unlockTarget]);
+  const toggleDeviceCollapsed = (deviceId: string) => setCollapsedDevices((current) => {
+    const next = { ...current, [deviceId]: !current[deviceId] };
+    writeCollapsedDevices(next);
+    return next;
+  });
+  const remoteCall = async (device: Device, url: string, method: string, body: unknown) => {
+    try { await device.api(url, { method, body: JSON.stringify(body) }); }
+    catch (reason) { setError(reason); }
+  };
+  /** Reorder on another machine: shown at once, then saved there; its socket brings back the truth. */
+  const persistRemoteNavigation = async (device: Device, nextGroups: Group[], nextTabs: TabMeta[]) => {
+    updateRemote(device.id, (current) => current.index ? { ...current, index: { ...current.index, groups: nextGroups, tabs: nextTabs } } : current);
+    const groupIds = [...nextGroups].sort((a, b) => a.order - b.order).map((group) => group.id);
+    const sections = [
+      ...groupIds.map((groupId) => ({ groupId, tabIds: orderedTabIds(nextTabs, groupId) })),
+      { groupId: null, tabIds: orderedTabIds(nextTabs, null) },
+    ];
+    await remoteCall(device, "/api/navigation/order", "PUT", { groupIds, sections });
+  };
   const applyTabBundle = useCallback((bundle: TabBundle) => {
     setIndex((current) => {
       if (!current) return current;
@@ -456,19 +604,18 @@ export function App() {
     }));
   }, []);
   const retainedTabs = useMemo(() => {
-    if (!index) return [];
-    const validIds = new Set(index.tabs.map((tab) => tab.id));
-    const retained = new Set(retainRecentTabIds(retainedTabIds, selectedId, validIds));
-    return index.tabs.filter((tab) => retained.has(tab.id));
-  }, [index, retainedTabIds, selectedId]);
+    const validKeys = new Set(tabIdsKey ? tabIdsKey.split(",") : []);
+    return retainRecentTabIds(retainedTabIds, selectedId, validKeys)
+      .map((key) => resolveTab(key))
+      .filter((entry): entry is { key: string; device: Device; tab: TabMeta } => entry !== null);
+    // resolveTab reads index and remoteStates, which tabIdsKey follows.
+  }, [tabIdsKey, index, remoteStates, retainedTabIds, selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
   // Which tab is currently the encryption switch, if any. There can only be
   // one, so every other tab's session panel needs to know it is taken.
   const encryptionTabId = useMemo(
     () => index?.tabs.find((tab) => tab.session.provider === "e2ee" && tab.session.state === "ready")?.id ?? null,
     [index],
   );
-  const groups = useMemo(() => [...(index?.groups ?? [])].sort((a, b) => a.order - b.order), [index]);
-  const ungrouped = index?.tabs.filter((tab) => !tab.groupId).sort((a, b) => a.order - b.order) ?? [];
   // On a phone the four desktop panes become four full-screen pages, chosen
   // from the bar at the bottom. The attribute drives the layout and is inert
   // above the CSS breakpoint.
@@ -478,11 +625,18 @@ export function App() {
   // list whose selection just moved off-screen.
   const openTab = (tabId: string) => { setSelectedId(tabId); setMobilePane("conversation"); };
 
-  const createTab = async () => {
+  /**
+   * A new conversation on `target`: by default the machine of the selected
+   * conversation, else this page's own. Placed after the selected one when
+   * that one is on the same machine.
+   */
+  const createTab = async (target: Device = selectedEntry?.device ?? homeDevice()) => {
     try {
-      const tab = await api<TabMeta>("/api/tabs", jsonBody({ name: t("dialog.defaultConversationName"), afterTabId: selected?.id ?? null }));
-      await refresh();
-      openTab(tab.id);
+      const afterTabId = selectedEntry && selectedEntry.device.id === target.id ? selectedEntry.tab.id : null;
+      const tab = await target.api<TabMeta>("/api/tabs", jsonBody({ name: t("dialog.defaultConversationName"), afterTabId }));
+      // Another machine's list arrives over its socket; this one's is re-read.
+      if (target.home) await refresh();
+      openTab(target.cacheKey(tab.id));
     }
     catch (reason) { setError(reason); }
   };
@@ -490,12 +644,13 @@ export function App() {
   const submitDialog = async (value: string) => {
     if (!dialog) return;
     if (dialog.kind === "delete-tab" || dialog.kind === "delete-group") return;
+    const target = dialog.deviceId ? deviceFor(dialog.deviceId) : homeDevice();
     try {
-      if (dialog.kind === "group") await api("/api/groups", jsonBody({ name: value }));
-      else if (dialog.kind === "rename-tab" && value !== dialog.initialValue) await api(`/api/tabs/${dialog.tabId}`, { method: "PATCH", body: JSON.stringify({ name: value }) });
-      else if (dialog.kind === "rename-group" && value !== dialog.initialValue) await api(`/api/groups/${dialog.groupId}`, { method: "PATCH", body: JSON.stringify({ name: value }) });
+      if (dialog.kind === "group") await target.api("/api/groups", jsonBody({ name: value }));
+      else if (dialog.kind === "rename-tab" && value !== dialog.initialValue) await target.api(`/api/tabs/${dialog.tabId}`, { method: "PATCH", body: JSON.stringify({ name: value }) });
+      else if (dialog.kind === "rename-group" && value !== dialog.initialValue) await target.api(`/api/groups/${dialog.groupId}`, { method: "PATCH", body: JSON.stringify({ name: value }) });
       setDialog(null);
-      await refresh();
+      if (target.home) await refresh();
     } catch (reason) {
       setError(reason);
       throw reason;
@@ -504,17 +659,19 @@ export function App() {
 
   const confirmDelete = async () => {
     if (!dialog || (dialog.kind !== "delete-tab" && dialog.kind !== "delete-group")) return;
+    const target = dialog.deviceId ? deviceFor(dialog.deviceId) : homeDevice();
+    const sourceIndex = target.home ? index : remoteStates[target.id]?.index ?? null;
     try {
       if (dialog.kind === "delete-tab") {
-        const wasEncryption = index?.tabs.find((entry) => entry.id === dialog.tabId)?.session.provider === "e2ee";
-        await api(`/api/tabs/${dialog.tabId}`, { method: "DELETE" });
-        forgetCachedTab(dialog.tabId);
-        forgetCachedTerminal(dialog.tabId);
+        const wasEncryption = sourceIndex?.tabs.find((entry) => entry.id === dialog.tabId)?.session.provider === "e2ee";
+        await target.api(`/api/tabs/${dialog.tabId}`, { method: "DELETE" });
+        forgetCachedTab(target.cacheKey(dialog.tabId));
+        forgetCachedTerminal(target.cacheKey(dialog.tabId));
         if (wasEncryption) setNotice(t("session.e2eeOff"));
       }
-      else await api(`/api/groups/${dialog.groupId}`, { method: "DELETE" });
+      else await target.api(`/api/groups/${dialog.groupId}`, { method: "DELETE" });
       setDialog(null);
-      await refresh();
+      if (target.home) await refresh();
     } catch (reason) {
       setError(reason);
       throw reason;
@@ -535,18 +692,6 @@ export function App() {
     finally { navigationBusy.current = false; }
   };
 
-  const moveGroup = (sourceId: string, targetId: string) => {
-    if (!index) return;
-    const nextGroups = placeGroupAfter(groups, sourceId, targetId);
-    if (nextGroups) void persistNavigation(nextGroups, index.tabs);
-  };
-
-  const moveTab = (sourceId: string, targetId: string | null, groupId: string | null) => {
-    if (!index) return;
-    const nextTabs = placeTab(index.tabs, groups.map((group) => group.id), sourceId, targetId, groupId);
-    if (nextTabs) void persistNavigation(groups, nextTabs);
-  };
-
   const toggleGroup = async (group: Group) => {
     try { await api(`/api/groups/${group.id}`, { method: "PATCH", body: JSON.stringify({ collapsed: !group.collapsed }) }); await refresh(); }
     catch (reason) { setError(reason); }
@@ -557,6 +702,21 @@ export function App() {
     await refresh();
     if (tabId) setViewRefreshNonces((current) => ({ ...current, [tabId]: (current[tabId] ?? 0) + 1 }));
   };
+  const homeTree = index ? <NavigationTree
+    index={index}
+    activities={activities}
+    recentCompletions={recentCompletionExpiries}
+    keyOf={homeDevice().cacheKey}
+    selectedKey={selectedId}
+    native={homeDevice().native}
+    readOnly={false}
+    onOpen={openTab}
+    onDialog={setDialog}
+    onToggleGroup={(group) => void toggleGroup(group)}
+    onToggleUngrouped={() => void updatePreferences({ ungroupedCollapsed: !index.ui.ungroupedCollapsed })}
+    onPersist={(nextGroups, nextTabs) => void persistNavigation(nextGroups, nextTabs)}
+  /> : null;
+
   if (!index) return <I18nContext.Provider value={i18n}><div className={`loading-screen ${error ? "failed" : ""}`}>
     {error ? <div className="startup-error-mark" aria-hidden="true">!</div> : <div className="orb" />}
     <p role={error ? "alert" : undefined}>{error ? i18n.errorText(error) : t("app.loading")}</p>
@@ -568,29 +728,50 @@ export function App() {
   return <I18nContext.Provider value={i18n}><div className="app-shell" ref={appShellRef} data-mobile-pane={mobilePane}>
     <aside className="sidebar" aria-label={t("aria.console")}>
       <div className="brand"><img className="brand-mark" src="/favicon.svg" alt="" aria-hidden="true" draggable={false} /><div><strong>Promptor</strong><span>{t("brand.subtitle")}</span></div></div>
-      <div className="sidebar-actions"><button className="primary small" onClick={() => void createTab()}>{t("nav.newConversation")}</button><button className="icon-button" title={t("nav.newGroupTitle")} onClick={() => setDialog({ kind: "group" })}>{t("nav.newGroup")}</button></div>
+      <div className="sidebar-actions"><button className="primary small" onClick={() => void createTab()}>{t("nav.newConversation")}</button><button className="icon-button" title={t("nav.newGroupTitle")} onClick={() => setDialog({ kind: "group", ...(selectedEntry && !selectedEntry.device.home ? { deviceId: selectedEntry.device.id } : {}) })}>{t("nav.newGroup")}</button></div>
       <div className="tab-tree">
-        {groups.map((group) => {
-          const groupTabs = index.tabs.filter((tab) => tab.groupId === group.id).sort((a, b) => a.order - b.order);
-          return <div className="group" key={group.id}>
-            <div className={`group-heading ${navigationDropTarget === `group:${group.id}` ? "navigation-drop-target" : ""}`} draggable onDragStart={(event) => { dragItem.current = { type: "group", id: group.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", group.id); }} onDragEnd={() => { dragItem.current = null; setNavigationDropTarget(null); }} onDragOver={(event) => { if (!dragItem.current) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setNavigationDropTarget(`group:${group.id}`); }} onDrop={(event) => { event.preventDefault(); const item = dragItem.current; dragItem.current = null; setNavigationDropTarget(null); if (item?.type === "group") moveGroup(item.id, group.id); else if (item?.type === "tab") moveTab(item.id, null, group.id); }}>
-              <button className="collapse-button" aria-label={t(group.collapsed ? "nav.expand" : "nav.collapse", { name: group.name })} onClick={() => void toggleGroup(group)}>{group.collapsed ? "▸" : "▾"}</button><span className="group-name">{group.name}</span><em>{groupTabs.length}</em><RowActionsMenu subject={t("nav.groupSubject", { name: group.name })} deleteTitle={t("nav.deleteGroupHint")} onEdit={() => setDialog({ kind: "rename-group", groupId: group.id, initialValue: group.name })} onDelete={() => setDialog({ kind: "delete-group", groupId: group.id, name: group.name, tabCount: groupTabs.length })} />
+        {!multiDevice ? homeTree : [
+          // This page's own machine first; the rest in the order the hub registered them.
+          devicesListed.find((device) => device.id === federation.selfId),
+          ...remoteDevices,
+        ].filter((device): device is DirectoryDevice => Boolean(device)).map((entry) => {
+          const isHome = entry.id === federation.selfId;
+          const state = isHome ? null : remoteStates[entry.id];
+          const device = isHome ? homeDevice() : deviceFor(entry.id);
+          const collapsed = Boolean(collapsedDevices[entry.id]);
+          const locked = Boolean(state?.e2ee.required && !state.e2ee.proved);
+          const status = isHome
+            ? null
+            : !entry.online
+              ? t(federation.mode === "member" && !federation.hubReachable ? "device.unreachable" : "device.offline")
+              : locked ? t("device.locked") : null;
+          const versionDiffers = !isHome && Boolean(entry.version && homeVersion && entry.version !== homeVersion);
+          return <section className={`device-section ${entry.online ? "" : "offline"}`} key={entry.id} aria-label={entry.name}>
+            <div className="device-heading">
+              <button className="collapse-button" aria-label={t(collapsed ? "nav.expand" : "nav.collapse", { name: entry.name })} onClick={() => toggleDeviceCollapsed(entry.id)}>{collapsed ? "▸" : "▾"}</button>
+              <span className="device-name" title={entry.version ? `${entry.name} · ${entry.version}` : entry.name}>{entry.name}</span>
+              {isHome && <span className="device-badge">{t(isLoopbackHostname(location.hostname) ? "device.local" : "device.hub")}</span>}
+              {status && (locked
+                ? <button className="device-status locked" onClick={() => setUnlockDeviceId(entry.id)}>{status}</button>
+                : <span className="device-status">{status}</span>)}
+              {versionDiffers && <span className="device-status version" title={t("device.versionHint", { theirs: entry.version ?? "", ours: homeVersion ?? "" })}>{t("device.versionMismatch")}</span>}
+              <button className="device-new" title={t("device.newConversation", { name: entry.name })} aria-label={t("device.newConversation", { name: entry.name })} disabled={!entry.online || locked} onClick={() => void createTab(device)}>＋</button>
             </div>
-            {!group.collapsed && groupTabs.map((tab) => <ConsoleTabRow key={tab.id} tab={tab} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletionExpiries[tab.id])} selected={tab.id === selectedId} dropTarget={navigationDropTarget === `tab:${tab.id}`} onClick={() => openTab(tab.id)} onRename={() => setDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => setDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={(event) => { dragItem.current = { type: "tab", id: tab.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", tab.id); }} onDragEnd={() => { dragItem.current = null; setNavigationDropTarget(null); }} onDragOver={() => { if (dragItem.current?.type !== "tab") return false; setNavigationDropTarget(`tab:${tab.id}`); return true; }} onDrop={() => { const item = dragItem.current; dragItem.current = null; setNavigationDropTarget(null); if (item?.type === "tab") moveTab(item.id, tab.id, group.id); }} />)}
-          </div>;
+            {!collapsed && (isHome
+              ? homeTree
+              : state?.index
+                ? <NavigationTree index={state.index} activities={state.activities} recentCompletions={recentCompletionExpiries} keyOf={device.cacheKey} selectedKey={selectedId} native={false} readOnly={!entry.online} onOpen={(tabId) => openTab(device.cacheKey(tabId))} onDialog={(target) => setDialog({ ...target, deviceId: entry.id })} onToggleGroup={(group) => void remoteCall(device, `/api/groups/${group.id}`, "PATCH", { collapsed: !group.collapsed })} onToggleUngrouped={() => void remoteCall(device, "/api/preferences", "PATCH", { ungroupedCollapsed: !state.index!.ui.ungroupedCollapsed })} onPersist={(nextGroups, nextTabs) => void persistRemoteNavigation(device, nextGroups, nextTabs)} />
+                : <div className="device-placeholder">{locked
+                  ? <button className="ghost" onClick={() => setUnlockDeviceId(entry.id)}>{t("device.unlock")}</button>
+                  : t(entry.online ? "device.loading" : "device.neverLoaded")}</div>)}
+          </section>;
         })}
-        <div className="group ungrouped-group">
-          <div className={`group-heading ${navigationDropTarget === "group:__ungrouped" ? "navigation-drop-target" : ""}`} onDragOver={(event) => { if (dragItem.current?.type !== "tab") return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setNavigationDropTarget("group:__ungrouped"); }} onDrop={(event) => { event.preventDefault(); const item = dragItem.current; dragItem.current = null; setNavigationDropTarget(null); if (item?.type === "tab") moveTab(item.id, null, null); }}>
-            <button className="collapse-button" aria-label={t(index.ui.ungroupedCollapsed ? "nav.expand" : "nav.collapse", { name: t("nav.ungrouped") })} onClick={() => void updatePreferences({ ungroupedCollapsed: !index.ui.ungroupedCollapsed })}>{index.ui.ungroupedCollapsed ? "▸" : "▾"}</button><span className="group-name">{t("nav.ungrouped")}</span><em>{ungrouped.length}</em>
-          </div>
-          {!index.ui.ungroupedCollapsed && ungrouped.map((tab) => <ConsoleTabRow key={tab.id} tab={tab} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletionExpiries[tab.id])} selected={tab.id === selectedId} dropTarget={navigationDropTarget === `tab:${tab.id}`} onClick={() => openTab(tab.id)} onRename={() => setDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => setDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={(event) => { dragItem.current = { type: "tab", id: tab.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", tab.id); }} onDragEnd={() => { dragItem.current = null; setNavigationDropTarget(null); }} onDragOver={() => { if (dragItem.current?.type !== "tab") return false; setNavigationDropTarget(`tab:${tab.id}`); return true; }} onDrop={() => { const item = dragItem.current; dragItem.current = null; setNavigationDropTarget(null); if (item?.type === "tab") moveTab(item.id, tab.id, null); }} />)}
-        </div>
-        {!groups.length && !ungrouped.length && <div className="empty-sidebar">{t("nav.empty")}<br /><span>{t("nav.emptyHint")}</span></div>}
       </div>
       <div className="sidebar-footer">
         <div className="footer-bottom-row">
           <button className="footer-compact-button theme-icon-toggle" title={t(index.ui.theme === "light" ? "theme.toDark" : "theme.toLight")} aria-label={t(index.ui.theme === "light" ? "theme.toDark" : "theme.toLight")} onClick={() => void updatePreferences({ theme: index.ui.theme === "light" ? "dark" : "light" })}><ThemeIcon theme={index.ui.theme} /></button>
           <button className="footer-compact-button refresh-icon-button" title={t("footer.refresh")} aria-label={t("footer.refresh")} onClick={() => void reloadSelected()}><RefreshIcon /></button>
+          {isLoopbackHostname(location.hostname) && <button className={`footer-compact-button devices-icon-button ${federation.mode !== "off" ? "active" : ""}`} title={t("federation.open")} aria-label={t("federation.open")} onClick={() => setFederationDialog("open")}><DevicesIcon /></button>}
           <div className="service-status" title={t("service.title", { state: serviceStateLabel(i18n, service?.codex?.state) })}><span className={`status-dot ${service?.codex?.state === "ready" ? "ready" : service?.codex?.state === "error" ? "error" : ""}`} /><time>{i18n.formatClock(clock)}</time></div>
           <button className="footer-compact-button locale-toggle" title={t(locale === "zh-CN" ? "language.toEnglish" : "language.toChinese")} aria-label={t(locale === "zh-CN" ? "language.toEnglish" : "language.toChinese")} onClick={() => void updatePreferences({ locale: locale === "zh-CN" ? "en" : "zh-CN" })}><span className={locale === "zh-CN" ? "active" : ""}>中</span><span aria-hidden="true">/</span><span className={locale === "en" ? "active" : ""}>En</span></button>
         </div>
@@ -600,13 +781,22 @@ export function App() {
     <main className="workspace" aria-label={t("aria.conversationPage")}>
       {Boolean(error) && <div className="toast error-toast">{i18n.errorText(error)}<button onClick={() => setError(null)}>×</button></div>}
       {notice && <div className="toast notice-toast" role="status">{notice}<button onClick={() => setNotice(null)}>×</button></div>}
-      {e2ee.required && !e2ee.proved && kdf && <E2eeUnlock state={e2ee} kdf={kdf} onError={setError} />}
-      {retainedTabs.map((tab) => <TabView key={tab.id} tab={tab} active={tab.id === selectedId} refreshNonce={viewRefreshNonces[tab.id] ?? 0} theme={index.ui.theme} projectionSupported={service?.terminal?.modes?.includes?.("projection") !== false} codexNativeTui={service?.codexConnectionMode === "pty-hooks"} encryptionTabId={encryptionTabId} onBundleChanged={applyTabBundle} onError={setError} onNotice={setNotice} />)}
+      {e2ee.required && !e2ee.proved && kdf && <E2eeUnlock state={e2ee} kdf={kdf} onError={setError} onUnlock={unlockAll} />}
+      {unlockDeviceId && unlockTarget?.kdf && <E2eeUnlock state={unlockTarget.e2ee} kdf={unlockTarget.kdf} title={t("e2ee.unlockDevice", { name: devicesListed.find((device) => device.id === unlockDeviceId)?.name ?? "" })} onError={setError} onUnlock={unlockAll} onCancel={() => setUnlockDeviceId(null)} />}
+      {remoteDevices.map((entry) => <RemoteDeviceSync key={entry.id} device={deviceFor(entry.id)} online={entry.online} onChange={updateRemote} onCompletion={markRecentCompletion} onError={setError} />)}
+      {retainedTabs.map(({ key, device, tab }) => {
+        // Each view takes its machine from context for its whole life.
+        const remote = device.home ? null : remoteStates[device.id];
+        const app = device.home ? service : remote?.app;
+        const online = device.home || Boolean(devicesListed.find((entry) => entry.id === device.id)?.online);
+        return <DeviceContext.Provider key={key} value={device}><TabView tab={tab} active={key === selectedId} offline={!online} refreshNonce={viewRefreshNonces[key] ?? 0} theme={index.ui.theme} projectionSupported={app?.terminal?.modes?.includes?.("projection") !== false} codexNativeTui={app?.codexConnectionMode === "pty-hooks"} encryptionTabId={device.home ? encryptionTabId : remote?.index?.tabs.find((entry) => entry.session.provider === "e2ee" && entry.session.state === "ready")?.id ?? null} onBundleChanged={device.home ? applyTabBundle : remoteBundleHandler(device.id)} onError={setError} onNotice={setNotice} /></DeviceContext.Provider>;
+      })}
       {!selected && <Welcome onCreate={() => void createTab()} />}
     </main>
     <nav className="mobile-pane-bar" aria-label={t("aria.paneSwitcher")}>
       {MOBILE_PANES.map((pane) => <button key={pane} className={pane === mobilePane ? "active" : ""} aria-current={pane === mobilePane ? "page" : undefined} onClick={() => setMobilePane(pane)}>{t(`pane.${pane}`)}</button>)}
     </nav>
+    <Suspense fallback={null}>{federationDialog !== "unmounted" && <FederationDialog open={federationDialog === "open"} onClose={() => setFederationDialog("closed")} onError={setError} />}</Suspense>
     {dialog && (dialog.kind === "delete-tab" || dialog.kind === "delete-group" ? <ConfirmDialog
       title={t(dialog.kind === "delete-tab" ? "dialog.deleteConversation" : "dialog.deleteGroup")}
       message={dialog.kind === "delete-tab" ? t("dialog.deleteConversationMessage", { name: dialog.name }) : t("dialog.deleteGroupMessage", { name: dialog.name, count: dialog.tabCount })}
@@ -736,13 +926,13 @@ function RowActionsMenu({ subject, deleteTitle, deleteDisabled, onEdit, onDelete
   </span>;
 }
 
-function ConsoleTabRow({ tab, activity, recentlyCompleted, selected, dropTarget, onClick, onRename, onDelete, onDragStart, onDragEnd, onDragOver, onDrop }: { tab: TabMeta; activity?: TabActivitySummary; recentlyCompleted: boolean; selected: boolean; dropTarget: boolean; onClick: () => void; onRename: () => void; onDelete: () => void; onDragStart: (event: DragEvent<HTMLDivElement>) => void; onDragEnd: () => void; onDragOver: () => boolean; onDrop: () => void }) {
+function ConsoleTabRow({ tab, native, activity, recentlyCompleted, selected, dropTarget, onClick, onRename, onDelete, onDragStart, onDragEnd, onDragOver, onDrop }: { tab: TabMeta; native: boolean; activity?: TabActivitySummary; recentlyCompleted: boolean; selected: boolean; dropTarget: boolean; onClick: () => void; onRename: () => void; onDelete: () => void; onDragStart: (event: DragEvent<HTMLDivElement>) => void; onDragEnd: () => void; onDragOver: () => boolean; onDrop: () => void }) {
   const { t } = useI18n();
   const visualState = tabVisualState(tab.session.state, activity);
   // The encryption switch is set from the machine itself, so it is unset from
   // there too: a remote page that could delete it would be taking encryption
   // away from everyone, from the far side of the thing it protects.
-  const encryptionLocked = tab.session.provider === "e2ee" && !isLoopbackHostname(location.hostname);
+  const encryptionLocked = tab.session.provider === "e2ee" && !native;
   const tabStatus = visualState === "closed"
     ? t("tab.closed")
     : visualState === "running"
@@ -764,27 +954,102 @@ function ConsoleTabRow({ tab, activity, recentlyCompleted, selected, dropTarget,
  * of the page legible, and asking for it after the terminal has failed to load
  * would present a key problem as a connection problem.
  */
-function E2eeUnlock({ state, kdf, onError }: { state: E2eeState; kdf: { salt: string; iterations: number }; onError: (error: unknown) => void }) {
+/**
+ * One machine's conversations: its groups, the ungrouped ones, and dragging
+ * among them. Each machine gets its own tree with its own drag state, so a
+ * conversation can never be dropped onto another machine -- that would be a
+ * move of files between computers, which nothing here does.
+ */
+function NavigationTree({ index, activities, recentCompletions, keyOf, selectedKey, native, readOnly, onOpen, onDialog, onToggleGroup, onToggleUngrouped, onPersist }: {
+  index: IndexFile;
+  activities: Record<string, TabActivitySummary>;
+  recentCompletions: Record<string, number>;
+  keyOf: (tabId: string) => string;
+  selectedKey: string | null;
+  native: boolean;
+  readOnly: boolean;
+  onOpen: (tabId: string) => void;
+  onDialog: (dialog: TreeDialog) => void;
+  onToggleGroup: (group: Group) => void;
+  onToggleUngrouped: () => void;
+  onPersist: (groups: Group[], tabs: TabMeta[]) => void;
+}) {
+  const { t } = useI18n();
+  const dragItem = useRef<{ type: "group" | "tab"; id: string } | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const groups = useMemo(() => [...index.groups].sort((a, b) => a.order - b.order), [index]);
+  const ungrouped = index.tabs.filter((tab) => !tab.groupId).sort((a, b) => a.order - b.order);
+  const moveGroup = (sourceId: string, targetId: string) => {
+    if (readOnly) return;
+    const nextGroups = placeGroupAfter(groups, sourceId, targetId);
+    if (nextGroups) onPersist(nextGroups, index.tabs);
+  };
+  const moveTab = (sourceId: string, targetId: string | null, groupId: string | null) => {
+    if (readOnly) return;
+    const nextTabs = placeTab(index.tabs, groups.map((group) => group.id), sourceId, targetId, groupId);
+    if (nextTabs) onPersist(groups, nextTabs);
+  };
+  const row = (tab: TabMeta, groupId: string | null) => <ConsoleTabRow key={tab.id} tab={tab} native={native} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletions[keyOf(tab.id)])} selected={keyOf(tab.id) === selectedKey} dropTarget={dropTarget === `tab:${tab.id}`} onClick={() => onOpen(tab.id)} onRename={() => onDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => onDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={(event) => { dragItem.current = { type: "tab", id: tab.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", tab.id); }} onDragEnd={() => { dragItem.current = null; setDropTarget(null); }} onDragOver={() => { if (dragItem.current?.type !== "tab") return false; setDropTarget(`tab:${tab.id}`); return true; }} onDrop={() => { const item = dragItem.current; dragItem.current = null; setDropTarget(null); if (item?.type === "tab") moveTab(item.id, tab.id, groupId); }} />;
+  return <>
+    {groups.map((group) => {
+      const groupTabs = index.tabs.filter((tab) => tab.groupId === group.id).sort((a, b) => a.order - b.order);
+      return <div className="group" key={group.id}>
+        <div className={`group-heading ${dropTarget === `group:${group.id}` ? "navigation-drop-target" : ""}`} draggable={!readOnly} onDragStart={(event) => { dragItem.current = { type: "group", id: group.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", group.id); }} onDragEnd={() => { dragItem.current = null; setDropTarget(null); }} onDragOver={(event) => { if (!dragItem.current) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTarget(`group:${group.id}`); }} onDrop={(event) => { event.preventDefault(); const item = dragItem.current; dragItem.current = null; setDropTarget(null); if (item?.type === "group") moveGroup(item.id, group.id); else if (item?.type === "tab") moveTab(item.id, null, group.id); }}>
+          <button className="collapse-button" aria-label={t(group.collapsed ? "nav.expand" : "nav.collapse", { name: group.name })} onClick={() => onToggleGroup(group)}>{group.collapsed ? "▸" : "▾"}</button><span className="group-name">{group.name}</span><em>{groupTabs.length}</em><RowActionsMenu subject={t("nav.groupSubject", { name: group.name })} deleteTitle={t("nav.deleteGroupHint")} onEdit={() => onDialog({ kind: "rename-group", groupId: group.id, initialValue: group.name })} onDelete={() => onDialog({ kind: "delete-group", groupId: group.id, name: group.name, tabCount: groupTabs.length })} />
+        </div>
+        {!group.collapsed && groupTabs.map((tab) => row(tab, group.id))}
+      </div>;
+    })}
+    <div className="group ungrouped-group">
+      <div className={`group-heading ${dropTarget === "group:__ungrouped" ? "navigation-drop-target" : ""}`} onDragOver={(event) => { if (dragItem.current?.type !== "tab") return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTarget("group:__ungrouped"); }} onDrop={(event) => { event.preventDefault(); const item = dragItem.current; dragItem.current = null; setDropTarget(null); if (item?.type === "tab") moveTab(item.id, null, null); }}>
+        <button className="collapse-button" aria-label={t(index.ui.ungroupedCollapsed ? "nav.expand" : "nav.collapse", { name: t("nav.ungrouped") })} onClick={onToggleUngrouped}>{index.ui.ungroupedCollapsed ? "▸" : "▾"}</button><span className="group-name">{t("nav.ungrouped")}</span><em>{ungrouped.length}</em>
+      </div>
+      {!index.ui.ungroupedCollapsed && ungrouped.map((tab) => row(tab, null))}
+    </div>
+    {!groups.length && !ungrouped.length && <div className="empty-sidebar">{t("nav.empty")}<br /><span>{t("nav.emptyHint")}</span></div>}
+  </>;
+}
+
+function DevicesIcon() {
+  return <svg viewBox="0 0 24 24" aria-hidden="true" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="2.5" y="4" width="12" height="9" rx="1.5" /><path d="M6 16.5h5M8.5 13v3.5" /><rect x="16.5" y="7" width="5" height="12" rx="1.2" /><path d="M18.6 16.6h.8" /></svg>;
+}
+
+function E2eeUnlock({ state, kdf, onError, title, onUnlock, onCancel }: {
+  state: E2eeState;
+  kdf: { salt: string; iterations: number };
+  onError: (error: unknown) => void;
+  title?: string;
+  /** Tries the passphrase on every machine waiting for one; false when none took it. */
+  onUnlock?: (passphrase: string) => Promise<boolean>;
+  onCancel?: () => void;
+}) {
   const { t } = useI18n();
   const [value, setValue] = useState("");
   const [working, setWorking] = useState(false);
   const [masked, setMasked] = useState(false);
+  const [mismatch, setMismatch] = useState(false);
   const unlock = async () => {
     if (working || !value.trim()) return;
     setWorking(true);
     try {
       // Deriving takes a moment by design; the button says so rather than
       // looking stuck.
-      await useKey(await deriveSessionKey(value.trim(), kdf.salt, kdf.iterations));
-      setValue("");
+      if (onUnlock) {
+        const opened = await onUnlock(value.trim());
+        setMismatch(!opened);
+        if (opened) setValue("");
+      } else {
+        await useKey(await deriveSessionKey(value.trim(), kdf.salt, kdf.iterations));
+        setValue("");
+      }
     } catch (reason) { onError(reason); }
     finally { setWorking(false); }
   };
   return <div className="e2ee-unlock" role="dialog" aria-modal="true">
     <div className="e2ee-unlock-card">
-      <strong>{t("e2ee.unlockTitle")}</strong>
+      <strong>{title ?? t("e2ee.unlockTitle")}</strong>
       <p>{t("e2ee.unlockBody")}</p>
-      {state.rejected && <div className="inline-error">{t("e2ee.wrongKey")}</div>}
+      {(state.rejected || mismatch) && <div className="inline-error">{t("e2ee.wrongKey")}</div>}
       {/*
         A plain text field, not a password one. Windows and macOS disable the
         IME inside password inputs, so a passphrase in Chinese -- or any other
@@ -807,6 +1072,7 @@ function E2eeUnlock({ state, kdf, onError }: { state: E2eeState; kdf: { salt: st
         <button className="ghost" type="button" onClick={() => setMasked((current) => !current)}>{t(masked ? "e2ee.reveal" : "e2ee.mask")}</button>
       </div>
       <button className="primary" disabled={working || !value.trim()} onClick={() => void unlock()}>{t(working ? "e2ee.unlocking" : "e2ee.unlock")}</button>
+      {onCancel && <button className="ghost" onClick={onCancel}>{t("e2ee.later")}</button>}
       <small className="field-hint">{t("e2ee.imeHint")}</small>
       {state.fingerprint && <small className="field-hint">{t("e2ee.expectFingerprint", { fingerprint: state.fingerprint })}</small>}
     </div>
@@ -893,7 +1159,7 @@ function LoadEarlier({ shown, busy, label, busyLabel, onReveal }: { shown: boole
   return <button type="button" className="load-earlier" disabled={busy} onClick={onReveal}>{busy ? busyLabel : label}</button>;
 }
 
-function TabView({ tab, active, refreshNonce, theme, projectionSupported, codexNativeTui, encryptionTabId, onBundleChanged, onError, onNotice }: { tab: TabMeta; active: boolean; refreshNonce: number; theme: "light" | "dark"; projectionSupported: boolean; codexNativeTui: boolean; encryptionTabId: string | null; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void; onNotice: (message: string) => void }) {
+function TabView({ tab, active, offline = false, refreshNonce, theme, projectionSupported, codexNativeTui, encryptionTabId, onBundleChanged, onError, onNotice }: { tab: TabMeta; active: boolean; offline?: boolean; refreshNonce: number; theme: "light" | "dark"; projectionSupported: boolean; codexNativeTui: boolean; encryptionTabId: string | null; onBundleChanged: (bundle: TabBundle) => void; onError: (error: unknown) => void; onNotice: (message: string) => void }) {
   // The machine that owns this conversation; every call below goes there.
   const device = useDevice();
   const { api } = device;
@@ -1173,7 +1439,7 @@ function TabView({ tab, active, refreshNonce, theme, projectionSupported, codexN
     } finally { documentOpenBusy.current = false; }
   };
   return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspaceRef}>
-    <section className="conversation-pane" ref={conversation}>{active && <><SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} encryptionElsewhere={encryptionTabId !== null && encryptionTabId !== tab.id} onReopen={reopen} onSyncHistory={async () => { await api(`/api/tabs/${tab.id}/history/sync`, { method: "POST" }); await load(); }} onBundle={applyBundle} onError={onError} onNotice={onNotice} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
+    <section className="conversation-pane" ref={conversation}>{active && <>{offline && <div className="device-offline-banner" role="status">{t("device.offlineBanner")}</div>}<SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} encryptionElsewhere={encryptionTabId !== null && encryptionTabId !== tab.id} onReopen={reopen} onSyncHistory={async () => { await api(`/api/tabs/${tab.id}/history/sync`, { method: "POST" }); await load(); }} onBundle={applyBundle} onError={onError} onNotice={onNotice} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
     <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) splitDrag.current = new PaneDrag(leftWidthRef.current, applyLeftWidth, (value) => writePaneSize(splitSpec, value)); }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
     <section className="queue-pane" ref={queuePaneRef}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" ref={queueSplitterRef} role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} />{bundle.tab.session.provider === "chatgpt"
       ? <ChatGptPanel bundle={bundle} localControls={device.native} onError={onError} />
