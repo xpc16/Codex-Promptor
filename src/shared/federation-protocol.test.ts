@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   FRAME_HEADER_BYTES,
   FrameType,
+  bodyIsIncompressible,
   decodeFrame,
   decodeHeadBody,
   encodeFrame,
@@ -37,6 +38,15 @@ describe("link frames", () => {
     expect(decoded?.head.method).toBe("POST");
     expect([...decoded!.body]).toEqual([...body]);
     expect(decodeHeadBody(new Uint8Array([0, 0, 0, 99, 1]))).toBeNull();
+  });
+
+  it("are not deflated again when the body is ciphertext or already compressed", () => {
+    expect(bodyIsIncompressible({ "content-type": "application/json", "content-encoding": "br" })).toBe(true);
+    expect(bodyIsIncompressible({ "content-type": "application/json", "x-promptor-e2ee": "ab12" })).toBe(true);
+    expect(bodyIsIncompressible({ "content-type": "application/octet-stream" })).toBe(true);   // a sealed request
+    expect(bodyIsIncompressible({ "content-type": "application/json; charset=utf-8" })).toBe(false);
+    expect(bodyIsIncompressible({ "content-type": "application/json", "content-encoding": "identity" })).toBe(false);
+    expect(bodyIsIncompressible({})).toBe(false);
   });
 });
 

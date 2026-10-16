@@ -6,6 +6,7 @@ import {
   FrameType,
   MAX_FRAME_BYTES,
   RESPONSE_HEADERS,
+  bodyIsIncompressible,
   decodeFrame,
   decodeHeadBody,
   decodeJson,
@@ -55,6 +56,14 @@ export type MemberOptions = {
 
 /** The hub pings every 30 s; this long without hearing anything means the link is gone even if TCP has not noticed. */
 const LINK_SILENCE_MS = 75_000;
+/**
+ * A link this far behind is not catching up. Single streams are already shed
+ * at LINK_HIGH_WATER_BYTES; one still past this after LINK_REBUILD_AFTER_MS is
+ * rebuilt rather than left to grow (§6.4).
+ */
+const LINK_REBUILD_BYTES = 32 * 1024 * 1024;
+const LINK_REBUILD_AFTER_MS = 30_000;
+const WATCHDOG_MS = 5_000;
 const BACKOFF_START_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
 const STABLE_AFTER_MS = 60_000;
@@ -94,14 +103,30 @@ export class FederationMember {
   private readonly streams = new Map<number, Stream>();
   private stopped = false;
   private httpFailure: number | null = null;
+  private congestedSince: number | null = null;
 
   private constructor(private readonly options: MemberOptions) {
-    this.watchdog = setInterval(() => {
-      if (this.state === "connected" && Date.now() - this.lastHeard > LINK_SILENCE_MS) {
-        try { this.socket?.terminate(); } catch { /* gone */ }
-      }
-    }, 15_000);
+    this.watchdog = setInterval(() => this.checkLink(), WATCHDOG_MS);
     this.watchdog.unref?.();
+  }
+
+  /**
+   * Silent for too long means the link is gone even if TCP has not noticed;
+   * backed up past LINK_REBUILD_BYTES for too long means it will not recover
+   * by itself. Either way it is torn down and the ordinary reconnect rebuilds
+   * it, which is also what tells every page to resubscribe.
+   */
+  private checkLink(now = Date.now()): void {
+    const socket = this.socket;
+    if (this.state !== "connected" || !socket) { this.congestedSince = null; return; }
+    const silent = now - this.lastHeard > LINK_SILENCE_MS;
+    if (!silent && socket.bufferedAmount <= LINK_REBUILD_BYTES) { this.congestedSince = null; return; }
+    if (!silent) {
+      this.congestedSince ??= now;
+      if (now - this.congestedSince < LINK_REBUILD_AFTER_MS) return;
+    }
+    this.congestedSince = null;
+    try { socket.terminate(); } catch { /* gone */ }
   }
 
   static async create(options: MemberOptions): Promise<FederationMember> {
@@ -213,11 +238,12 @@ export class FederationMember {
 
   // ---------------------------------------------------------------- frames
 
-  private send(type: FrameTypeValue, stream: number, payload?: Uint8Array): boolean {
+  /** `compress` off for ciphertext and for bodies that arrive already compressed (§6.4). */
+  private send(type: FrameTypeValue, stream: number, payload?: Uint8Array, compress = type !== FrameType.SocketBinary): boolean {
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) return false;
     const frame = encodeFrame(type, stream, payload);
-    socket.send(frame, { binary: true, compress: type !== FrameType.SocketBinary });
+    socket.send(frame, { binary: true, compress });
     this.options.record?.("out", frameName(type), frame.length);
     return true;
   }
@@ -265,11 +291,13 @@ export class FederationMember {
       catch (error) { response = this.errorResponse(500, "FEDERATION_EXECUTION_FAILED", error instanceof Error ? error.message : String(error)); }
     }
     let frame = encodeHeadBody(response.head, response.body);
+    let compress = !bodyIsIncompressible(response.head.headers);
     if (frame.length > MAX_FRAME_BYTES) {
       const tooLarge = this.errorResponse(502, "RESPONSE_TOO_LARGE", "The response is too large to forward; it should be paged.");
       frame = encodeHeadBody(tooLarge.head, tooLarge.body);
+      compress = true;
     }
-    this.send(FrameType.Response, stream, frame);
+    this.send(FrameType.Response, stream, frame, compress);
   }
 
   private errorResponse(status: number, code: string, message: string): ExecutedResponse {

@@ -230,4 +230,84 @@ describe("two machines, one workspace", () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect((await view(extra)).hubReachable).toBe(true);
   });
+
+  /**
+   * The link dropping at each moment that matters for a write (§16): before
+   * the request reaches the device, while the device runs it, and after it
+   * ran but before the answer got back. The page hears that the device went
+   * away every time; the write happens at most once, and nothing is replayed
+   * once the link is back.
+   */
+  describe("a link that drops around a write", () => {
+    /** The member's end of the link, ended the way a network failure would: no close handshake. */
+    const cut = () => ((member.app.promptor.federation as any).member.socket as WebSocket).terminate();
+    const addPrompt = (tabId: string, text: string) => hub.app.inject({
+      method: "POST",
+      url: `/d/${memberId}/api/tabs/${tabId}/prompts`,
+      headers: { "x-codex-promptor-token": hub.app.promptor.token, "content-type": "application/json" },
+      payload: JSON.stringify({ text }),
+    });
+    const promptsOn = async (tabId: string) => (await member.app.promptor.storage.readTab(tabId)).prompts.prompts.map((prompt) => prompt.text);
+    const memberOnline = (online: boolean) => until(() => view(hub), (current) => current.devices.find((device: any) => device.id === memberId)?.online === online);
+    /** Hands the next forwarded write on the member to `around`, which decides when the link drops. */
+    const interceptWrite = (around: (run: () => Promise<unknown>) => Promise<unknown>) => {
+      const original = member.app.inject.bind(member.app);
+      let armed = true;
+      (member.app as any).inject = (options: any) => {
+        if (!armed || options?.headers?.host !== "federation.invalid" || options.method !== "POST") return original(options);
+        armed = false;
+        return around(() => original(options));
+      };
+    };
+    /** Back online, and still exactly `expected` a moment later: nothing was resent. */
+    const settlesAt = async (tabId: string, expected: string[]) => {
+      await memberOnline(true);
+      expect(await promptsOn(tabId)).toEqual(expected);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(await promptsOn(tabId)).toEqual(expected);
+    };
+
+    it("before the request is sent: refused, nothing written", async () => {
+      const tab = await member.app.promptor.storage.createTab("断在之前");
+      cut();
+      await memberOnline(false);
+      const response = await addPrompt(tab.id, "不该出现");
+      expect(response.statusCode).toBe(503);
+      expect(response.json().error.code).toBe("DEVICE_OFFLINE");
+      await settlesAt(tab.id, []);
+    });
+
+    it("while the device runs it: the page is told, and the write lands once", async () => {
+      const tab = await member.app.promptor.storage.createTab("断在中间");
+      interceptWrite(async (run) => { cut(); return run(); });
+      const response = await addPrompt(tab.id, "写入中断线");
+      expect(response.statusCode).toBe(503);
+      expect(response.json().error.code).toBe("DEVICE_OFFLINE");
+      await settlesAt(tab.id, ["写入中断线"]);
+    });
+
+    it("after it ran, before the answer: the page is told, and the write is not repeated", async () => {
+      const tab = await member.app.promptor.storage.createTab("断在之后");
+      interceptWrite(async (run) => { const result = await run(); cut(); return result; });
+      const response = await addPrompt(tab.id, "回包前断线");
+      expect(response.statusCode).toBe(503);
+      expect(response.json().error.code).toBe("DEVICE_OFFLINE");
+      await settlesAt(tab.id, ["回包前断线"]);
+    });
+  });
+
+  it("rebuilds a link that stays backed up instead of letting it grow", async () => {
+    const link = (member.app.promptor.federation as any).member;
+    const socket = link.socket as WebSocket;
+    Object.defineProperty(socket, "bufferedAmount", { get: () => 40 * 1024 * 1024 });
+    const now = Date.now();
+    link.checkLink(now);
+    // One look is not "stays": a burst is allowed to drain.
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    link.checkLink(now + 31_000);
+    expect(socket.readyState).not.toBe(WebSocket.OPEN);
+    // The ordinary reconnect brings up a fresh link.
+    const back = await until(() => view(member), (current) => current.hubReachable === true && link.socket !== socket);
+    expect(back.hubReachable).toBe(true);
+  });
 });

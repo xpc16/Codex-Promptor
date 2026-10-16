@@ -4,6 +4,7 @@ import {
   FederationClose,
   FrameType,
   MAX_FRAME_BYTES,
+  bodyIsIncompressible,
   decodeFrame,
   decodeHeadBody,
   decodeJson,
@@ -248,11 +249,12 @@ export class FederationHub {
 
   // ---------------------------------------------------------------- frames
 
-  private send(link: Link, type: FrameTypeValue, stream: number, payload?: Uint8Array): boolean {
+  private send(link: Link, type: FrameTypeValue, stream: number, payload?: Uint8Array, compress = type !== FrameType.SocketBinary): boolean {
     if (link.socket.readyState !== WebSocket.OPEN) return false;
     const frame = encodeFrame(type, stream, payload);
-    // A binary socket frame is ciphertext -- deflate would only spend CPU on it.
-    link.socket.send(frame, { binary: true, compress: type !== FrameType.SocketBinary });
+    // A binary socket frame is ciphertext, and so is a sealed request body --
+    // deflate would only spend CPU on either.
+    link.socket.send(frame, { binary: true, compress });
     this.options.record?.("out", frameName(type), frame.length);
     return true;
   }
@@ -329,7 +331,7 @@ export class FederationHub {
       }, RELAY_TIMEOUT_MS);
       timer.unref?.();
       link.http.set(stream, { resolve, reject, timer });
-      if (!this.send(link, FrameType.Request, stream, frame)) {
+      if (!this.send(link, FrameType.Request, stream, frame, !bodyIsIncompressible(head.headers))) {
         link.http.delete(stream);
         clearTimeout(timer);
         reject(new FederationError(503, "DEVICE_OFFLINE", "That device is offline."));

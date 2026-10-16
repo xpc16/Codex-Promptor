@@ -144,6 +144,18 @@ export type ResponseHead = { status: number; headers: Record<string, string> };
 export const REQUEST_HEADERS: readonly string[] = ["content-type", "accept", "accept-encoding", "if-none-match"];
 export const RESPONSE_HEADERS: readonly string[] = ["content-type", "content-encoding", "etag", "cache-control", "x-promptor-e2ee"];
 
+/**
+ * A forwarded body that deflate on the link would only spend CPU on (§6.4):
+ * ciphertext -- a sealed answer is marked, a sealed request is plain octets
+ * -- or bytes the sending machine already gzip'd or brotli'd.
+ */
+export function bodyIsIncompressible(headers: Readonly<Record<string, string>>): boolean {
+  const encoding = (headers["content-encoding"] ?? "").trim().toLowerCase();
+  if (encoding && encoding !== "identity") return true;
+  if (headers["x-promptor-e2ee"]) return true;
+  return (headers["content-type"] ?? "").trim().toLowerCase().startsWith("application/octet-stream");
+}
+
 export const RELAY_METHODS: ReadonlySet<string> = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 
 export function pickHeaders(headers: Record<string, unknown> | undefined | null, names: readonly string[]): Record<string, string> {
