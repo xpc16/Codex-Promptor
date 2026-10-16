@@ -71,7 +71,7 @@ import { DocumentView, useDocumentViewer, type DocumentOpenIntent } from "./docu
 import { documentTransportFor } from "./document-loader.js";
 import { DeviceContext, deviceFor, homeDevice, setHomeDeviceId, splitTabKey, useDevice, type Device } from "./device.js";
 import { RemoteDeviceSync, initialRemoteState, unlockWithPassphrase, type RemoteDeviceState } from "./remote-device.js";
-import { FEDERATION_OFF_VIEW, type DirectoryDevice, type FederationView } from "../shared/federation-protocol.js";
+import { FEDERATION_OFF_VIEW, FederationClose, type DirectoryDevice, type FederationView } from "../shared/federation-protocol.js";
 import { insertCommonPrompt, type DraftSelection } from "./prompt-insertion.js";
 import { placeGroupAfter, placeTab } from "./navigation-placement.js";
 import { LazyDialogBoundary } from "./lazy-dialog-boundary.js";
@@ -562,6 +562,18 @@ export function App() {
     return list;
   };
   const unlockAll = async (passphrase: string) => (await unlockWithPassphrase(passphrase, lockedDevices())) > 0;
+  /** Whether a machine can take a change now: listed as online and not waiting for its key. */
+  const deviceWritable = (device: Device) => {
+    if (device.home) return true;
+    const state = remoteStates[device.id];
+    return Boolean(devicesListed.find((entry) => entry.id === device.id)?.online) && !(state?.e2ee.required && !state.e2ee.proved);
+  };
+  // The sidebar's own buttons act on the selected conversation's machine
+  // (docs/MULTI_DEVICE_FEDERATION_IMPLEMENTATION.md §9.3), so they say which
+  // one, and wait while it cannot be reached.
+  const defaultTarget = selectedEntry?.device ?? homeDevice();
+  const defaultTargetWritable = deviceWritable(defaultTarget);
+  const defaultTargetName = multiDevice ? devicesListed.find((entry) => entry.id === (defaultTarget.home ? federation.selfId : defaultTarget.id))?.name ?? null : null;
   const unlockTarget = unlockDeviceId ? remoteStates[unlockDeviceId] : null;
   useEffect(() => {
     if (unlockDeviceId && (!unlockTarget || unlockTarget.e2ee.proved || !unlockTarget.e2ee.required)) setUnlockDeviceId(null);
@@ -728,7 +740,7 @@ export function App() {
   return <I18nContext.Provider value={i18n}><div className="app-shell" ref={appShellRef} data-mobile-pane={mobilePane}>
     <aside className="sidebar" aria-label={t("aria.console")}>
       <div className="brand"><img className="brand-mark" src="/favicon.svg" alt="" aria-hidden="true" draggable={false} /><div><strong>Promptor</strong><span>{t("brand.subtitle")}</span></div></div>
-      <div className="sidebar-actions"><button className="primary small" onClick={() => void createTab()}>{t("nav.newConversation")}</button><button className="icon-button" title={t("nav.newGroupTitle")} onClick={() => setDialog({ kind: "group", ...(selectedEntry && !selectedEntry.device.home ? { deviceId: selectedEntry.device.id } : {}) })}>{t("nav.newGroup")}</button></div>
+      <div className="sidebar-actions"><button className="primary small" disabled={!defaultTargetWritable} title={defaultTargetName ? t("device.newConversation", { name: defaultTargetName }) : undefined} onClick={() => void createTab()}>{t("nav.newConversation")}</button><button className="icon-button" disabled={!defaultTargetWritable} title={defaultTargetName ? t("device.newGroup", { name: defaultTargetName }) : t("nav.newGroupTitle")} onClick={() => setDialog({ kind: "group", ...(defaultTarget.home ? {} : { deviceId: defaultTarget.id }) })}>{t("nav.newGroup")}</button></div>
       <div className="tab-tree">
         {!multiDevice ? homeTree : [
           // This page's own machine first; the rest in the order the hub registered them.
@@ -926,7 +938,7 @@ function RowActionsMenu({ subject, deleteTitle, deleteDisabled, onEdit, onDelete
   </span>;
 }
 
-function ConsoleTabRow({ tab, native, activity, recentlyCompleted, selected, dropTarget, onClick, onRename, onDelete, onDragStart, onDragEnd, onDragOver, onDrop }: { tab: TabMeta; native: boolean; activity?: TabActivitySummary; recentlyCompleted: boolean; selected: boolean; dropTarget: boolean; onClick: () => void; onRename: () => void; onDelete: () => void; onDragStart: (event: DragEvent<HTMLDivElement>) => void; onDragEnd: () => void; onDragOver: () => boolean; onDrop: () => void }) {
+function ConsoleTabRow({ tab, native, readOnly, activity, recentlyCompleted, selected, dropTarget, onClick, onRename, onDelete, onDragStart, onDragEnd, onDragOver, onDrop }: { tab: TabMeta; native: boolean; readOnly: boolean; activity?: TabActivitySummary; recentlyCompleted: boolean; selected: boolean; dropTarget: boolean; onClick: () => void; onRename: () => void; onDelete: () => void; onDragStart: (event: DragEvent<HTMLDivElement>) => void; onDragEnd: () => void; onDragOver: () => boolean; onDrop: () => void }) {
   const { t } = useI18n();
   const visualState = tabVisualState(tab.session.state, activity);
   // The encryption switch is set from the machine itself, so it is unset from
@@ -942,18 +954,11 @@ function ConsoleTabRow({ tab, native, activity, recentlyCompleted, selected, dro
         : visualState === "error"
           ? t("tab.error")
           : t("tab.unconfigured");
-  return <div className={`tab-row ${selected ? "selected" : ""} ${dropTarget ? "navigation-drop-target" : ""}`} data-provider={tab.session.provider} draggable onDragStart={onDragStart} onDragEnd={onDragEnd} onDragOver={(event) => { if (!onDragOver()) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => { event.preventDefault(); event.stopPropagation(); onDrop(); }}>
-    <span className="console-drag" title={t("nav.dragConversation")}>⠿</span><button className="tab-button" onClick={onClick}><span className="tab-label">{tab.name}</span><span className="tab-status-cluster">{recentlyCompleted && <span className="tab-completion-bell" role="img" aria-label={t("tab.justCompleted")} title={t("tab.justCompletedRecent")}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg></span>}<span className={`tab-status-indicator ${visualState}`} role="img" aria-label={tabStatus} title={tabStatus} /></span></button><RowActionsMenu subject={t("nav.conversationSubject", { name: tab.name })} deleteDisabled={encryptionLocked} deleteTitle={encryptionLocked ? t("session.e2eeLocalOnly") : undefined} onEdit={onRename} onDelete={onDelete} />
+  return <div className={`tab-row ${selected ? "selected" : ""} ${dropTarget ? "navigation-drop-target" : ""}`} data-provider={tab.session.provider} draggable={!readOnly} onDragStart={onDragStart} onDragEnd={onDragEnd} onDragOver={(event) => { if (!onDragOver()) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; }} onDrop={(event) => { event.preventDefault(); event.stopPropagation(); onDrop(); }}>
+    <span className="console-drag" title={t("nav.dragConversation")}>⠿</span><button className="tab-button" onClick={onClick}><span className="tab-label">{tab.name}</span><span className="tab-status-cluster">{recentlyCompleted && <span className="tab-completion-bell" role="img" aria-label={t("tab.justCompleted")} title={t("tab.justCompletedRecent")}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4" /></svg></span>}<span className={`tab-status-indicator ${visualState}`} role="img" aria-label={tabStatus} title={tabStatus} /></span></button>{!readOnly && <RowActionsMenu subject={t("nav.conversationSubject", { name: tab.name })} deleteDisabled={encryptionLocked} deleteTitle={encryptionLocked ? t("session.e2eeLocalOnly") : undefined} onEdit={onRename} onDelete={onDelete} />}
   </div>;
 }
 
-/**
- * The first thing a remote page shows when encryption is on.
- *
- * Ahead of everything else on purpose: the passphrase is what makes the rest
- * of the page legible, and asking for it after the terminal has failed to load
- * would present a key problem as a connection problem.
- */
 /**
  * One machine's conversations: its groups, the ungrouped ones, and dragging
  * among them. Each machine gets its own tree with its own drag state, so a
@@ -989,20 +994,20 @@ function NavigationTree({ index, activities, recentCompletions, keyOf, selectedK
     const nextTabs = placeTab(index.tabs, groups.map((group) => group.id), sourceId, targetId, groupId);
     if (nextTabs) onPersist(groups, nextTabs);
   };
-  const row = (tab: TabMeta, groupId: string | null) => <ConsoleTabRow key={tab.id} tab={tab} native={native} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletions[keyOf(tab.id)])} selected={keyOf(tab.id) === selectedKey} dropTarget={dropTarget === `tab:${tab.id}`} onClick={() => onOpen(tab.id)} onRename={() => onDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => onDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={(event) => { dragItem.current = { type: "tab", id: tab.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", tab.id); }} onDragEnd={() => { dragItem.current = null; setDropTarget(null); }} onDragOver={() => { if (dragItem.current?.type !== "tab") return false; setDropTarget(`tab:${tab.id}`); return true; }} onDrop={() => { const item = dragItem.current; dragItem.current = null; setDropTarget(null); if (item?.type === "tab") moveTab(item.id, tab.id, groupId); }} />;
+  const row = (tab: TabMeta, groupId: string | null) => <ConsoleTabRow key={tab.id} tab={tab} native={native} readOnly={readOnly} activity={activities[tab.id]} recentlyCompleted={Boolean(recentCompletions[keyOf(tab.id)])} selected={keyOf(tab.id) === selectedKey} dropTarget={dropTarget === `tab:${tab.id}`} onClick={() => onOpen(tab.id)} onRename={() => onDialog({ kind: "rename-tab", tabId: tab.id, initialValue: tab.name })} onDelete={() => onDialog({ kind: "delete-tab", tabId: tab.id, name: tab.name })} onDragStart={(event) => { dragItem.current = { type: "tab", id: tab.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", tab.id); }} onDragEnd={() => { dragItem.current = null; setDropTarget(null); }} onDragOver={() => { if (dragItem.current?.type !== "tab") return false; setDropTarget(`tab:${tab.id}`); return true; }} onDrop={() => { const item = dragItem.current; dragItem.current = null; setDropTarget(null); if (item?.type === "tab") moveTab(item.id, tab.id, groupId); }} />;
   return <>
     {groups.map((group) => {
       const groupTabs = index.tabs.filter((tab) => tab.groupId === group.id).sort((a, b) => a.order - b.order);
       return <div className="group" key={group.id}>
         <div className={`group-heading ${dropTarget === `group:${group.id}` ? "navigation-drop-target" : ""}`} draggable={!readOnly} onDragStart={(event) => { dragItem.current = { type: "group", id: group.id }; event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", group.id); }} onDragEnd={() => { dragItem.current = null; setDropTarget(null); }} onDragOver={(event) => { if (!dragItem.current) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTarget(`group:${group.id}`); }} onDrop={(event) => { event.preventDefault(); const item = dragItem.current; dragItem.current = null; setDropTarget(null); if (item?.type === "group") moveGroup(item.id, group.id); else if (item?.type === "tab") moveTab(item.id, null, group.id); }}>
-          <button className="collapse-button" aria-label={t(group.collapsed ? "nav.expand" : "nav.collapse", { name: group.name })} onClick={() => onToggleGroup(group)}>{group.collapsed ? "▸" : "▾"}</button><span className="group-name">{group.name}</span><em>{groupTabs.length}</em><RowActionsMenu subject={t("nav.groupSubject", { name: group.name })} deleteTitle={t("nav.deleteGroupHint")} onEdit={() => onDialog({ kind: "rename-group", groupId: group.id, initialValue: group.name })} onDelete={() => onDialog({ kind: "delete-group", groupId: group.id, name: group.name, tabCount: groupTabs.length })} />
+          <button className="collapse-button" disabled={readOnly} aria-label={t(group.collapsed ? "nav.expand" : "nav.collapse", { name: group.name })} onClick={() => onToggleGroup(group)}>{group.collapsed ? "▸" : "▾"}</button><span className="group-name">{group.name}</span><em>{groupTabs.length}</em>{!readOnly && <RowActionsMenu subject={t("nav.groupSubject", { name: group.name })} deleteTitle={t("nav.deleteGroupHint")} onEdit={() => onDialog({ kind: "rename-group", groupId: group.id, initialValue: group.name })} onDelete={() => onDialog({ kind: "delete-group", groupId: group.id, name: group.name, tabCount: groupTabs.length })} />}
         </div>
         {!group.collapsed && groupTabs.map((tab) => row(tab, group.id))}
       </div>;
     })}
     <div className="group ungrouped-group">
       <div className={`group-heading ${dropTarget === "group:__ungrouped" ? "navigation-drop-target" : ""}`} onDragOver={(event) => { if (dragItem.current?.type !== "tab") return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTarget("group:__ungrouped"); }} onDrop={(event) => { event.preventDefault(); const item = dragItem.current; dragItem.current = null; setDropTarget(null); if (item?.type === "tab") moveTab(item.id, null, null); }}>
-        <button className="collapse-button" aria-label={t(index.ui.ungroupedCollapsed ? "nav.expand" : "nav.collapse", { name: t("nav.ungrouped") })} onClick={onToggleUngrouped}>{index.ui.ungroupedCollapsed ? "▸" : "▾"}</button><span className="group-name">{t("nav.ungrouped")}</span><em>{ungrouped.length}</em>
+        <button className="collapse-button" disabled={readOnly} aria-label={t(index.ui.ungroupedCollapsed ? "nav.expand" : "nav.collapse", { name: t("nav.ungrouped") })} onClick={onToggleUngrouped}>{index.ui.ungroupedCollapsed ? "▸" : "▾"}</button><span className="group-name">{t("nav.ungrouped")}</span><em>{ungrouped.length}</em>
       </div>
       {!index.ui.ungroupedCollapsed && ungrouped.map((tab) => row(tab, null))}
     </div>
@@ -1014,6 +1019,13 @@ function DevicesIcon() {
   return <svg viewBox="0 0 24 24" aria-hidden="true" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="2.5" y="4" width="12" height="9" rx="1.5" /><path d="M6 16.5h5M8.5 13v3.5" /><rect x="16.5" y="7" width="5" height="12" rx="1.2" /><path d="M18.6 16.6h.8" /></svg>;
 }
 
+/**
+ * The first thing a remote page shows when encryption is on.
+ *
+ * Ahead of everything else on purpose: the passphrase is what makes the rest
+ * of the page legible, and asking for it after the terminal has failed to load
+ * would present a key problem as a connection problem.
+ */
 function E2eeUnlock({ state, kdf, onError, title, onUnlock, onCancel }: {
   state: E2eeState;
   kdf: { salt: string; iterations: number };
@@ -1439,11 +1451,11 @@ function TabView({ tab, active, offline = false, refreshNonce, theme, projection
     } finally { documentOpenBusy.current = false; }
   };
   return <div className={`tab-view ${active ? "" : "tab-view-hidden"} ${closed ? "conversation-closed" : ""}`} aria-hidden={!active}><div className="tab-workspace" ref={workspaceRef}>
-    <section className="conversation-pane" ref={conversation}>{active && <>{offline && <div className="device-offline-banner" role="status">{t("device.offlineBanner")}</div>}<SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} encryptionElsewhere={encryptionTabId !== null && encryptionTabId !== tab.id} onReopen={reopen} onSyncHistory={async () => { await api(`/api/tabs/${tab.id}/history/sync`, { method: "POST" }); await load(); }} onBundle={applyBundle} onError={onError} onNotice={onNotice} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
+    <section className="conversation-pane" ref={conversation}>{active && <>{offline && <div className="device-offline-banner" role="status">{t("device.offlineBanner")}</div>}<SessionPanel bundle={bundle} height={sessionHeight} reopening={reopening} offline={offline} encryptionElsewhere={encryptionTabId !== null && encryptionTabId !== tab.id} onReopen={reopen} onSyncHistory={async () => { await api(`/api/tabs/${tab.id}/history/sync`, { method: "POST" }); await load(); }} onBundle={applyBundle} onError={onError} onNotice={onNotice} /><div className="session-splitter" role="separator" aria-orientation="horizontal" title={t("conversation.sessionSplitter")} onPointerDown={dragSessionHeight} /><AnswerHistory key={`answers-${threadId ?? "none"}`} answers={answers} offline={offline} total={bundle.window?.answers.total ?? answers.length} hasEarlier={(bundle.window?.answers.start ?? 0) > 0} onLoadEarlier={loadEarlierAnswers} onDocumentLink={(href, answerId) => void openDocumentLink(href, answerId)} emptyKey={bundle.tab.session.provider === "shell" ? "answers.shellEmpty" : "answers.empty"} /></>}</section>
     <div className={`splitter ${closed ? "disabled" : ""}`} onMouseDown={() => { if (!closed) splitDrag.current = new PaneDrag(leftWidthRef.current, applyLeftWidth, (value) => writePaneSize(splitSpec, value)); }} title={t(closed ? "conversation.splitterClosed" : "conversation.splitter")} />
-    <section className="queue-pane" ref={queuePaneRef}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" ref={queueSplitterRef} role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} />{bundle.tab.session.provider === "chatgpt"
+    <section className="queue-pane" ref={queuePaneRef}>{active && <PromptQueue key={`queue-${threadId ?? "none"}`} bundle={bundle} total={bundle.window?.prompts.total ?? bundle.prompts.prompts.length} hasEarlier={(bundle.window?.prompts.start ?? 0) > 0} onLoadEarlier={loadEarlierPrompts} disabled={closed} offline={offline} runnable={runnable} onChanged={applyServerEcho} onError={onError} />}<div className="queue-terminal-splitter" ref={queueSplitterRef} role="separator" aria-orientation="horizontal" aria-label={t("conversation.queueTerminalSplitter")} aria-valuemin={queueTerminalSpec.min} aria-valuemax={queueTerminalSpec.max} title={t("conversation.queueTerminalSplitter")} onPointerDown={dragQueueTerminalHeight} />{bundle.tab.session.provider === "chatgpt"
       ? <ChatGptPanel bundle={bundle} localControls={device.native} onError={onError} />
-      : <TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} documentIntent={documentIntent} projectionSupported={projectionSupported} onBundle={applySnapshot} onMessage={applyRealtimeMessage} onError={onError} />}</section>
+      : <TerminalPanel tabId={tab.id} provider={bundle.tab.session.provider} runtime={bundle.runtime} theme={theme} active={active} closed={closed} offline={offline} documentIntent={documentIntent} projectionSupported={projectionSupported} onBundle={applySnapshot} onMessage={applyRealtimeMessage} onError={onError} />}</section>
   </div></div>;
 }
 
@@ -1451,7 +1463,7 @@ function orderedTabIds(tabs: TabMeta[], groupId: string | null): string[] {
   return tabs.filter((tab) => tab.groupId === groupId).sort((a, b) => a.order - b.order).map((tab) => tab.id);
 }
 
-function SessionPanel({ bundle, height, reopening, encryptionElsewhere, onReopen, onSyncHistory, onBundle, onError, onNotice }: { bundle: TabBundle; height: number | null; reopening: boolean; encryptionElsewhere: boolean; onReopen: () => Promise<void>; onSyncHistory: () => Promise<void>; onBundle: (bundle: TabBundle) => void; onError: (error: unknown) => void; onNotice: (message: string) => void }) {
+function SessionPanel({ bundle, height, reopening, offline, encryptionElsewhere, onReopen, onSyncHistory, onBundle, onError, onNotice }: { bundle: TabBundle; height: number | null; reopening: boolean; offline: boolean; encryptionElsewhere: boolean; onReopen: () => Promise<void>; onSyncHistory: () => Promise<void>; onBundle: (bundle: TabBundle) => void; onError: (error: unknown) => void; onNotice: (message: string) => void }) {
   // The machine that owns this conversation; every call below goes there.
   const device = useDevice();
   const { api } = device;
@@ -1555,24 +1567,29 @@ function SessionPanel({ bundle, height, reopening, encryptionElsewhere, onReopen
       : t("session.setupHelp");
   return <div className="session-card" style={height === null ? undefined : { height: `${height}%`, maxHeight: "none" }}>
     <div className="section-title"><span className="section-icon">◌</span><div><strong>{sessionTitle}</strong><small>{sessionHelp}</small></div></div>
-    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t(session.provider === "e2ee" ? "session.e2eeClosedNotice" : "session.closedNotice")}</div>}<div className="session-path"><span>{t(session.provider === "e2ee" ? "session.e2eeFingerprint" : "session.workingDirectory")}</span><code>{session.provider === "e2ee" ? (session.e2ee?.fingerprint ?? "—") : session.workingDirectory}</code></div>{session.provider === "e2ee" && <div className="field-hint e2ee-hint">{t("session.e2eeCompare")}</div>}{encryptionLocked && <div className="closed-notice" role="status">{t("session.e2eeLocalOnly")}</div>}{session.provider !== "shell" && session.provider !== "e2ee" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.state === "ready" && !session.lastError && !bundle.runtime.terminal.lastError && session.lastThreadSwitch && session.lastThreadSwitch.toThreadId === session.threadId && session.lastThreadSwitch.switchedAt >= (session.connectedAt ?? "") && session.lastThreadSwitch.method !== "thread/fork" && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring || syncing || encryptionLocked} title={encryptionLocked ? t("session.e2eeLocalOnly") : undefined} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <><button className="danger-action" disabled={busy || syncing || encryptionLocked} title={encryptionLocked ? t("session.e2eeLocalOnly") : undefined} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>{session.provider !== "shell" && session.provider !== "e2ee" && session.threadId && <button className="ghost" disabled={busy || reopening || syncing} onClick={() => void syncHistory()}>{t("footer.syncHistory")}</button>}</>}{localFolderPicker && <button className="ghost" disabled={exporting} onClick={() => void exportConversation()}>{t(exporting ? "session.exporting" : "session.export")}</button>}</div></div> : <>
+    {connected ? <div className="session-ready">{session.state === "closed" && <div className="closed-notice" role="status">{t(session.provider === "e2ee" ? "session.e2eeClosedNotice" : "session.closedNotice")}</div>}<div className="session-path"><span>{t(session.provider === "e2ee" ? "session.e2eeFingerprint" : "session.workingDirectory")}</span><code>{session.provider === "e2ee" ? (session.e2ee?.fingerprint ?? "—") : session.workingDirectory}</code></div>{session.provider === "e2ee" && <div className="field-hint e2ee-hint">{t("session.e2eeCompare")}</div>}{encryptionLocked && <div className="closed-notice" role="status">{t("session.e2eeLocalOnly")}</div>}{session.provider !== "shell" && session.provider !== "e2ee" && <div className={`session-ids ${session.provider !== "codex" ? "single" : ""}`}>{session.provider === "codex" && <div><span>{t("session.threadId")}</span><code>{session.threadId}</code></div>}<div><span>{t("session.sessionId")}</span><code>{session.sessionId}</code></div></div>}{session.state === "ready" && !session.lastError && !bundle.runtime.terminal.lastError && session.lastThreadSwitch && session.lastThreadSwitch.toThreadId === session.threadId && session.lastThreadSwitch.switchedAt >= (session.connectedAt ?? "") && session.lastThreadSwitch.method !== "thread/fork" && <div className="thread-switch-notice" role="status" title={`${session.lastThreadSwitch.fromThreadId} → ${session.lastThreadSwitch.toThreadId}`}><strong>{t("session.followedSwitch")}</strong><span>/{session.lastThreadSwitch.method.split("/").at(-1)} · {i18n.formatTime(session.lastThreadSwitch.switchedAt)}</span></div>}<div className="session-actions"><button className="ghost" disabled={busy || reopening || restoring || syncing || encryptionLocked || offline} title={encryptionLocked ? t("session.e2eeLocalOnly") : undefined} onClick={() => void onReopen()}>{t(reopening || restoring ? "session.restoringAction" : "session.reopen")}</button>{session.state === "ready" && <><button className="danger-action" disabled={busy || syncing || encryptionLocked || offline} title={encryptionLocked ? t("session.e2eeLocalOnly") : undefined} onClick={() => void closeConversation()}>{t(busy ? "session.closing" : "session.close")}</button>{session.provider !== "shell" && session.provider !== "e2ee" && session.threadId && <button className="ghost" disabled={busy || reopening || syncing || offline} onClick={() => void syncHistory()}>{t("footer.syncHistory")}</button>}</>}{localFolderPicker && <button className="ghost" disabled={exporting} onClick={() => void exportConversation()}>{t(exporting ? "session.exporting" : "session.export")}</button>}</div></div> : <>
       <label className="field-label">{t(isE2ee ? "session.e2eeKey" : localFolderPicker ? "session.localPath" : "session.remotePath")}</label><div className={`path-row ${localFolderPicker && !isE2ee ? "" : "remote"}`}><input value={cwd} title={isE2ee ? undefined : cwd} onChange={(event) => setCwd(event.target.value)} placeholder={t(isE2ee ? "session.e2eeKeyPlaceholder" : "session.pathExample")} />{isE2ee ? <button className="ghost" onClick={() => setCwd(randomPassphrase())}>{t("session.e2eeGenerate")}</button> : localFolderPicker && <button className="ghost" disabled={browsing} onClick={() => void browse()}>{t(browsing ? "session.choosingFolder" : "session.chooseFolder")}</button>}</div>{isE2ee ? <small className="field-hint">{t(encryptionLocked ? "session.e2eeLocalOnly" : encryptionElsewhere ? "session.e2eeAlreadyOn" : session.e2ee ? "session.e2eeKeepHint" : "session.e2eeKeyHint")}</small> : <>{!localFolderPicker && <small className="field-hint">{t("session.remotePathHint")}</small>}{cwd && <code className="path-preview" title={cwd}>{cwd}</code>}{isShell && !cwd.trim() && <small className="field-hint">{t("session.shellPathHint")}</small>}</>}
       {isWeb && <small className="field-hint">{t("session.chatgptPathHint")}</small>}
       {!isShell && <div className="mode-switch"><button className={mode === "new" ? "active" : ""} onClick={() => setMode("new")}>{t("session.createNew")}</button><button className={mode === "resume" ? "active" : ""} onClick={() => setMode("resume")}>{t("session.resumeOld")}</button></div>}
       {!isShell && mode === "resume" && <input className="resume-input" value={resumeId} onChange={(event) => setResumeId(event.target.value)} placeholder={t("session.resumePlaceholder")} />}
-      <div className="connect-row"><button className="primary connect" disabled={busy || encryptionLocked || (isE2ee ? !e2eeReady : !isShell && !isWeb && !cwd.trim())} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button><select value={provider} disabled={busy} onChange={(event) => setProvider(event.target.value as AgentProvider)} aria-label={providerName}><option value="codex">{t("provider.codex")}</option><option value="claude">{t("provider.claude")}</option><option value="cursor">{t("provider.cursor")}</option><option value="chatgpt">{t("provider.chatgpt")}</option><option value="shell">{t("provider.shell")}</option><option value="e2ee">{t("provider.e2ee")}</option></select></div>
+      <div className="connect-row"><button className="primary connect" disabled={busy || encryptionLocked || offline || (isE2ee ? !e2eeReady : !isShell && !isWeb && !cwd.trim())} onClick={() => void connect()}>{t(busy ? "session.connecting" : "session.confirmOpen")}</button><select value={provider} disabled={busy} onChange={(event) => setProvider(event.target.value as AgentProvider)} aria-label={providerName}><option value="codex">{t("provider.codex")}</option><option value="claude">{t("provider.claude")}</option><option value="cursor">{t("provider.cursor")}</option><option value="chatgpt">{t("provider.chatgpt")}</option><option value="shell">{t("provider.shell")}</option><option value="e2ee">{t("provider.e2ee")}</option></select></div>
     </>}
     {session.lastError && <div className="inline-error">{i18n.errorText(session.lastError)}</div>}
   </div>;
 }
 
-function AnswerHistory({ answers, total, hasEarlier, onLoadEarlier, onDocumentLink, emptyKey }: { answers: AnswerRecord[]; total: number; hasEarlier: boolean; onLoadEarlier: () => Promise<number>; onDocumentLink: (href: string, answerId: string) => void; emptyKey: "answers.empty" | "answers.shellEmpty" }) {
+function AnswerHistory({ answers, offline, total, hasEarlier, onLoadEarlier, onDocumentLink, emptyKey }: { answers: AnswerRecord[]; offline: boolean; total: number; hasEarlier: boolean; onLoadEarlier: () => Promise<number>; onDocumentLink: (href: string, answerId: string) => void; emptyKey: "answers.empty" | "answers.shellEmpty" }) {
   const i18n = useI18n();
   const { t } = i18n;
   const contentKey = answers.map((answer) => `${answer.id}:${answer.status}:${answer.completedAt ?? ""}:${answer.finalAnswer.length}`).join("|");
   const { onScroll, scrollRef, visibleItems, revealEarlier, revealing, canRevealEarlier } = useTailWindow(answers, contentKey, 12, hasEarlier, onLoadEarlier);
   return <div className="answers"><div className="answers-heading"><span>{t("answers.title")}</span><em>{total}</em></div><div className="answer-scroll" ref={scrollRef} onScroll={onScroll}>{answers.length === 0 ? <div className="empty-answers">{t(emptyKey)}</div> : <div className="answer-list"><LoadEarlier shown={canRevealEarlier} busy={revealing} label={t("answers.loadEarlier")} busyLabel={t("answers.loadingEarlier")} onReveal={() => void revealEarlier()} />{visibleItems.map((answer) => {
-    const statusLabel = t(answer.status === "running" ? "answers.running" : answer.status === "completed" ? "answers.completed" : answer.status === "interrupted" ? "answers.interrupted" : "answers.failed");
+    // A turn that was running when its machine went away may have finished,
+    // failed or still be going. Saying "running" would be a guess, and so
+    // would "interrupted"; the machine's own push settles it once it is back.
+    const unknown = offline && answer.status === "running";
+    const statusLabel = unknown ? t("device.statusUnknown") : t(answer.status === "running" ? "answers.running" : answer.status === "completed" ? "answers.completed" : answer.status === "interrupted" ? "answers.interrupted" : "answers.failed");
+    const unknownNotice = <div className="answer-lifecycle unknown"><strong>{statusLabel}</strong></div>;
     // A turn can end without a clean final answer (interrupted mid-stream, or
     // Claude's transcript never reaching end_turn) yet still carry the last
     // thing the agent said. Show that content instead of an empty card, with
@@ -1581,20 +1598,20 @@ function AnswerHistory({ answers, total, hasEarlier, onLoadEarlier, onDocumentLi
     // that "did not finish", so it must never get the partial badge's wording.
     const isRunning = answer.status === "running";
     const isPartial = !isRunning && (answer.captureMode === "fallback_partial_answer" || (answer.status !== "completed" && Boolean(answer.finalAnswer)));
-    return <article className={`answer-card ${answer.status}`} key={answer.id}>
-      <div className="answer-meta"><span className="answer-meta-left"><span>{t(answer.origin === "imported" ? "answers.imported" : answer.origin === "manual" ? "answers.manual" : answer.origin === "timer" ? "answers.timer" : "answers.queue")}</span><b className={`answer-state ${answer.status}`}>{statusLabel}</b></span><time>{t("answers.startedAt")} {i18n.formatTime(answer.startedAt)}</time></div>
+    return <article className={`answer-card ${unknown ? "unknown" : answer.status}`} key={answer.id}>
+      <div className="answer-meta"><span className="answer-meta-left"><span>{t(answer.origin === "imported" ? "answers.imported" : answer.origin === "manual" ? "answers.manual" : answer.origin === "timer" ? "answers.timer" : "answers.queue")}</span><b className={`answer-state ${unknown ? "unknown" : answer.status}`}>{statusLabel}</b></span><time>{t("answers.startedAt")} {i18n.formatTime(answer.startedAt)}</time></div>
       <div className="answer-prompt">{answer.prompt}</div>
       {answer.finalAnswer ? <>
-        {isRunning && <div className="answer-lifecycle running"><span className="status-dot running" />{t("answers.waitingFinal")}</div>}
+        {isRunning && (unknown ? unknownNotice : <div className="answer-lifecycle running"><span className="status-dot running" />{t("answers.waitingFinal")}</div>)}
         {isPartial && <div className={`answer-lifecycle partial ${answer.status}`}><strong>{answer.status === "completed" ? t("answers.partial") : statusLabel}</strong><span>{t("answers.partialDetail")}</span></div>}
         <div className="markdown"><MarkdownView source={answer.finalAnswer} onDocumentLink={(href) => onDocumentLink(href, answer.id)} /></div>
-      </> : answer.status === "running" ? <div className="answer-lifecycle running"><span className="status-dot running" />{t("answers.waitingFinal")}</div> : <div className={`answer-lifecycle ${answer.status}`}><strong>{statusLabel}</strong><span>{answer.error ? i18n.errorText(answer.error) : t(answer.status === "interrupted" ? "answers.interruptedDetail" : "answers.failedDetail")}</span></div>}
+      </> : answer.status === "running" ? (unknown ? unknownNotice : <div className="answer-lifecycle running"><span className="status-dot running" />{t("answers.waitingFinal")}</div>) : <div className={`answer-lifecycle ${answer.status}`}><strong>{statusLabel}</strong><span>{answer.error ? i18n.errorText(answer.error) : t(answer.status === "interrupted" ? "answers.interruptedDetail" : "answers.failedDetail")}</span></div>}
       {answer.status !== "running" && <div className="answer-ended"><time>{t("answers.endedAt")} {i18n.formatTime(answer.completedAt)}</time></div>}
     </article>;
   })}</div>}</div></div>;
 }
 
-function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runnable, onChanged, onError }: { bundle: TabBundle; total: number; hasEarlier: boolean; onLoadEarlier: () => Promise<number>; disabled: boolean; runnable: boolean; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
+function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, offline, runnable, onChanged, onError }: { bundle: TabBundle; total: number; hasEarlier: boolean; onLoadEarlier: () => Promise<number>; disabled: boolean; offline: boolean; runnable: boolean; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
   // The machine that owns this conversation; every call below goes there.
   const device = useDevice();
   const { api } = device;
@@ -1659,7 +1676,10 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   const a2aRoots = bundle.a2a?.roots ?? [];
   const activeRoots = a2aRoots.filter((root) => root.status === "running" || root.status === "ending");
   const notebookOnly = !disabled && !isShell && !runnable;
-  const runnerControlsDisabled = disabled || !runnable;
+  // Nothing here can be changed while the owning machine is away. Typing a
+  // draft still works: it is kept in this browser and added once it is back.
+  const locked = disabled || offline;
+  const runnerControlsDisabled = locked || !runnable;
   const changeRunner = async (action: "start" | "pause" | "interrupt") => {
     if (runnerControlsDisabled || runnerAction) return;
     setRunnerAction(action);
@@ -1673,7 +1693,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   };
   const add = async () => {
     const text = newText.trim();
-    if (!text || adding || disabled) return;
+    if (!text || adding || locked) return;
     setAdding(true);
     // Only drop the draft once the prompt is safely on the list; a failed add
     // must leave the text exactly where the user can retry it.
@@ -1685,7 +1705,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
   // but only the two ids are sent: the server owns the order and recomputes it
   // with this same function, so a queue of any length costs one small request.
   const reorder = async (sourceId: string, targetId: string) => {
-    if (disabled || !sourceId || sourceId === targetId || reorderInFlight.current) return;
+    if (locked || !sourceId || sourceId === targetId || reorderInFlight.current) return;
     if (!reorderPromptIds(prompts.filter((item) => item.status === "pending").map((item) => item.id), sourceId, targetId)) return;
     reorderInFlight.current = true;
     try { onChanged(await api(`/api/tabs/${bundle.tab.id}/prompts/order`, { method: "PUT", body: JSON.stringify({ sourceId, targetId }) })); }
@@ -1756,12 +1776,12 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
     const remembered = rememberedPromptComposerHeight(window.innerHeight);
     if (box && remembered !== null) box.style.height = `${remembered}px`;
   }, []);
-  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={activeRoots.length > 0 ? t("a2a.runningHelp", { count: activeRoots.length }) : runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : activeRoots.length > 0 ? "a2a" : runnerHasActiveWork(runtime.runner) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span>{stalledFor !== null && <span className="queue-state stalled" title={t("queue.stalledHelp", { minutes: stalledFor })}><i className="status-dot" /><span>{t("queue.stalled", { minutes: stalledFor })}</span></span>}</>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={showStartPending || undefined} onClick={() => void changeRunner("start")}>{t(showStartPending ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
+  return <div className="queue-card"><div className="queue-heading"><div className="queue-summary"><h3>{t("queue.title")}</h3><span className="queue-count">{completedCount}/{total}</span>{notebookOnly ? <span className="queue-state notebook" title={t("queue.notebookHelp")}><i className="status-dot" /><span>{t("queue.notebook")}</span></span> : offline ? <span className="queue-state unknown" title={t("device.offlineBanner")}><i className="status-dot" /><span>{t("device.statusUnknown")}</span></span> : <><span className={`queue-state ${runtime.runner.state === "error" ? "error" : ""}`} title={activeRoots.length > 0 ? t("a2a.runningHelp", { count: activeRoots.length }) : runnerState}><i className={`status-dot ${runtime.runner.state === "error" ? "error" : activeRoots.length > 0 ? "a2a" : runnerHasActiveWork(runtime.runner) ? "running" : ""}`} /><span>{runnerState}</span></span><span className={`queue-state ${runtime.runner.desiredState}`} title={t(queueStateKey)}><i className={`status-dot ${runtime.runner.desiredState === "running" ? "running" : queueRolling ? "armed" : ""}`} /><span>{t(queueStateKey)}</span></span>{stalledFor !== null && <span className="queue-state stalled" title={t("queue.stalledHelp", { minutes: stalledFor })}><i className="status-dot" /><span>{t("queue.stalled", { minutes: stalledFor })}</span></span>}</>}</div><div className="runner-actions"><button className="primary runner-start-button" disabled={runnerControlsDisabled} aria-busy={showStartPending || undefined} onClick={() => void changeRunner("start")}>{t(showStartPending ? "queue.starting" : "queue.start")}</button><button className="pause-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "pause"} onClick={() => void changeRunner("pause")}>{t(runnerAction === "pause" ? "queue.pausing" : "queue.pause")}</button><button className="interrupt-button" disabled={runnerControlsDisabled} aria-busy={runnerAction === "interrupt"} onClick={() => void changeRunner("interrupt")}>{t(runnerAction === "interrupt" ? "queue.interrupting" : "queue.interrupt")}</button></div></div>
     {runtime.runner.lastError && <div className="runner-error" role="alert">{i18n.errorText(runtime.runner.lastError)}</div>}
-    {activeRoots.map((root) => <A2aRootBar key={root.rootId} root={root} onError={onError} />)}
-    <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t(notebookOnly ? "queue.notebookEmpty" : "queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={disabled} executionDisabled={!runnable} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; if (!sourceId) nativeDragTarget.current = null; }} onNativeDragTarget={(targetId) => { if (nativeDragSource.current) nativeDragTarget.current = targetId; }} onNativeDrop={() => { const sourceId = nativeDragSource.current; const targetId = nativeDragTarget.current; nativeDragSource.current = null; nativeDragTarget.current = null; if (sourceId && targetId) void reorder(sourceId, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
+    {activeRoots.map((root) => <A2aRootBar key={root.rootId} root={root} disabled={offline} onError={onError} />)}
+    <div className="prompt-list" ref={promptWindow} onScroll={onPromptScroll}>{prompts.length === 0 && <div className="empty-prompts">{t(notebookOnly ? "queue.notebookEmpty" : "queue.empty")}</div>}<LoadEarlier shown={canRevealEarlierPrompts} busy={revealingPrompts} label={t("queue.loadEarlier")} busyLabel={t("queue.loadingEarlier")} onReveal={() => void revealEarlierPrompts()} />{visiblePrompts.map((prompt, visibleIndex) => { const index = promptStartIndex + visibleIndex; return <PromptRow key={prompt.id} prompt={prompt} index={index} tabId={bundle.tab.id} locked={locked} statusUnknown={offline} executionDisabled={!runnable} onDrop={reorder} onNativeDragStart={(sourceId) => { nativeDragSource.current = sourceId; if (!sourceId) nativeDragTarget.current = null; }} onNativeDragTarget={(targetId) => { if (nativeDragSource.current) nativeDragTarget.current = targetId; }} onNativeDrop={() => { const sourceId = nativeDragSource.current; const targetId = nativeDragTarget.current; nativeDragSource.current = null; nativeDragTarget.current = null; if (sourceId && targetId) void reorder(sourceId, targetId); }} onChanged={onChanged} onError={onError} />; })}</div>
     {isShell && <div className="queue-shell-notice" role="status">{t("queue.shellNotice")}</div>}
-    <div className="add-prompt"><div className="prompt-composer" ref={composerBox}><textarea ref={composer} disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : "queue.inputPlaceholder")} /><div className="prompt-composer-resizer" role="separator" aria-orientation="horizontal" aria-label={t("queue.resizeInput")} title={t("queue.resizeInput")} tabIndex={0} onPointerDown={beginComposerResize} onPointerMove={moveComposerResize} onPointerUp={endComposerResize} onPointerCancel={endComposerResize} onLostPointerCapture={() => { composerResize.current = null; }} onKeyDown={(event) => { if (event.key === "ArrowUp" || event.key === "ArrowDown") { event.preventDefault(); nudgeComposerHeight(event.key === "ArrowUp" ? 20 : -20); } }} /></div><div className="compose-tools"><button className="compose-tool" disabled={!runnable} title={t(runnable ? "queue.timers" : "queue.connectForTimers")} aria-label={t("queue.timers")} onClick={() => { if (!runnable) return; setTimerMounted(true); setTimerOpen(true); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3 4 6M17 3l3 3M5.5 11a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm6.5-3v3.5l2.2 1.4M8 19l-1.5 2M16 19l1.5 2" /></svg></button><button className="compose-tool" title={t("queue.commonPrompts")} aria-label={t("queue.commonPrompts")} onClick={openCommonPrompts}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></svg></button></div><button className="primary" disabled={disabled || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
+    <div className="add-prompt"><div className="prompt-composer" ref={composerBox}><textarea ref={composer} disabled={disabled || isShell} value={newText} onChange={(event) => editDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void add(); } }} placeholder={t(disabled ? "queue.closedPlaceholder" : offline ? "device.offlineInput" : "queue.inputPlaceholder")} /><div className="prompt-composer-resizer" role="separator" aria-orientation="horizontal" aria-label={t("queue.resizeInput")} title={t("queue.resizeInput")} tabIndex={0} onPointerDown={beginComposerResize} onPointerMove={moveComposerResize} onPointerUp={endComposerResize} onPointerCancel={endComposerResize} onLostPointerCapture={() => { composerResize.current = null; }} onKeyDown={(event) => { if (event.key === "ArrowUp" || event.key === "ArrowDown") { event.preventDefault(); nudgeComposerHeight(event.key === "ArrowUp" ? 20 : -20); } }} /></div><div className="compose-tools"><button className="compose-tool" disabled={!runnable || offline} title={t(runnable ? "queue.timers" : "queue.connectForTimers")} aria-label={t("queue.timers")} onClick={() => { if (!runnable || offline) return; setTimerMounted(true); setTimerOpen(true); }}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3 4 6M17 3l3 3M5.5 11a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm6.5-3v3.5l2.2 1.4M8 19l-1.5 2M16 19l1.5 2" /></svg></button><button className="compose-tool" disabled={offline} title={t("queue.commonPrompts")} aria-label={t("queue.commonPrompts")} onClick={openCommonPrompts}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></svg></button></div><button className="primary" disabled={locked || isShell || adding || !newText.trim()} onClick={() => void add()}>{t(adding ? "queue.adding" : "queue.add")}</button></div>
     {timerMounted && <LazyDialogBoundary open={timerOpen} label={t("queue.timers")} onClose={() => setTimerOpen(false)}><Suspense fallback={timerOpen ? <LazyDialogFallback label={t("queue.timers")} /> : null}><TimerDialog open={timerOpen} tabId={tabId} sessionReady={runnable && !isShell} currentThreadId={bundle.tab.session.threadId} provider={bundle.tab.session.provider} onClose={() => setTimerOpen(false)} onError={onError} /></Suspense></LazyDialogBoundary>}
     {commonMounted && <LazyDialogBoundary open={commonOpen} label={t("queue.commonPrompts")} onClose={() => setCommonOpen(false)}><Suspense fallback={commonOpen ? <LazyDialogFallback label={t("queue.commonPrompts")} /> : null}><CommonPromptDialog open={commonOpen} canInsert={!disabled && !isShell} onClose={() => setCommonOpen(false)} onInsert={insertFromLibrary} onError={onError} /></Suspense></LazyDialogBoundary>}
   </div>;
@@ -1775,7 +1795,7 @@ function PromptQueue({ bundle, total, hasEarlier, onLoadEarlier, disabled, runna
  * counts wall clock -- waiting for a reply and a pause are part of it -- so it
  * ticks locally instead of asking the server.
  */
-function A2aRootBar({ root, onError }: { root: A2aRootSummary; onError: (error: unknown) => void }) {
+function A2aRootBar({ root, disabled, onError }: { root: A2aRootSummary; disabled: boolean; onError: (error: unknown) => void }) {
   const { api } = useDevice();
   const { t } = useI18n();
   const [busy, setBusy] = useState<"finish" | "stop" | null>(null);
@@ -1806,8 +1826,8 @@ function A2aRootBar({ root, onError }: { root: A2aRootSummary; onError: (error: 
     {root.sessionClosed && <span className="a2a-note">{t("a2a.sessionClosed")}</span>}
     {root.advice !== "continue" && <span className="a2a-note">{t(`a2a.advice.${root.advice}` as "a2a.advice.wrap_up")}</span>}
     <span className="a2a-actions">
-      <button className="link-button" disabled={busy !== null} onClick={() => void act("finish")}>{t(busy === "finish" ? "a2a.finishing" : "a2a.finish")}</button>
-      <button className="link-button" disabled={busy !== null} title={root.status === "ending" ? t("a2a.stopAgain") : undefined} onClick={() => void act("stop")}>{t(busy === "stop" ? "a2a.finishing" : "a2a.stop")}</button>
+      <button className="link-button" disabled={busy !== null || disabled} onClick={() => void act("finish")}>{t(busy === "finish" ? "a2a.finishing" : "a2a.finish")}</button>
+      <button className="link-button" disabled={busy !== null || disabled} title={root.status === "ending" ? t("a2a.stopAgain") : undefined} onClick={() => void act("stop")}>{t(busy === "stop" ? "a2a.finishing" : "a2a.stop")}</button>
     </span>
   </div>;
 }
@@ -1944,7 +1964,7 @@ function handoffPromptTextareaWheel(event: ReactWheelEvent<HTMLDivElement>) {
   if (decision.outerDelta) promptList.scrollTop += decision.outerDelta;
 }
 
-function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, onNativeDragStart, onNativeDragTarget, onNativeDrop, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; executionDisabled: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragTarget: (targetId: string) => void; onNativeDrop: () => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
+function PromptRow({ prompt, index, tabId, locked, statusUnknown, executionDisabled, onDrop, onNativeDragStart, onNativeDragTarget, onNativeDrop, onChanged, onError }: { prompt: PromptRecord; index: number; tabId: string; locked: boolean; statusUnknown: boolean; executionDisabled: boolean; onDrop: (sourceId: string, targetId: string) => void; onNativeDragStart: (sourceId: string | null) => void; onNativeDragTarget: (targetId: string) => void; onNativeDrop: () => void; onChanged: (echo?: unknown) => void; onError: (error: unknown) => void }) {
   const { api } = useDevice();
   const i18n = useI18n();
   const { t } = i18n;
@@ -1985,6 +2005,9 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
   };
   const pendingStatus = prompt.status === "pending";
   const pending = pendingStatus && !locked;
+  // In flight when its machine went away: neither "running" nor "interrupted"
+  // is known to be true until that machine says so again.
+  const shownStatus = statusUnknown && (prompt.status === "running" || prompt.status === "dispatching") ? "unknown" : prompt.status;
   const pointerDown = (event: PointerEvent<HTMLDivElement>) => { if (!pending || event.pointerType === "mouse" || event.button !== 0) return; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add("dragging"); };
   const pointerUp = (event: PointerEvent<HTMLDivElement>) => { if (event.pointerType === "mouse") return; event.currentTarget.classList.remove("dragging"); if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId); const targetId = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>(".prompt-row.pending")?.dataset.promptId; if (pending && targetId) onDrop(prompt.id, targetId); };
   const mouseDown = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -1994,7 +2017,7 @@ function PromptRow({ prompt, index, tabId, locked, executionDisabled, onDrop, on
     window.addEventListener("mouseup", release, { once: true });
   };
   const nativeDragStart = (event: DragEvent<HTMLDivElement>) => { if ((event.target as HTMLElement).closest("textarea, button")) { event.preventDefault(); return; } event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", prompt.id); onNativeDragStart(prompt.id); };
-  return <div ref={row} className={`prompt-row ${prompt.status} ${locked ? "locked" : ""} ${actionsBelow ? "actions-below" : "actions-inline"}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDragOver={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDrop={(event) => { if (!pending) return; event.preventDefault(); event.stopPropagation(); onNativeDrop(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div ref={actions} className="prompt-side"><span className="prompt-status">{prompt.a2a && <span className="a2a-badge" title={prompt.a2a.fromTabId ? `rootId ${prompt.a2a.rootId}` : t("a2a.root", { skill: prompt.a2a.skill })}>{t("a2a.badge", { skill: prompt.a2a.skill })}</span>}{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || executionDisabled || insertingNow} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked || executionDisabled} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked || executionDisabled} onClick={() => void skip()}>{t("queue.skip")}</button></> : null}{editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
+  return <div ref={row} className={`prompt-row ${shownStatus} ${locked ? "locked" : ""} ${actionsBelow ? "actions-below" : "actions-inline"}`} data-prompt-id={prompt.id} draggable={pending && !editing} onWheelCapture={handoffPromptTextareaWheel} onMouseDown={mouseDown} onDragStart={nativeDragStart} onDragEnd={() => onNativeDragStart(null)} onDragEnter={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDragOver={(event) => { if (pending) { event.preventDefault(); onNativeDragTarget(prompt.id); } }} onDrop={(event) => { if (!pending) return; event.preventDefault(); event.stopPropagation(); onNativeDrop(); }}><div className="prompt-index">{prompt.status === "completed" ? "✓" : index + 1}</div><div className={`drag-handle ${pending ? "enabled" : ""}`} title={pending ? t("queue.drag") : undefined} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={(event) => event.currentTarget.classList.remove("dragging")}>⠿</div><textarea ref={editor} value={text} disabled={!editable} readOnly={!editing} className={editing ? "editing" : ""} onChange={(event) => setText(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); void save(); } }} rows={1} /><div ref={actions} className="prompt-side"><span className="prompt-status">{prompt.a2a && <span className="a2a-badge" title={prompt.a2a.fromTabId ? `rootId ${prompt.a2a.rootId}` : t("a2a.root", { skill: prompt.a2a.skill })}>{t("a2a.badge", { skill: prompt.a2a.skill })}</span>}{prompt.status === "completed" && prompt.completedAt && <time>{i18n.formatTime(prompt.completedAt)}</time>}<span>{shownStatus === "unknown" ? t("device.statusUnknown") : promptStatusLabel(i18n, prompt.status)}</span></span>{pendingStatus && <div className="prompt-icon-group"><button className="prompt-edit-button" aria-label={t(editing ? "action.save" : "queue.edit")} title={t(editing ? "action.save" : "queue.edit")} disabled={locked || insertingNow} onClick={() => editing ? void save() : beginEdit()}>{editing ? "✓" : "✎"}</button><button className="prompt-send-button insert-now-button" aria-label={t(insertingNow ? "queue.insertingNow" : "queue.insertNow")} aria-busy={insertingNow || undefined} title={t("queue.insertNowHelp")} disabled={locked || executionDisabled || insertingNow} onClick={() => void insertNow()}><SendIcon /></button></div>}{prompt.status === "failed" || prompt.status === "interrupted" ? <><button className="link-button" disabled={locked || executionDisabled} onClick={() => void retry()}>{t("queue.retry")}</button><button className="link-button" disabled={locked || executionDisabled} onClick={() => void skip()}>{t("queue.skip")}</button></> : null}{editable && <button className="delete-button" aria-label={t("queue.deletePrompt")} onClick={() => void remove()}>×</button>}</div></div>;
 }
 
 /**
@@ -2052,7 +2075,7 @@ function ChatGptPanel({ bundle, localControls, onError }: { bundle: TabBundle; l
   </div>;
 }
 
-function TerminalPanel({ tabId, provider, runtime, theme, active, closed, documentIntent, projectionSupported, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; documentIntent: DocumentOpenIntent | null; projectionSupported: boolean; onBundle: (partial: Partial<TabBundle>) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {
+function TerminalPanel({ tabId, provider, runtime, theme, active, closed, offline, documentIntent, projectionSupported, onBundle, onMessage, onError }: { tabId: string; provider: AgentProvider; runtime: RuntimeFile; theme: "light" | "dark"; active: boolean; closed: boolean; offline: boolean; documentIntent: DocumentOpenIntent | null; projectionSupported: boolean; onBundle: (partial: Partial<TabBundle>) => void; onMessage: (message: any) => void; onError: (error: unknown) => void }) {
   // Sockets, keys and caches all belong to the machine that owns this
   // conversation (docs/MULTI_DEVICE_FEDERATION_IMPLEMENTATION.md §9).
   const device = useDevice();
@@ -2070,6 +2093,9 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
   const scheduleLayout = useRef<(() => void) | null>(null);
   const activeRef = useRef(active);
   const closedRef = useRef(closed);
+  // The owning machine is away: there is nothing to connect to until it is
+  // back, and every attempt in between would only be a failure to report.
+  const offlineRef = useRef(offline);
   const themeRef = useRef(theme);
   const providerRef = useRef(provider);
   const callbacks = useRef({ onBundle, onMessage, onError });
@@ -2088,6 +2114,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
   const runnerBusy = runnerHasActiveWork(runtime.runner);
   closedRef.current = closed;
   activeRef.current = active;
+  offlineRef.current = offline;
   themeRef.current = theme;
   providerRef.current = provider;
   callbacks.current = { onBundle, onMessage, onError };
@@ -2241,7 +2268,9 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
     // goes out with whatever is buffered, in order.
     const inputCoalescer = createInputCoalescer(writeInput);
     const sendInputNow = (data: string) => {
-      if (documentVisibleRef.current || (!projectionMode && !rawLeaseWritable)) return;
+      // Dropped, not held: keys typed at a machine that is away must not
+      // arrive in a burst once it is back (§6.3).
+      if (offlineRef.current || documentVisibleRef.current || (!projectionMode && !rawLeaseWritable)) return;
       const disposition = terminalInputDisposition({
         subscribed: terminalSubscribed,
         wanted: terminalSubscriptionWanted({ hidden: pageIsHidden(), documentVisible: documentVisibleRef.current, active: activeRef.current }),
@@ -2538,7 +2567,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       scheduleSize();
     };
     const connect = () => {
-      if (disposed || closedRef.current || !activeRef.current || socket.current?.readyState === WebSocket.OPEN || socket.current?.readyState === WebSocket.CONNECTING) return;
+      if (disposed || closedRef.current || offlineRef.current || !activeRef.current || socket.current?.readyState === WebSocket.OPEN || socket.current?.readyState === WebSocket.CONNECTING) return;
       const ws = new WebSocket(device.wsUrl());
       socket.current = ws;
       // Encrypted frames are binary; without this they arrive as Blobs.
@@ -2551,7 +2580,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
         if (lastSubscription) sendSubscription(lastSubscription.includeTerminal, lastSubscription.snapshots, lastSubscription.boundedCatchUp);
       });
       ws.onopen = () => {
-        if (disposed || closedRef.current || !activeRef.current) { closeSocketQuietly(ws); return; }
+        if (disposed || closedRef.current || offlineRef.current || !activeRef.current) { closeSocketQuietly(ws); return; }
         alarm.noteSuccess();
         setConnected(true);
         const reconnecting = connectedOnce;
@@ -2617,13 +2646,17 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
         if (subscriptionController.current) subscriptionController.current = null;
         if (disposed) return;
         setConnected(false);
-        if (closedRef.current || !activeRef.current || deliberateCloses.has(ws)) return;
-        if (alarm.noteFailure()) callbacks.current.onError({ code: "TERMINAL_WEBSOCKET_FAILED", message: t("terminal.connectionLost") });
+        if (closedRef.current || offlineRef.current || !activeRef.current || deliberateCloses.has(ws)) return;
+        // The hub saying the machine is gone is not this terminal failing:
+        // the sidebar shows it and the view refreshes when it is back. It
+        // still backs off, in case that news is slow to reach this page.
+        const machineAway = event.code === FederationClose.deviceUnavailable || event.code === FederationClose.hubUnreachable;
+        if (alarm.noteFailure() && !machineAway) callbacks.current.onError({ code: "TERMINAL_WEBSOCKET_FAILED", message: t("terminal.connectionLost") });
         reconnectTimer = window.setTimeout(scheduleConnect, reconnectDelay(alarm.failures()));
       };
     };
     const scheduleConnect = () => {
-      if (disposed || connectFrame !== null || closedRef.current || !activeRef.current) return;
+      if (disposed || connectFrame !== null || closedRef.current || offlineRef.current || !activeRef.current) return;
       // Let React paint the selected conversation before replaying a large TUI
       // buffer. Otherwise xterm parsing can make the whole page look blank on
       // the first tab switch even though its data has already loaded.
@@ -2736,15 +2769,23 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       setConnected(false);
     } else reconnect.current?.();
   }, [closed]);
+  useEffect(() => {
+    offlineRef.current = offline;
+    if (offline) {
+      closeSocketQuietly(socket.current);
+      setConnected(false);
+      terminal.current?.blur();
+    } else reconnect.current?.();
+  }, [offline]);
   const sendTerminalShortcut = (value: string) => {
     const data = terminalShortcutInput(value);
-    if (!data || closed || !connected || documentVisible) return;
+    if (!data || closed || offline || !connected || documentVisible) return;
     terminalInput.current(data);
   };
   const placeholder = t(runtime.terminal.state === "stopped" ? "terminal.notStarted" : runtime.terminal.state === "starting" ? "terminal.startingHelp" : runtime.terminal.state === "running" ? "terminal.runningHelp" : runtime.terminal.state === "error" ? "terminal.failedHelp" : "terminal.exitedHelp");
   const terminalProvider = provider === "claude" ? t("provider.claude") : provider === "cursor" ? t("provider.cursor") : provider === "shell" ? t("provider.shell") : provider === "chatgpt" ? t("provider.chatgpt") : t("provider.codex");
   const terminalStatus = closed ? t("terminal.closed") : terminalStateLabel(i18n, runtime.terminal.state);
-  const inputStatus = t(closed ? "terminal.inputDisabled" : connected ? "terminal.inputConnected" : "terminal.inputConnecting");
+  const inputStatus = t(closed ? "terminal.inputDisabled" : offline ? "device.offline" : connected ? "terminal.inputConnected" : "terminal.inputConnecting");
   const transportLabel = t(transportMode === "projection" ? "terminal.modeProjection" : "terminal.modeRaw");
   return <div className={`terminal-card ${closed ? "locked" : ""} ${runnerBusy ? "runner-busy" : ""} ${documentVisible ? "document-open" : ""}`}>
     <div className="terminal-heading">
@@ -2752,7 +2793,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       <span className="terminal-meta">
         <label className="terminal-key-control" title={t("terminal.keyInputHelp")}>
           <span className="sr-only">{t("terminal.keyInput")}</span>
-          <select aria-label={t("terminal.keyInput")} defaultValue="" disabled={closed || !connected || documentVisible} onChange={(event) => { sendTerminalShortcut(event.currentTarget.value); event.currentTarget.value = ""; }}>
+          <select aria-label={t("terminal.keyInput")} defaultValue="" disabled={closed || offline || !connected || documentVisible} onChange={(event) => { sendTerminalShortcut(event.currentTarget.value); event.currentTarget.value = ""; }}>
             <option value="">{t("terminal.keyInput")}</option>
             <option value="shift-tab">Shift+Tab</option>
             <option value="escape-twice">Esc*2</option>
@@ -2769,7 +2810,7 @@ function TerminalPanel({ tabId, provider, runtime, theme, active, closed, docume
       </span>
     </div>
     {runtime.terminal.lastError && <div className="terminal-error">{i18n.errorText(runtime.terminal.lastError)}</div>}
-    <div className={`terminal-body ${theme} ${transportMode} ${closed ? "locked" : ""}`} onMouseDown={() => { if (!closed && !documentVisible) terminal.current?.focus(); }}><div className={`terminal-host ${documentVisible ? "document-hidden" : ""}`} ref={host} />{documentVisible ? <DocumentView state={documentState} loader={documentLoader} onClose={() => documentLoader.close()} /> : <>{!hasOutput && <div className="terminal-placeholder">{closed ? t("terminal.closedPlaceholder") : placeholder}</div>}</>}</div>
+    <div className={`terminal-body ${theme} ${transportMode} ${closed ? "locked" : ""}`} onMouseDown={() => { if (!closed && !offline && !documentVisible) terminal.current?.focus(); }}><div className={`terminal-host ${documentVisible ? "document-hidden" : ""}`} ref={host} />{documentVisible ? <DocumentView state={documentState} loader={documentLoader} onClose={() => documentLoader.close()} /> : <>{!hasOutput && <div className="terminal-placeholder">{closed ? t("terminal.closedPlaceholder") : placeholder}</div>}</>}</div>
   </div>;
 }
 

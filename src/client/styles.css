@@ -133,6 +133,13 @@ input, textarea, select { color: var(--text); }
 .device-section.offline .group, .device-section.offline .device-name { opacity: .62; }
 .device-placeholder { padding: 6px 10px 8px 32px; color: var(--faint); font-size: 12px; }
 .device-offline-banner { flex: none; margin-bottom: 10px; padding: 9px 11px; border: 1px solid color-mix(in srgb, var(--notice) 40%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--notice) 9%, var(--panel)); color: var(--text); font-size: 12px; line-height: 1.5; }
+/* In flight when its machine went away (§9.6): neither "running" nor
+   "interrupted" is known, so it is marked in the notice colour, not either's. */
+.answer-card.unknown { border-color: color-mix(in srgb, var(--notice) 40%, var(--border)); }
+.answer-state.unknown { background: color-mix(in srgb, var(--notice) 12%, var(--panel)); color: var(--notice); }
+.answer-lifecycle.unknown strong, .queue-state.unknown { color: var(--notice); }
+.queue-state.unknown .status-dot { background: currentColor; }
+.prompt-row.unknown { border-color: color-mix(in srgb, var(--notice) 45%, var(--border)); }
 .devices-icon-button.active { color: var(--primary); }
 .federation-dialog { display: flex; flex-direction: column; gap: 10px; }
 .federation-dialog input, .federation-dialog textarea { width: 100%; margin-top: 5px; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--panel-soft); color: var(--text); font: inherit; font-size: 13px; }
