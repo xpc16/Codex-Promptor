@@ -75,6 +75,16 @@ describe("remote Codex terminal command", () => {
     expect(terminalStartupError(`${output}__CODEX_PROMPTOR_EXIT__:1\r\n`)).toContain(`No saved session found with ID ${id}`);
   });
 
+  it("names the rollout path Codex could not resume from", () => {
+    // Codex 0.163 after the home folder was renamed: its index still held the old path.
+    const id = "01a11c1f-b0f4-7b50-a364-7a641a074668";
+    const rollout = `/Users/tw/.codex/sessions/2026/10/08/rollout-2026-10-08T23-26-41-${id}.jsonl`;
+    const output = `\x1b[1m›\x1b[0m Error: Failed to resume session from ${rollout}: thread/resume failed during TUI bootstrap: `
+      + `thread/resume failed: no rollout found for thread id ${id} (code -32600)\r\n__CODEX_PROMPTOR_EXIT__:1\r\n`;
+    expect(terminalStartupError(output))
+      .toContain(`Failed to resume session from ${rollout}: no rollout found for thread id ${id}.`);
+  });
+
   it("sends only the missing terminal bytes for a matching cursor", () => {
     const source = { generation: "generation-1", buffer: Buffer.from("abcdef", "utf8"), bufferStart: 10, nextOffset: 16 };
     const delta = sliceTerminalBuffer(source, { generation: "generation-1", nextOffset: 13 });

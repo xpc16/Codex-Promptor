@@ -474,6 +474,11 @@ function terminalExitDetail(value: string): string | null {
   if (/active writer|already has an active writer|thread\/resume failed.*writer/i.test(plain)) {
     return "thread/resume failed: thread already has an active writer";
   }
+  // Codex looks the rollout up in its own index, which keeps the absolute path
+  // it was written at; after the home folder is renamed that path is gone. The
+  // path is the part worth showing: it is what says where Codex looked.
+  const unresolved = /Failed to resume session from\s+(\S+?\.jsonl)[\s\S]{0,400}?no rollout found for thread id\s+([0-9a-f-]{36})/i.exec(plain);
+  if (unresolved) return `Failed to resume session from ${unresolved[1]}: no rollout found for thread id ${unresolved[2]}.`;
   const missing = /No saved session found with ID\s+([0-9a-f-]{36})/i.exec(plain);
   return missing ? `No saved session found with ID ${missing[1]}.` : null;
 }
