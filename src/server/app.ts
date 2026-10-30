@@ -19,7 +19,7 @@ import {
 } from "../shared/tab-window.js";
 import { AppServerPool, type AppServerManager, type CodexRpcClient, terminateStaleAppServer, waitForThreadLoaded } from "./codex.js";
 import { CodexTuiPool, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, codexTuiReady, resolveCodexTuiLaunch, type CodexTuiManager } from "./codex-tui.js";
-import { ClaudeCodePool, type ClaudeCodeManager, probeClaudeVersion } from "./claude.js";
+import { ClaudeCodePool, type ClaudeCodeManager, claudeStartupFailureText, claudeStartupQuestion, probeClaudeVersion } from "./claude.js";
 import { readClaudeHistoryThread, syncClaudeHistory } from "./claude-history.js";
 import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorHookBridge, probeCursorVersion } from "./cursor.js";
 import { syncCursorHistory } from "./cursor-history.js";
@@ -1173,7 +1173,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
         CODEX_PROMPTOR_CLAUDE_HOOK_URL: claudeHookUrl(tabId, lease.nonce),
         CODEX_PROMPTOR_HOOK_SECRET: lease.secret,
       }, theme);
-      const session = await manager.waitForSession(30_000, () => pty.startupError(tabId));
+      const session = await manager.waitForSession(
+        30_000,
+        () => pty.startupError(tabId),
+        async () => claudeStartupQuestion(await pty.screenText(tabId)),
+      );
       if (launch.mode === "resume" && session.sessionId !== launch.sessionId) {
         throw new Error(`CLAUDE_RESUME_ID_MISMATCH:${launch.sessionId}:${session.sessionId}`);
       }
@@ -1277,6 +1281,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       return { ok: true, bundle };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const display = claudeStartupFailureText(message) ?? message;
       await pty.stop(tabId, false).catch(() => undefined);
       await claude.stop(tabId).catch(() => undefined);
       revokeHookLease("claude", tabId);
@@ -1284,12 +1289,12 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       try {
         await storage.updateTab(tabId, (current) => ({
           ...current,
-          session: { ...current.session, state: "closed", lastError: { code: "TERMINAL_REOPEN_FAILED", message } },
+          session: { ...current.session, state: "closed", lastError: { code: "TERMINAL_REOPEN_FAILED", message: display } },
           updatedAt: isoNow(),
         }));
       } catch { /* a missing tab is already effectively closed */ }
       await emitSnapshot(tabId);
-      return { ok: false, statusCode: 500, code: "TERMINAL_REOPEN_FAILED", message };
+      return { ok: false, statusCode: 500, code: "TERMINAL_REOPEN_FAILED", message: display };
     }
   };
 
@@ -3229,7 +3234,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
       const activeWriter = provider === "codex" && isActiveWriterError(message);
       const unavailable = message === "CLAUDE_CLI_NOT_FOUND" || message === "CURSOR_CLI_NOT_FOUND";
       const code = activeWriter ? "SESSION_ACTIVE_WRITER" : unavailable ? message : "SESSION_CONNECT_FAILED";
-      const display = activeWriter ? "该 session 正由另一个 Codex 进程占用；请先退出外部 CLI 或其他客户端后重试。" : message;
+      const display = activeWriter ? "该 session 正由另一个 Codex 进程占用；请先退出外部 CLI 或其他客户端后重试。" : claudeStartupFailureText(message) ?? message;
       try { await storage.updateTab(tabId, (tab) => ({ ...tab, session: { ...tab.session, state: previous?.session.state === "closed" ? "closed" : "error", lastError: { code, message: display } }, updatedAt: isoNow() })); } catch { /* tab error is secondary */ }
       return apiError(reply, activeWriter ? 409 : unavailable ? 503 : 502, code, display, true);
     }

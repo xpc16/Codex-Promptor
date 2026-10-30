@@ -134,14 +134,35 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
     return buildClaudeCommand(options.cwd, options.settingsPath, options.launch, options.theme, options.exitMarker);
   }
 
-  async waitForSession(timeoutMs = 30_000, startupError?: () => string | null): Promise<ClaudeSessionInfo> {
+  /**
+   * Waits for SessionStart, which Claude Code fires only after its startup
+   * screens are answered. The folder trust prompt is one of them, and for the
+   * home directory it comes back on every launch because Claude never stores
+   * that answer. Counting thirty seconds down through it and then killing the
+   * terminal took the prompt away from the reader, so the clock waits while a
+   * question is on screen and starts over once it has been answered.
+   */
+  async waitForSession(
+    timeoutMs = 30_000,
+    startupError?: () => string | null,
+    question?: () => Promise<string | null> | string | null,
+    questionTimeoutMs = 10 * 60_000,
+  ): Promise<ClaudeSessionInfo> {
     const ready = this.launchReady;
     if (!ready) throw new Error("CLAUDE_LAUNCH_NOT_PREPARED");
-    const deadline = Date.now() + timeoutMs;
+    const started = Date.now();
+    const latest = started + timeoutMs + questionTimeoutMs;
+    let deadline = started + timeoutMs;
+    let pending: string | null = null;
+    let askedAt: number | null = null;
     while (Date.now() < deadline) {
       if (ready.settled) return ready.promise;
       const error = startupError?.();
       if (error) throw new Error(error);
+      pending = (await question?.()) ?? null;
+      if (ready.settled) return ready.promise;
+      if (pending) askedAt = Date.now();
+      if (askedAt !== null) deadline = Math.min(latest, askedAt + (pending ? questionTimeoutMs : timeoutMs));
       const remaining = Math.max(1, deadline - Date.now());
       const result = await Promise.race([
         ready.promise.then((value) => ({ value })),
@@ -149,7 +170,7 @@ export class ClaudeCodeManager extends EventEmitter implements QueueBinding {
       ]);
       if (result) return result.value;
     }
-    throw new Error("CLAUDE_SESSION_START_TIMEOUT");
+    throw new Error(pending ? `${CLAUDE_STARTUP_QUESTION_UNANSWERED}:${pending}` : "CLAUDE_SESSION_START_TIMEOUT");
   }
 
   async handleHook(payload: any): Promise<void> {
@@ -528,6 +549,47 @@ export function buildClaudeCommand(cwd: string, settingsPath: string, launch: Cl
   // contents never enter xterm's native scrollback. Promptor is itself the
   // terminal emulator, so keep Claude on the classic main-screen renderer.
   return `$env:NO_COLOR = "1"; $env:CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN = "1"; Set-Location -LiteralPath ${quotePowerShellArg(cwd)}; $Host.UI.RawUI.ForegroundColor = "${foreground}"; $Host.UI.RawUI.BackgroundColor = "${background}"; $promptorEsc = [char]27; Write-Host -NoNewline "$promptorEsc[${ansi}m"; Clear-Host; ${invocation}; $promptorClaudeOk = $?; $promptorClaudeExit = $LASTEXITCODE; if ($null -eq $promptorClaudeExit) { if ($promptorClaudeOk) { $promptorClaudeExit = 0 } else { $promptorClaudeExit = 1 } }; Write-Output "${exitMarker}$promptorClaudeExit"`;
+}
+
+/** A launch that ended with Claude Code still asking, and nobody answering. */
+export const CLAUDE_STARTUP_QUESTION_UNANSWERED = "CLAUDE_STARTUP_QUESTION_UNANSWERED";
+const UNNAMED_CLAUDE_QUESTION = "Claude Code 启动提问";
+const CLAUDE_QUESTION_FOOTER = /^enter to (?:confirm|select|continue)\b/i;
+const CLAUDE_NUMBERED_OPTION = /^❯\s*\d+[.)]\s+\S/u;
+const CLAUDE_RULE = /^[─━]{8,}$/u;
+
+/**
+ * The question Claude Code is showing before its session starts, or null.
+ *
+ * Its startup screens (folder trust, and whatever a later version adds) are
+ * menus with a "Enter to confirm" footer, or numbered rows whose current one
+ * is marked with ❯. The composer uses the same ❯ but neither the footer nor a
+ * number, so an idle Claude does not read as asking. The question is named by
+ * the dialog's first sentence ending in "?", else its first line.
+ *
+ * Pass the parsed screen, never the rolling buffer, which keeps answered
+ * questions forever.
+ */
+export function claudeStartupQuestion(screen: string): string | null {
+  const lines = screen.split(/\r?\n/).map((line) => line.trim());
+  let anchor = -1;
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (CLAUDE_QUESTION_FOOTER.test(lines[index]) || CLAUDE_NUMBERED_OPTION.test(lines[index])) { anchor = index; break; }
+  }
+  if (anchor < 0) return null;
+  let start = anchor;
+  while (start > 0 && !CLAUDE_RULE.test(lines[start - 1])) start -= 1;
+  const body = lines.slice(start, anchor).filter((line) => line && !line.startsWith("❯"));
+  const asking = body.find((line) => line.includes("?"));
+  if (asking) return asking.slice(0, asking.indexOf("?") + 1);
+  return body[0] ?? UNNAMED_CLAUDE_QUESTION;
+}
+
+/** Reader-facing text for a launch that stopped at an unanswered question. */
+export function claudeStartupFailureText(message: string): string | null {
+  const match = new RegExp(`^${CLAUDE_STARTUP_QUESTION_UNANSWERED}:(.*)$`, "s").exec(message.trim());
+  if (!match) return null;
+  return `Claude Code 在终端里等你回答「${match[1].trim() || UNNAMED_CLAUDE_QUESTION}」，一直没有回答，已停止。点「重新打开」后在终端里用方向键选择并回车，就会接着连上。`;
 }
 
 export async function probeClaudeVersion(): Promise<{ available: boolean; version: string | null; error: string | null }> {

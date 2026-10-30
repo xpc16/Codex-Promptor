@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildClaudeCommand, buildClaudeHookSettings, ClaudeCodeManager } from "./claude.js";
+import { buildClaudeCommand, buildClaudeHookSettings, claudeStartupFailureText, claudeStartupQuestion, ClaudeCodeManager } from "./claude.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -172,5 +172,103 @@ describe("Claude Code provider", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// What Claude Code 2.1.304 shows on macOS when launched in the home directory,
+// as Promptor's screen model reads it. It asks on every launch there: Claude
+// never stores trust for the home directory.
+const folderTrust = [
+  "────────────────────────────────────────────────────────────────────────────────",
+  " Accessing workspace:",
+  "",
+  " /Users/xpc",
+  "",
+  " Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source",
+  " project, or work from your team). If not, take a moment to review what's in this folder first.",
+  "",
+  " Claude Code'll be able to read, edit, and execute files here.",
+  "",
+  " Security guide",
+  "",
+  " ❯ No, exit",
+  "   Yes, I trust this folder",
+  "",
+  " Enter to confirm · Esc to cancel",
+].join("\n");
+
+const idleComposer = [
+  "⏺ Compacted while idle, before the prompt cache expired",
+  "────────────────────────────────────────────────────────────────────────────────",
+  "❯ ",
+  "────────────────────────────────────────────────────────────────────────────────",
+  "  Sonnet 5 xhigh · Context 100% left",
+  "  ⏵⏵ auto mode on (shift+tab to cycle)",
+].join("\n");
+
+async function preparedManager(): Promise<ClaudeCodeManager> {
+  const manager = new ClaudeCodeManager("tab-1", {} as any);
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-claude-"));
+  temporaryDirectories.push(directory);
+  await manager.beginLaunch({
+    cwd: directory,
+    launch: { mode: "resume", sessionId: "session-1" },
+    hookScriptPath: path.join(process.cwd(), "scripts", "claude-hook.mjs"),
+    settingsPath: path.join(directory, "settings.json"),
+    theme: "light",
+    exitMarker: "__CLAUDE_PROMPTOR_EXIT__:test:",
+  });
+  return manager;
+}
+
+describe("a Claude Code startup question", () => {
+  it("is read from the folder trust prompt and named by its question", () => {
+    expect(claudeStartupQuestion(folderTrust)).toBe("Quick safety check: Is this a project you created or one you trust?");
+  });
+
+  it("is not seen in an idle composer or ordinary output", () => {
+    expect(claudeStartupQuestion(idleComposer)).toBeNull();
+    expect(claudeStartupQuestion("❯ fix the failing test\n  Context 80% left")).toBeNull();
+    expect(claudeStartupQuestion("")).toBeNull();
+  });
+
+  it("is seen in a numbered menu or by its footer alone", () => {
+    expect(claudeStartupQuestion("──────────\n Use this setting?\n ❯ 1. Yes\n   2. No")).toBe("Use this setting?");
+    expect(claudeStartupQuestion("  Enter to confirm · Esc to cancel")).toBe("Claude Code 启动提问");
+  });
+
+  it("stops the clock while it is on screen, and connects once it is answered", async () => {
+    const manager = await preparedManager();
+    let screen = folderTrust;
+    const waiting = manager.waitForSession(50, () => null, () => claudeStartupQuestion(screen), 5_000);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    screen = idleComposer;
+    await manager.handleHook({ hook_event_name: "SessionStart", session_id: "session-1", source: "resume" });
+    expect((await waiting).sessionId).toBe("session-1");
+  });
+
+  it("names the question when nobody answers it", async () => {
+    const manager = await preparedManager();
+    const waiting = manager.waitForSession(20, () => null, () => claudeStartupQuestion(folderTrust), 200);
+    await expect(waiting).rejects.toThrow("CLAUDE_STARTUP_QUESTION_UNANSWERED:Quick safety check");
+    expect(claudeStartupFailureText("CLAUDE_STARTUP_QUESTION_UNANSWERED:Quick safety check: Is this a project you created or one you trust?"))
+      .toContain("「Quick safety check: Is this a project you created or one you trust?」");
+  });
+
+  it("gives the ordinary timeout back once the question is gone", async () => {
+    const manager = await preparedManager();
+    let screen = folderTrust;
+    const started = Date.now();
+    const waiting = manager.waitForSession(100, () => null, () => claudeStartupQuestion(screen), 60_000);
+    setTimeout(() => { screen = idleComposer; }, 150);
+    await expect(waiting).rejects.toThrow("CLAUDE_SESSION_START_TIMEOUT");
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(claudeStartupFailureText("CLAUDE_SESSION_START_TIMEOUT")).toBeNull();
+  });
+
+  it("still fails at once when Claude exits instead", async () => {
+    const manager = await preparedManager();
+    const waiting = manager.waitForSession(30_000, () => "TERMINAL_EXITED", () => claudeStartupQuestion(folderTrust));
+    await expect(waiting).rejects.toThrow("TERMINAL_EXITED");
   });
 });
