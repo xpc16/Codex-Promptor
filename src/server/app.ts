@@ -18,7 +18,7 @@ import {
   MAX_WINDOW_RECORDS,
 } from "../shared/tab-window.js";
 import { AppServerPool, type AppServerManager, type CodexRpcClient, terminateStaleAppServer, waitForThreadLoaded } from "./codex.js";
-import { CodexTuiPool, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, codexTuiReady, resolveCodexTuiLaunch, type CodexTuiManager } from "./codex-tui.js";
+import { clearStaleCodexDaemonLink, CodexTuiPool, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, codexTuiReady, resolveCodexTuiLaunch, type CodexTuiManager } from "./codex-tui.js";
 import { ClaudeCodePool, type ClaudeCodeManager, claudeStartupFailureText, claudeStartupQuestion, probeClaudeVersion } from "./claude.js";
 import { readClaudeHistoryThread, syncClaudeHistory } from "./claude-history.js";
 import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorHookBridge, probeCursorVersion } from "./cursor.js";
@@ -1108,6 +1108,7 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
   ) => {
     const lease = issueHookLease("codex", tabId);
     try {
+      if (await clearStaleCodexDaemonLink()) console.log("Removed a stale Codex app-server control link left by a reboot.");
       const manager = codexTui.get(tabId);
       const transcriptPath = launch.mode === "resume" ? await durableRolloutFile(launch.sessionId) : null;
       if (launch.mode === "resume" && !transcriptPath) {
@@ -1628,6 +1629,22 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     try {
       await awaitThreadSwitch(tabId);
       const tab = await storage.getTabMeta(tabId);
+      // A terminal cannot start in a directory that is gone. On macOS the child
+      // exits at once with code 1 and nothing on screen, which read as the
+      // agent crashing ("Codex TUI exited."). A conversation imported from
+      // before an account rename points at just such a directory.
+      const directory = tab.session.workingDirectory;
+      if (directory && tab.session.provider !== "chatgpt" && tab.session.provider !== "e2ee" && !(await validWorkingDirectory(directory))) {
+        try {
+          await storage.updateTab(tabId, (current) => ({
+            ...current,
+            session: { ...current.session, lastError: { code: "WORKING_DIRECTORY_MISSING", message: directory } },
+            updatedAt: isoNow(),
+          }));
+        } catch { /* a missing tab is already effectively closed */ }
+        await emitSnapshot(tabId);
+        return { ok: false, statusCode: 409, code: "WORKING_DIRECTORY_MISSING", message: directory };
+      }
       if (tab.session.provider === "claude") return performClaudeTerminalReopen(tab, recorder);
       if (tab.session.provider === "cursor") return performCursorTerminalReopen(tab, recorder);
       if (tab.session.provider === "shell") return performShellTerminalReopen(tab, recorder);

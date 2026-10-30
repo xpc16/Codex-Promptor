@@ -1,8 +1,9 @@
 import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildCodexHookOverride, buildCodexTuiLaunch, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, codexTuiReady, CodexTuiManager, resolveHookCommandPaths, spaceFreePath } from "./codex-tui.js";
+import { buildCodexHookOverride, buildCodexTuiLaunch, clearStaleCodexDaemonLink, codexHookFailureText, codexHookStartupError, codexStartupQuestion, codexStartupQuestionFrom, codexTuiReady, CodexTuiManager, resolveHookCommandPaths, spaceFreePath } from "./codex-tui.js";
 import { SLASH_COMMAND_NO_TURN } from "./prompt-submit.js";
 import * as history from "./codex-history.js";
 
@@ -422,5 +423,49 @@ describe("the questions Codex asks before a session exists", () => {
     expect(codexStartupQuestionFrom("CODEX_HOOK_TRUST_REQUIRED")).toBeNull();
     expect(codexHookFailureText("CODEX_HOOK_PATH_HAS_SPACES:C:/Program Files/node.exe")).toContain("空格");
     expect(codexHookFailureText("CODEX_TUI_LAUNCH_NOT_PREPARED")).toBeNull();
+  });
+});
+
+// Windows needs elevation to create a symlink, and the link only exists where
+// Codex runs a managed daemon; the cases that make one run elsewhere.
+describe("a Codex app-server control link left by a reboot", () => {
+  const made: string[] = [];
+  afterEach(async () => {
+    await Promise.all(made.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })));
+  });
+
+  async function controlLink(target: "missing" | "present", ageMs: number): Promise<{ home: string; link: string }> {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "promptor-codex-home-"));
+    made.push(home);
+    const control = path.join(home, "app-server-control");
+    await fs.mkdir(control);
+    const socket = path.join(home, "daemon-socket");
+    if (target === "present") await fs.writeFile(socket, "");
+    const link = path.join(control, "app-server-control.sock");
+    await fs.symlink(socket, link);
+    const when = new Date(Date.now() - ageMs);
+    await fs.lutimes(link, when, when);
+    return { home, link };
+  }
+  const exists = (link: string) => fs.lstat(link).then(() => true, () => false);
+
+  it.skipIf(process.platform === "win32")("is removed once it points nowhere", async () => {
+    const { home, link } = await controlLink("missing", 10 * 60_000);
+    expect(await clearStaleCodexDaemonLink(home, "darwin")).toBe(true);
+    expect(await exists(link)).toBe(false);
+  });
+
+  it.skipIf(process.platform === "win32")("is left alone while a daemon may still be starting, or while it works", async () => {
+    const fresh = await controlLink("missing", 5_000);
+    expect(await clearStaleCodexDaemonLink(fresh.home, "darwin")).toBe(false);
+    expect(await exists(fresh.link)).toBe(true);
+    const live = await controlLink("present", 10 * 60_000);
+    expect(await clearStaleCodexDaemonLink(live.home, "darwin")).toBe(false);
+    expect(await exists(live.link)).toBe(true);
+  });
+
+  it("is not looked for on Windows, or where there is none", async () => {
+    expect(await clearStaleCodexDaemonLink(path.join(os.tmpdir(), "no-such-codex-home"), "win32")).toBe(false);
+    expect(await clearStaleCodexDaemonLink(path.join(os.tmpdir(), "no-such-codex-home"), "darwin")).toBe(false);
   });
 });

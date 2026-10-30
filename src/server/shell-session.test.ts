@@ -124,6 +124,37 @@ describe("terminal-only conversations", () => {
     expect(response.json().error.code).toBe("INVALID_WORKING_DIRECTORY");
   });
 
+  it("names a working directory that is gone instead of starting a terminal in it", async () => {
+    // A conversation imported from before an account rename: /Users/tw is the
+    // old home, and nothing exists there any more.
+    const gone = path.join(root, "renamed-away");
+    for (const provider of ["shell", "codex", "claude"] as const) {
+      fakePty();
+      const tab = await app!.promptor.storage.createTab(`gone-${provider}`);
+      await app!.promptor.storage.updateTab(tab.id, (current) => ({
+        ...current,
+        session: {
+          ...current.session,
+          provider,
+          state: "closed",
+          workingDirectory: gone,
+          threadId: provider === "shell" ? null : "01a11c1f-b0f4-7b50-a364-7a641a074668",
+          sessionId: provider === "shell" ? null : "01a11c1f-b0f4-7b50-a364-7a641a074668",
+        },
+        updatedAt: isoNow(),
+      }));
+
+      const response = await post(`/api/tabs/${tab.id}/terminal/reopen`);
+
+      expect(response.statusCode).toBe(409);
+      expect(response.json().error).toMatchObject({ code: "WORKING_DIRECTORY_MISSING", message: gone });
+      expect(mocks.spawn).not.toHaveBeenCalled();
+      const stored = await app!.promptor.storage.getTabMeta(tab.id);
+      expect(stored.session.lastError).toEqual({ code: "WORKING_DIRECTORY_MISSING", message: gone });
+      mocks.spawn.mockReset();
+    }
+  });
+
   it("refuses the queue and history routes instead of spinning up an App Server", async () => {
     fakePty();
     const tab = await app!.promptor.storage.createTab("终端");

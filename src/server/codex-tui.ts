@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { AgentProcessLaunch, PtyManager } from "./pty.js";
@@ -920,6 +921,37 @@ export function codexTuiReady(screen: string): boolean {
   // absence of an option number is what separates "type here" from "choose".
   if (plain.split(/\r?\n/).some((line) => /^\s*›\s+(?!\d+[.)]\s)\S/u.test(line))) return true;
   return />_\s*OpenAI Codex/i.test(plain) || /context\s+\d+%\s*left/i.test(plain);
+}
+
+/**
+ * Removes Codex's app-server control link when the socket it names is gone.
+ *
+ * The managed daemon binds its socket under /tmp and links to it from
+ * <CODEX_HOME>/app-server-control. A reboot empties /tmp and leaves the link
+ * behind. The daemon (0.162.1; openai/codex#55181) then fails at startup with
+ * "File exists (os error 17)", and every Codex TUI started after it exits with
+ * nothing but "app server did not become ready". Only a link that points
+ * nowhere and is over a minute old is removed, so a daemon that is part way
+ * through starting is never touched.
+ */
+export async function clearStaleCodexDaemonLink(
+  codexHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), ".codex")),
+  platform: NodeJS.Platform = process.platform,
+  now = Date.now(),
+): Promise<boolean> {
+  if (platform === "win32") return false;
+  const link = path.join(codexHome, "app-server-control", "app-server-control.sock");
+  try {
+    const entry = await fs.lstat(link);
+    if (!entry.isSymbolicLink() || now - entry.mtimeMs < 60_000) return false;
+  } catch { return false; }
+  try {
+    await fs.stat(link);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+  }
+  try { await fs.unlink(link); return true; } catch { return false; }
 }
 
 export function codexHookStartupError(output: string): string | null {
