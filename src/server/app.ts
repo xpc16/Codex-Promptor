@@ -1,6 +1,7 @@
 import { resolveTerminalInputHandle, TERMINAL_INPUT_COMPACT_TYPE } from "../shared/terminal-input.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import fastifyCompress from "@fastify/compress";
@@ -23,7 +24,7 @@ import { ClaudeCodePool, type ClaudeCodeManager, claudeStartupFailureText, claud
 import { readClaudeHistoryThread, syncClaudeHistory } from "./claude-history.js";
 import { buildCursorCommand, CursorCliPool, type CursorCliManager, ensureCursorHookBridge, probeCursorVersion } from "./cursor.js";
 import { syncCursorHistory } from "./cursor-history.js";
-import { DirectoryPickerBusyError, DirectoryPickerService } from "./directory-picker.js";
+import { DirectoryPickerBusyError, DirectoryPickerService, supportsNativeDirectoryPicker } from "./directory-picker.js";
 import { buildConversationMarkdown, conversationExportFilename } from "./conversation-export.js";
 import { DocumentError, DocumentService, isLocalBrowserRequest } from "./documents.js";
 import { continuesThread, findVerifiedCodexRollout, locateCodexRollout, readCodexRollout, readCodexRolloutThread, readCodexThreadForHistory, readRolloutHistoryBase, repointThread } from "./codex-history.js";
@@ -2698,10 +2699,11 @@ export async function createApp(rootDir: string): Promise<PromptorApp> {
     if (!isLocalBrowserRequest(request.headers)) {
       return apiError(reply, 403, "DIRECTORY_DIALOG_LOCAL_ONLY", "The native folder dialog is available only from a loopback browser.");
     }
-    if (process.platform !== "win32") return reply.code(400).send({ error: { code: "WINDOWS_ONLY", message: "Folder dialog is available on Windows." } });
+    if (!supportsNativeDirectoryPicker()) return apiError(reply, 400, "DIRECTORY_DIALOG_UNSUPPORTED", "The native folder dialog is available on Windows and macOS. Enter the folder path on this platform.");
     const body = (request.body ?? {}) as any;
     const initialPath = await validWorkingDirectory(body.initialPath)
       ?? await validWorkingDirectory(process.env.USERPROFILE)
+      ?? await validWorkingDirectory(homedir())
       ?? process.cwd();
     try {
       return reply.send({ data: { path: await directoryPicker.select(initialPath) } });

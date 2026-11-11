@@ -45,6 +45,23 @@ try {
   $owner.Dispose()
 }`;
 
+const MACOS_DIRECTORY_PICKER_SCRIPT = String.raw`
+on run argv
+  try
+    set initialFolder to (POSIX file (item 1 of argv)) as alias
+    activate
+    set selectedFolder to choose folder with prompt "Select a working folder" default location initialFolder
+    return POSIX path of selectedFolder
+  on error errorMessage number errorNumber
+    if errorNumber is -128 then return ""
+    error errorMessage number errorNumber
+  end try
+end run`;
+
+export function supportsNativeDirectoryPicker(platform: NodeJS.Platform = process.platform): boolean {
+  return platform === "win32" || platform === "darwin";
+}
+
 export class DirectoryPickerBusyError extends Error {
   constructor() {
     super("A directory picker is already open.");
@@ -57,13 +74,22 @@ export type DirectoryPickerRunner = {
   stop(): Promise<void>;
 };
 
-class PowerShellDirectoryPickerRunner implements DirectoryPickerRunner {
+export class NativeDirectoryPickerRunner implements DirectoryPickerRunner {
   private child: ChildProcess | null = null;
 
+  constructor(private readonly platform: NodeJS.Platform = process.platform) {}
+
   async run(initialPath: string): Promise<string | null> {
+    if (!supportsNativeDirectoryPicker(this.platform)) throw new Error("The native folder picker is available on Windows and macOS.");
     if (this.child) throw new DirectoryPickerBusyError();
+    const macos = this.platform === "darwin";
+    // Pass the path as data, never embed it in AppleScript or a shell command.
+    const command = macos ? "/usr/bin/osascript" : "powershell.exe";
+    const args = macos
+      ? ["-e", MACOS_DIRECTORY_PICKER_SCRIPT, initialPath]
+      : ["-NoProfile", "-STA", "-Command", DIRECTORY_PICKER_SCRIPT];
     return new Promise<string | null>((resolve, reject) => {
-      const child = execFile("powershell.exe", ["-NoProfile", "-STA", "-Command", DIRECTORY_PICKER_SCRIPT], {
+      const child = execFile(command, args, {
         windowsHide: false,
         timeout: 600_000,
         encoding: "utf8",
@@ -71,7 +97,11 @@ class PowerShellDirectoryPickerRunner implements DirectoryPickerRunner {
       }, (error, stdout) => {
         if (this.child === child) this.child = null;
         if (error) reject(error);
-        else resolve(String(stdout).trim() || null);
+        else {
+          // osascript appends a newline; spaces can belong to a POSIX path.
+          const selected = macos ? String(stdout).replace(/\r?\n$/, "") : String(stdout).trim();
+          resolve(selected || null);
+        }
       });
       this.child = child;
     });
@@ -99,7 +129,7 @@ class PowerShellDirectoryPickerRunner implements DirectoryPickerRunner {
 export class DirectoryPickerService {
   private active = false;
 
-  constructor(private readonly runner: DirectoryPickerRunner = new PowerShellDirectoryPickerRunner()) {}
+  constructor(private readonly runner: DirectoryPickerRunner = new NativeDirectoryPickerRunner()) {}
 
   async select(initialPath: string): Promise<string | null> {
     if (this.active) throw new DirectoryPickerBusyError();
