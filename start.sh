@@ -44,7 +44,7 @@ prepare() {
   if ! command -v pwsh >/dev/null; then
     echo "Warning: pwsh was not found; terminals will not start until PowerShell 7 is installed." >&2
   fi
-  [ -d node_modules ] || npm ci
+  node scripts/ensure-dependencies.mjs
   # Same reasoning as start.ps1: a forgotten rebuild silently serves the
   # previous bundle, and an unchanged tree should still start immediately.
   if [ ! -f "$entry" ] || [ -n "$(find src config package.json package-lock.json -newer "$entry" 2>/dev/null | head -n 1)" ]; then

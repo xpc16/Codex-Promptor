@@ -25,6 +25,8 @@ npm ci
 .\start.ps1
 ```
 
+Windows 的 `start.ps1` 与 macOS/Linux 的 `start.sh` 现在共用启动前依赖检查：首次使用此检查、依赖声明/锁文件变化，或发现直接依赖缺失/版本不符时，自动执行 `npm ci --include=dev`；其余启动只检查本地文件，不联网。拉取更新后直接运行启动脚本即可。安装或构建失败会停止启动并显示错误，不会继续使用旧构建；`-NoBuild` 仍检查依赖，只跳过编译。若旧版本出现 `Failed to resolve import "@xterm/addon-serialize"`，可先手动执行 `npm ci --include=dev` 后重试。
+
 `start.ps1` 会启动只监听 `127.0.0.1` 的服务并打开 `http://127.0.0.1:4317/`；该固定地址也可以直接手动打开。启动前脚本会比较 `src/`、`config/`、`package.json` 与 `dist/` 的最后修改时间，源码有变更时自动执行 `npm run build`，无变更则直接启动；`.\start.ps1 -Force` 强制重新构建，`.\start.ps1 -NoBuild` 跳过检查直接用现有构建。最后一个 Promptor 页面关闭后，后端会等待 30 秒；期间刷新或重新打开页面会取消退出。若 30 秒内没有页面重连，后端才记录当时仍开启的对话、中断正在执行的 turn、停止所有子进程并退出。下次启动会按标签保存的提供商并行恢复 App Server 或 hook 适配器、PowerShell/TUI 和历史同步；用户明确点击“关闭对话”的标签不会自动恢复，队列仍保持暂停且不会重复提交 prompt。设置环境变量 `CODEX_PROMPTOR_AUTO_EXIT=0` 可关闭自动退出。每个标签的数据在 `data/tabs/<tab-id>/`：
 
 - `prompt-list.json`：prompt、顺序、开始/完成时间、attempt 和状态；

@@ -46,6 +46,13 @@ function Test-BuildIsStale {
   return $sourceTime -gt $builtTime
 }
 
+# A git pull updates package-lock.json, not the installed node_modules. Both
+# launchers use the same local check and install only when synchronization is due.
+node (Join-Path $toolRoot "scripts\ensure-dependencies.mjs")
+if ($LASTEXITCODE -ne 0) {
+  throw "Dependency synchronization failed (exit $LASTEXITCODE). See the error above."
+}
+
 if ($NoBuild) {
   if (-not (Test-Path -LiteralPath $serverEntry)) {
     throw "No build output at dist\server\main.js. Run .\start.ps1 without -NoBuild first."
@@ -58,6 +65,11 @@ if ($NoBuild) {
   npm run build
 } else {
   Write-Host "Build output is current; skipping rebuild." -ForegroundColor DarkGray
+}
+
+# PowerShell 5.1 does not turn a native command's nonzero exit into an exception.
+if (-not $NoBuild -and $LASTEXITCODE -ne 0) {
+  throw "Build failed (exit $LASTEXITCODE); the server was not started."
 }
 
 # The session tables under docs/ are generated, not tracked, so a fresh clone
